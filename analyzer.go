@@ -1,0 +1,587 @@
+package main
+
+import (
+	"fmt"
+	"go/ast"
+	"go/token"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+)
+
+// AnalysisResult holds the result of semantic analysis.
+type AnalysisResult struct {
+	Funcs        map[string]*FuncInfo
+	Structs      map[string]*StructDef
+	ByteConsts   map[string]byte   // compile-time byte constants
+	StringConsts map[string]string // compile-time string constants
+	fset         *token.FileSet
+}
+
+// FuncInfo holds analysis results for a function.
+type FuncInfo struct {
+	Name        string
+	Params      []string        // parameter names in order
+	ParamTypes  []ParamInfo     // parameter names with type info
+	Returns     int             // number of return values (1 for struct/array)
+	ReturnNames []string        // named return variable names (nil if unnamed)
+	ReturnType  ReturnInfo      // composite return type info
+	Body        *ast.BlockStmt  // function body AST
+	Calls       map[string]bool // names of user-defined functions called
+	IsRecursive bool            // true if function is (mutually) recursive
+	IsTailRec   bool            // true if all recursive calls are tail calls
+}
+
+// ParamInfo holds a function parameter's name and optional composite type.
+type ParamInfo struct {
+	Name          string
+	ArraySize     int        // >0 if the parameter is an array (total cells)
+	ArrayCount    int        // >0 for arrays: number of elements
+	ArrayElemSize int        // >0 for arrays: cells per element
+	ArrayElemType string     // non-empty for arrays of structs
+	StructType    string     // non-empty if the parameter is a struct type
+	IsPointer     bool       // true if *byte, *[N]byte, or *StructType
+	PtrArrayInfo  *ParamInfo // non-nil for *[N]byte -- inner array info
+	PtrStructType string     // non-empty for *StructType
+}
+
+// ReturnInfo describes a function's return type.
+type ReturnInfo struct {
+	ArraySize  int    // >0 if returning a [N]byte array
+	StructType string // non-empty if returning a struct
+}
+
+// StructDef holds a struct type definition.
+type StructDef struct {
+	Name            string
+	Fields          []string          // field names in order
+	Offsets         map[string]int    // field name -> offset
+	FieldTypes      map[string]string // field name -> struct type name (empty for byte)
+	FieldArraySizes map[string]int    // field name -> array size (0 for non-array)
+	Size            int               // total number of cells
+}
+
+// Analyze performs semantic analysis on the ASTs.
+func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
+	result := &AnalysisResult{
+		Funcs:        make(map[string]*FuncInfo),
+		Structs:      make(map[string]*StructDef),
+		ByteConsts:   make(map[string]byte),
+		StringConsts: make(map[string]string),
+		fset:         fset,
+	}
+
+	for _, file := range files {
+		if file.Name.Name != "main" {
+			return nil, fmt.Errorf("%s: expected package main, got package %s",
+				fset.Position(file.Pos()).Filename, file.Name.Name)
+		}
+		if len(file.Imports) > 0 {
+			pos := fset.Position(file.Imports[0].Pos())
+			return nil, fmt.Errorf("%s: imports are not supported", pos)
+		}
+		for _, decl := range file.Decls {
+			// Parse const declarations (supports iota, char literals, const blocks).
+			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.CONST {
+				iota := 0
+				var lastExprs []ast.Expr // repeat previous expressions for iota
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					if len(vs.Values) > 0 {
+						lastExprs = vs.Values
+					}
+					for i, name := range vs.Names {
+						if i < len(lastExprs) {
+							// Handle string constants separately.
+							if lit, ok := lastExprs[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+								s, err := strconv.Unquote(lit.Value)
+								if err != nil {
+									return nil, fmt.Errorf("const %s: %w", name.Name, err)
+								}
+								result.StringConsts[name.Name] = s
+								continue
+							}
+							val, err := evalConstExpr(lastExprs[i], iota, result.ByteConsts)
+							if err != nil {
+								return nil, fmt.Errorf("const %s: %w", name.Name, err)
+							}
+							if val < 0 || val > 255 {
+								return nil, fmt.Errorf("const %s: value %d out of byte range (0-255)", name.Name, val)
+							}
+							result.ByteConsts[name.Name] = byte(val) // #nosec G115 -- bounded above
+						}
+					}
+					iota++
+				}
+				continue
+			}
+
+			// Parse struct type definitions.
+			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.TYPE {
+				for _, spec := range gd.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					st, ok := ts.Type.(*ast.StructType)
+					if !ok {
+						continue
+					}
+					def := &StructDef{
+						Name:            ts.Name.Name,
+						Offsets:         make(map[string]int),
+						FieldTypes:      make(map[string]string),
+						FieldArraySizes: make(map[string]int),
+					}
+					offset := 0
+					for _, field := range st.Fields.List {
+						fieldSize := 1 // default: byte
+						fieldType := ""
+						fieldArraySize := 0
+						if id, ok := field.Type.(*ast.Ident); ok {
+							if nested, ok := result.Structs[id.Name]; ok {
+								fieldSize = nested.Size
+								fieldType = id.Name
+							}
+						} else if arrSize := arrayTypeSize(field.Type); arrSize > 0 {
+							fieldSize = arrSize
+							fieldArraySize = arrSize
+						}
+						for _, name := range field.Names {
+							def.Fields = append(def.Fields, name.Name)
+							def.Offsets[name.Name] = offset
+							if fieldType != "" {
+								def.FieldTypes[name.Name] = fieldType
+							}
+							if fieldArraySize > 0 {
+								def.FieldArraySizes[name.Name] = fieldArraySize
+							}
+							offset += fieldSize
+						}
+					}
+					def.Size = offset
+					if _, exists := result.Structs[def.Name]; exists {
+						return nil, fmt.Errorf("duplicate type: %s", def.Name)
+					}
+					result.Structs[def.Name] = def
+				}
+				continue
+			}
+
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			funcName := fn.Name.Name
+			// Method receiver: func (p Point) name() -> stored as "Point.name"
+			if fn.Recv != nil && len(fn.Recv.List) == 1 {
+				recvField := fn.Recv.List[0]
+				if recvType, ok := recvField.Type.(*ast.Ident); ok {
+					funcName = recvType.Name + "." + fn.Name.Name
+				}
+			}
+
+			if _, exists := result.Funcs[funcName]; exists {
+				return nil, fmt.Errorf("duplicate function: %s", funcName)
+			}
+			info := &FuncInfo{
+				Name:  funcName,
+				Body:  fn.Body,
+				Calls: make(map[string]bool),
+			}
+
+			// Prepend receiver as first parameter for methods.
+			if fn.Recv != nil && len(fn.Recv.List) == 1 {
+				recvField := fn.Recv.List[0]
+				var structType string
+				if recvType, ok := recvField.Type.(*ast.Ident); ok {
+					if _, ok := result.Structs[recvType.Name]; ok {
+						structType = recvType.Name
+					}
+				}
+				for _, name := range recvField.Names {
+					info.Params = append(info.Params, name.Name)
+					info.ParamTypes = append(info.ParamTypes, ParamInfo{
+						Name:       name.Name,
+						StructType: structType,
+					})
+				}
+			}
+
+			// Extract parameter names and types.
+			if fn.Type.Params != nil {
+				for _, field := range fn.Type.Params.List {
+					var pi ParamInfo
+					if at, ok := field.Type.(*ast.ArrayType); ok {
+						count := arrayTypeSize(field.Type)
+						if count > 0 {
+							elemSize := 1
+							elemType := ""
+							if id, ok := at.Elt.(*ast.Ident); ok {
+								if def, ok := result.Structs[id.Name]; ok {
+									elemSize = def.Size
+									elemType = id.Name
+								}
+							} else if innerSize := arrayTypeSize(at.Elt); innerSize > 0 {
+								elemSize = innerSize
+							}
+							pi.ArraySize = count * elemSize
+							pi.ArrayCount = count
+							pi.ArrayElemSize = elemSize
+							pi.ArrayElemType = elemType
+						}
+					} else if id, ok := field.Type.(*ast.Ident); ok {
+						if _, ok := result.Structs[id.Name]; ok {
+							pi.StructType = id.Name
+						}
+					} else if star, ok := field.Type.(*ast.StarExpr); ok {
+						pi.IsPointer = true
+						if at, ok := star.X.(*ast.ArrayType); ok {
+							count := arrayTypeSizeWith(star.X, result.ByteConsts)
+							if count > 0 {
+								elemSize := 1
+								elemType := ""
+								if eid, ok := at.Elt.(*ast.Ident); ok {
+									if def, ok := result.Structs[eid.Name]; ok {
+										elemSize = def.Size
+										elemType = eid.Name
+									}
+								}
+								pi.PtrArrayInfo = &ParamInfo{
+									ArraySize:     count * elemSize,
+									ArrayCount:    count,
+									ArrayElemSize: elemSize,
+									ArrayElemType: elemType,
+								}
+							}
+						} else if id, ok := star.X.(*ast.Ident); ok {
+							if _, ok := result.Structs[id.Name]; ok {
+								pi.PtrStructType = id.Name
+							}
+						}
+					}
+					for _, name := range field.Names {
+						pi.Name = name.Name
+						info.Params = append(info.Params, name.Name)
+						info.ParamTypes = append(info.ParamTypes, pi)
+					}
+				}
+			}
+
+			// Count return values and detect composite return types.
+			if fn.Type.Results != nil {
+				for _, field := range fn.Type.Results.List {
+					if len(field.Names) == 0 {
+						info.Returns++
+					} else {
+						for _, name := range field.Names {
+							info.ReturnNames = append(info.ReturnNames, name.Name)
+						}
+						info.Returns += len(field.Names)
+					}
+				}
+				// Detect array/struct return type (single return value only).
+				if info.Returns == 1 && len(fn.Type.Results.List) == 1 {
+					retType := fn.Type.Results.List[0].Type
+					if size := arrayTypeSize(retType); size > 0 {
+						info.ReturnType.ArraySize = size
+					} else if id, ok := retType.(*ast.Ident); ok {
+						if _, ok := result.Structs[id.Name]; ok {
+							info.ReturnType.StructType = id.Name
+						}
+					}
+				}
+			}
+
+			result.Funcs[funcName] = info
+		}
+	}
+
+	if _, ok := result.Funcs["main"]; !ok {
+		return nil, fmt.Errorf("no main function found")
+	}
+
+	// Build call graph: find calls to user-defined functions.
+	for _, info := range result.Funcs {
+		ast.Inspect(info.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			ident, ok := call.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if _, isUserFunc := result.Funcs[ident.Name]; isUserFunc {
+				info.Calls[ident.Name] = true
+			}
+			return true
+		})
+	}
+
+	// Detect recursion and tail-call recursion.
+	if err := detectRecursion(result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// evalConstExpr evaluates a constant expression to an integer value.
+func evalConstExpr(expr ast.Expr, iota int, consts map[string]byte) (int, error) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		switch e.Kind {
+		case token.INT:
+			val, err := strconv.ParseInt(e.Value, 0, 64)
+			if err != nil {
+				return 0, err
+			}
+			return int(val), nil
+		case token.CHAR:
+			ch, _, _, err := strconv.UnquoteChar(e.Value[1:len(e.Value)-1], '\'')
+			if err != nil {
+				return 0, err
+			}
+			return int(ch), nil
+		}
+	case *ast.Ident:
+		if e.Name == "iota" {
+			return iota, nil
+		}
+		if val, ok := consts[e.Name]; ok {
+			return int(val), nil
+		}
+	case *ast.BinaryExpr:
+		left, err := evalConstExpr(e.X, iota, consts)
+		if err != nil {
+			return 0, err
+		}
+		right, err := evalConstExpr(e.Y, iota, consts)
+		if err != nil {
+			return 0, err
+		}
+		switch e.Op {
+		case token.ADD:
+			return left + right, nil
+		case token.SUB:
+			return left - right, nil
+		case token.MUL:
+			return left * right, nil
+		case token.QUO:
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero in constant expression")
+			}
+			return left / right, nil
+		case token.REM:
+			if right == 0 {
+				return 0, fmt.Errorf("modulo by zero in constant expression")
+			}
+			return left % right, nil
+		case token.AND:
+			return left & right, nil
+		case token.OR:
+			return left | right, nil
+		case token.XOR:
+			return left ^ right, nil
+		case token.AND_NOT:
+			return left &^ right, nil
+		case token.SHL:
+			return left << right, nil
+		case token.SHR:
+			return left >> right, nil
+		}
+	case *ast.CallExpr:
+		// Handle byte() type conversion.
+		if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "byte" && len(e.Args) == 1 {
+			return evalConstExpr(e.Args[0], iota, consts)
+		}
+	case *ast.UnaryExpr:
+		val, err := evalConstExpr(e.X, iota, consts)
+		if err != nil {
+			return 0, err
+		}
+		switch e.Op {
+		case token.SUB:
+			return -val, nil
+		case token.XOR:
+			return ^val & 0xFF, nil
+		}
+	case *ast.ParenExpr:
+		return evalConstExpr(e.X, iota, consts)
+	}
+	return 0, fmt.Errorf("unsupported constant expression")
+}
+
+// detectRecursion marks functions that are part of call graph cycles.
+func detectRecursion(result *AnalysisResult) error {
+	for _, name := range slices.Sorted(maps.Keys(result.Funcs)) {
+		info := result.Funcs[name]
+		if canReach(result, name, name, make(map[string]bool)) {
+			info.IsRecursive = true
+			info.IsTailRec = isTailRecursive(info)
+			// Check for mutual recursion: if any callee can reach
+			// this function, it's a mutual recursion cycle.
+			for _, callee := range slices.Sorted(maps.Keys(info.Calls)) {
+				if callee != name {
+					if path := findCyclePath(result, callee, name); path != nil {
+						cycle := name + " -> " + strings.Join(path, " -> ")
+						return fmt.Errorf("mutual recursion is not supported: %s", cycle)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// findCyclePath returns the path from 'from' to 'target' through the call graph,
+// or nil if no path exists.
+func findCyclePath(result *AnalysisResult, from, target string) []string {
+	var dfs func(cur string, visited map[string]bool) []string
+	dfs = func(cur string, visited map[string]bool) []string {
+		if cur == target {
+			return []string{cur}
+		}
+		info, ok := result.Funcs[cur]
+		if !ok {
+			return nil
+		}
+		for callee := range info.Calls {
+			if !visited[callee] {
+				visited[callee] = true
+				if path := dfs(callee, visited); path != nil {
+					return append([]string{cur}, path...)
+				}
+			}
+		}
+		return nil
+	}
+	visited := map[string]bool{from: true}
+	return dfs(from, visited)
+}
+
+// canReach checks if 'from' can reach 'target' through the call graph.
+func canReach(result *AnalysisResult, from, target string, visited map[string]bool) bool {
+	info, ok := result.Funcs[from]
+	if !ok {
+		return false
+	}
+	for callee := range info.Calls {
+		if callee == target {
+			return true
+		}
+		if !visited[callee] {
+			visited[callee] = true
+			if canReach(result, callee, target, visited) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isTailRecursive checks if all recursive self-calls are in tail position.
+// Functions with defer cannot use tail-call optimization because the loop
+// rewrite loses per-call defer semantics.
+func isTailRecursive(info *FuncInfo) bool {
+	if info.Returns == 0 || hasDefer(info.Body) {
+		return false
+	}
+	hasSelfCall := false
+	allTail := true
+	inspectTailCalls(info.Body.List, info.Name, &hasSelfCall, &allTail)
+	return hasSelfCall && allTail
+}
+
+// hasDefer reports whether a block contains any defer statements.
+func hasDefer(block *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		if _, ok := n.(*ast.DeferStmt); ok {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// inspectTailCalls checks whether all self-recursive calls in stmts are in tail position.
+func inspectTailCalls(stmts []ast.Stmt, funcName string, hasSelfCall, allTail *bool) {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *ast.ReturnStmt:
+			// Check if the return expression is a self-call.
+			if len(s.Results) == 1 {
+				if call, ok := s.Results[0].(*ast.CallExpr); ok {
+					if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == funcName {
+						*hasSelfCall = true
+						// Check arguments for nested self-calls (not tail).
+						for _, arg := range call.Args {
+							checkNonTailCallsExpr(arg, funcName, hasSelfCall, allTail)
+						}
+						continue
+					}
+				}
+			}
+			// Check if any sub-expression contains a self-call (non-tail).
+			ast.Inspect(s, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == funcName {
+						*hasSelfCall = true
+						*allTail = false
+					}
+				}
+				return true
+			})
+		case *ast.IfStmt:
+			if s.Init != nil {
+				checkNonTailCalls(s.Init, funcName, hasSelfCall, allTail)
+			}
+			checkNonTailCallsExpr(s.Cond, funcName, hasSelfCall, allTail)
+			inspectTailCalls(s.Body.List, funcName, hasSelfCall, allTail)
+			if s.Else != nil {
+				switch e := s.Else.(type) {
+				case *ast.BlockStmt:
+					inspectTailCalls(e.List, funcName, hasSelfCall, allTail)
+				case *ast.IfStmt:
+					inspectTailCalls([]ast.Stmt{e}, funcName, hasSelfCall, allTail)
+				}
+			}
+		case *ast.BlockStmt:
+			inspectTailCalls(s.List, funcName, hasSelfCall, allTail)
+		default:
+			// Any non-return, non-if statement: self-calls here are non-tail.
+			// But only if this is NOT the last statement.
+			checkNonTailCalls(s, funcName, hasSelfCall, allTail)
+		}
+	}
+}
+
+func checkNonTailCalls(node ast.Node, funcName string, hasSelfCall, allTail *bool) {
+	ast.Inspect(node, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == funcName {
+				*hasSelfCall = true
+				*allTail = false
+			}
+		}
+		return true
+	})
+}
+
+func checkNonTailCallsExpr(node ast.Expr, funcName string, hasSelfCall, allTail *bool) {
+	ast.Inspect(node, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == funcName {
+				*hasSelfCall = true
+				*allTail = false
+			}
+		}
+		return true
+	})
+}

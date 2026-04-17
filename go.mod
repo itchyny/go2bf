@@ -1,3 +1,3 @@
 module github.com/itchyny/go2bf
 
-go 1.26.0
+go 1.25.0

@@ -7,6 +7,348 @@
 
 Compile Go to Brainfuck!
 
+## Examples
+
+<details>
+<summary>FizzBuzz</summary>
+
+```go
+package main
+
+func main() {
+    for i := byte(1); i <= 100; i++ {
+        if i%15 == 0 {
+            print("FizzBuzz")
+        } else if i%3 == 0 {
+            print("Fizz")
+        } else if i%5 == 0 {
+            print("Buzz")
+        } else {
+            print(i)
+        }
+        println()
+    }
+}
+```
+
+Compile to Brainfuck:
+
+```text
+ $ go2bf fizzbuzz.go
+>>>>>>>>+>>>>>>>>+>>>>>>>>+>>>>>>>>+[>>>>>>>>]>>>[>>>]+++[<+++++>-]<[>+<-[>>>+<<
+<-]>>>]<<[<<<]<<<<<<<<[<<<<<<<<]>[-]>>>>>[-]>[-]<<<<<<[>>>>>+>+<<<<<<-]>>>>>>[<<
+<<<<+>>>>>>-]<<<<<[-]+>>>>[<<<<[-]>>>>[-]][-]>>[>>>>>>>>]>>>>>>>[-]<[<<<]<<<<<<<
+...
+```
+
+Compile and run:
+
+```text
+ $ go2bf run fizzbuzz.go
+1
+2
+Fizz
+4
+Buzz
+Fizz
+...
+```
+
+</details>
+
+<details>
+<summary>Recursive Fibonacci</summary>
+
+```go
+package main
+
+func fib(n byte) byte {
+    if n <= 1 {
+        return n
+    }
+    return fib(n-1) + fib(n-2)
+}
+
+func main() {
+    for i := byte(1); i <= 10; i++ {
+        print("fib(")
+        print(i)
+        print(") = ")
+        println(fib(i))
+    }
+}
+```
+
+```text
+ $ go2bf run fibonacci.go
+fib(1) = 1
+fib(2) = 1
+fib(3) = 2
+fib(4) = 3
+fib(5) = 5
+fib(6) = 8
+fib(7) = 13
+fib(8) = 21
+fib(9) = 34
+fib(10) = 55
+```
+
+</details>
+
+<details>
+<summary>Structs with methods</summary>
+
+```go
+package main
+
+type Point struct {
+    x byte
+    y byte
+}
+
+func (p Point) add(q Point) Point {
+    return Point{x: p.x + q.x, y: p.y + q.y}
+}
+
+func main() {
+    a := Point{x: 1, y: 2}
+    b := Point{x: 3, y: 4}
+    c := a.add(b)
+    print("(")
+    print(c.x)
+    print(", ")
+    print(c.y)
+    println(")")
+}
+```
+
+```text
+ $ go2bf run point.go
+(4, 6)
+```
+
+</details>
+
+<details>
+<summary>Reversi</summary>
+
+You can play Reversi written in Brainfuck!
+
+```text
+ $ go2bf run testdata/reversi.go
+  ABCDEFGH
+1 ........
+2 ........
+3 ...*....
+4 ..*OX...
+5 ...XO*..
+6 ....*...
+7 ........
+8 ........
+X:2 O:2
+X move: D3
+
+  ABCDEFGH
+1 ........
+2 ........
+3 ..*X*...
+4 ...XX...
+5 ..*XO...
+6 ........
+7 ........
+8 ........
+X:4 O:1
+O move: E3
+...
+```
+
+</details>
+
+## Installation
+
+```sh
+go install github.com/itchyny/go2bf@latest
+```
+
+## Usage
+
+```sh
+# Compile Go to Brainfuck
+go2bf source.go > output.bf
+
+# Compile and run
+go2bf run source.go
+
+# Compile multiple files
+go2bf run main.go helper.go
+
+# Compile from stdin
+echo 'package main ...' | go2bf -
+
+# Compile with debug comments
+go2bf -debug source.go
+```
+
+## How it works
+
+The compiler pipeline:
+
+1. **Parse** - Uses Go's `go/ast` parser to parse
+   the source code
+2. **Analyze** - Builds call graph, detects recursion
+   and tail calls
+3. **Lower** - Converts AST to a structured IR
+   (intermediate representation)
+4. **Optimize IR** - Constant folding, delta conversion,
+   dead store elimination
+5. **Generate** - Converts IR to Brainfuck using
+   a register-cache CPU model with optimized register
+   allocation and stack traffic reduction
+6. **Optimize BF** - Peephole optimization on
+   the generated Brainfuck code (merging, cancellation,
+   dead loop elimination)
+
+### Execution model
+
+The generated Brainfuck uses a CPU-like execution model:
+
+- **5 registers** at positions 1,2,4,5,7 interleaved
+  with algorithm temps for neighbor optimization
+- **Register cache** with LRU eviction
+  (consecutive operations on same variables
+  stay in registers, dead temporaries skipped)
+- **Stride-8 highway** markers at positions
+  8, 16, 24, 32 for fast tape navigation
+- **Phase temps** at fixed tape positions 25-39
+  for recursive dispatch computation
+- **Stride-3 stack** with guard/value/zero cells
+  for variable storage
+- **Counter-walk technique** for navigating to
+  stack slots via the zero column
+- **Breadcrumb technique** for far stack access
+  (guard=0 marks target slot)
+- **Phase dispatch loop** for general recursion
+  with dynamic stack frames
+
+## Supported Go features
+
+All values are `byte` (unsigned 8-bit, 0-255).
+No `int` or `string` types.
+
+### Types and operators
+
+- Arithmetic: `+`, `-`, `*`, `/`, `%`, `++`, `--`,
+  `+=`, `-=`, `*=`, `/=`, `%=`, unary `-`
+- Bitwise: `&`, `|`, `^`, `&^`, `<<`, `>>`, `^x`,
+  `&=`, `|=`, `^=`, `<<=`, `>>=`
+- Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
+  (including array and struct equality)
+- Logical: `&&`, `||`, `!` (0 is false, nonzero is true)
+- Type conversion: `byte(expr)`, `string(byte)` in
+  `print`/`println` to output a raw character
+- Constants: `const n = 10`, `const nl = '\n'`,
+  `const msg = "hello"`, `const` blocks with `iota`
+
+### Control flow
+
+- `if`, `else if`, `else` statements
+- `for` loops (condition-only, C-style, `range`)
+  with `break` and `continue`
+- `switch` statement on `byte` values (including
+  multiple values per case, `default`, and `fallthrough`)
+
+### Functions
+
+- Parameters, return values, multiple return values,
+  named return values
+- Tail-call recursion optimization
+- General recursion (via stack-based dispatch)
+  including nested recursive calls (e.g., Ackermann function)
+- `defer` for function calls
+  (LIFO order; not supported inside loops)
+
+### Arrays
+
+- Fixed-size: `[N]byte`, `[N]Point`, `[N][M]byte`
+- Constant and variable indexing
+- Composite literals: `[N]byte{...}`, `[N]byte{0: v}`
+- `len(array)`, `cap(array)`, `for i, v := range a`
+- Copy assignment, `a[i]++`, `a[i] += v`
+- Pass to and return from functions
+
+### Structs
+
+- Fields: `byte`, struct, or array types
+- Field access, nested field access (`p.a.x`)
+- Composite literals, copy assignment
+- `p.x++`, `p.x += v`, `a[i].x = v`
+- Pass to and return from functions
+- Method receivers, method calls on array elements
+
+### Pointers
+
+- `*byte` pointers: `&x`, `*p`, `*p = v`, `*p++`
+- `&myStruct`, `&myArray` -- address of composite values
+- `ptr.x` read/write for struct pointers (`ptr := &myStruct`)
+- `ptr[i]` read/write, `ptr[i][j]` read/write for array pointers
+- `ptr[i].x` read/write for array-of-structs pointers
+- `ptr.data[i]` read/write for struct-with-array pointers
+- `len(ptr)`, `len(*ptr)`, `cap(ptr)` for array pointers
+- Typed pointer parameters: `func f(p *[N]byte)`, `func f(p *Point)`
+- Pass pointers to functions for by-reference semantics
+
+### Built-in functions
+
+- `print`, `println` -- decimal output, string literals
+- `min(a, b, ...)`, `max(a, b, ...)` -- variadic
+- `len(array)`, `cap(array)`
+- `putchar(byte)` -- raw byte output
+- `getchar()` -- read a byte from stdin
+
+## Limitations
+
+- No import statements.
+- No slices, maps, interfaces, or channels.
+- Arrays of arrays and arrays of structs support up
+  to two levels of nesting.
+- No `select`, `go`, or `goto` statements.
+- No closures or function pointers.
+- Recursive functions do not support recursive calls
+  inside `for` loops, mutual recursion, or pointers.
+- Maximum 255 stack slots (variables + temporaries)
+  per program.
+- The built-in Brainfuck interpreter uses a 30,000-cell
+  tape with 8-bit wrapping cells.
+
+## Motivation
+
+More than a decade ago, a friend of mine was writing a compiler that
+turned a high-level language into Brainfuck. He was a brilliant
+programmer -- far beyond my level at the time -- but his ambition was
+equally outsized: he wanted to compile Haskell all the way down to
+Brainfuck. "Imagine losing a game of Reversi to a Brainfuck program," he
+said with a grin. In the end, the Brainfuck code his compiler generated
+was simply too slow even for a simple "Hello world" program, and the
+Reversi dream remained just that -- a dream.
+
+Years passed, and I grew as a programmer. I set out to build my own
+Python-to-Brainfuck compiler written in Haskell, layering abstractions
+one on top of another from raw Brainfuck primitives upward. I got as far
+as 32-bit integer arithmetic on the 8-bit Brainfuck tape, but then hit a
+wall: I could not figure out how to represent a stack. Without a stack,
+there could be no function calls, no arrays -- no Reversi. I, too, set
+the dream aside.
+
+More years went by. At some point, an idea for implementing a stack on
+the Brainfuck tape came to me, but the sheer amount of work it would
+take kept me from ever starting. Then the age of AI arrived. With Claude,
+I built the entire compiler in just three days -- from the first line of
+code to a working Reversi game. A dream I had carried for over a decade,
+realized in a long weekend. The compiler supports functions, recursion,
+arrays, structs -- and yes, it runs Reversi (also written by Claude).
+
+The day has come, old friend. You can now lose to Reversi written in Brainfuck.
+
 ## Bug Tracker
 
 Report bug at [Issues - itchyny/go2bf - GitHub](https://github.com/itchyny/go2bf/issues).
