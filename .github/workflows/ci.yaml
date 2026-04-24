@@ -65,13 +65,18 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
           name: goxz
           path: goxz
+      - name: Setup release body
+        run: sed -n '/\[${{ github.ref_name }}\]/,/^$/{//!p}' CHANGELOG.md >release-body.txt
       - name: Create release
         uses: ncipollo/release-action@v1
         with:
           name: Release ${{ github.ref_name }}
+          bodyFile: release-body.txt
           artifacts: goxz/*
