@@ -262,6 +262,31 @@ slots.
 frame slots. Before each `return` (and frame pop), the deferred IR
 blocks are emitted in LIFO order.
 
+## Frame-Based Indexing
+
+The `recLowerer` uses frame-based indexing helpers that parallel
+the regular lowerer's `indexInto`/`writeInto`:
+
+- **`recIndexInto(baseSlot, count, indexExpr)`** -- reads a scalar
+  from a frame array. Constant index emits `IRLoadFrame` directly;
+  variable index uses an if-cascade via `emitFrameIndexRead`.
+- **`recWriteInto(baseSlot, count, indexExpr, val)`** -- writes a
+  scalar to a frame array. Same dispatch as `recIndexInto`.
+- **`recFieldIndexInto(baseSlot, info, offset, indexExpr)`** --
+  reads a struct field from a frame struct array (adds field offset
+  to `i*elemSize`).
+- **`recFieldWriteInto(baseSlot, info, offset, indexExpr, val)`** --
+  writes a struct field in a frame struct array.
+
+These replace per-call-site constant/variable dispatch and are used
+by `lowerIndexExpr`, `lowerArrayAssign`, `lowerArrayIncDec`,
+`lowerSelectorExpr`, and `lowerFieldAssign`.
+
+The `compositeSize(name)` helper resolves the total frame slot count
+for a variable, checking `localArrayInfo` and `localStructTypes`.
+It is used by `lowerRecVarInit` and `lowerDecl` to avoid duplicated
+map lookups.
+
 ## Supported Features
 
 Most Go features supported in regular functions also work in

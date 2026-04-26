@@ -76,25 +76,72 @@ compile time, then indexes into the array.
 ### Multi-Assignment and Swap
 
 Parallel assignment (`a, b = b, a`) evaluates all RHS values into
-temporaries, then assigns to LHS. For struct and array variables,
-each cell is copied to a temp range, then moved to the destination:
-
-```go
-a, b = b, a  // where a, b are Point structs
-```
-
-Both RHS and LHS handle struct/array variables by copying cell-by-cell.
+temporaries via `lowerExpr` + `ensureTemp`, then assigns to LHS.
+Both `lowerExpr` and `ensureTemp` handle composite results
+(struct/array variables return multi-cell results with `size` set),
+so no special-casing is needed for composite swap.
 
 ### Method Receivers
 
 Method receivers are desugared: `func (p Point) sum() byte` becomes a
 function `Point.sum` with `p` as the first parameter.
 
-Method calls on array elements (`a[0].sum()`, `a[i].sum()`) resolve
-the receiver by looking up the array's element type and passing the
-element as the first argument. Constant-index access passes the
-struct fields directly. Variable-index access copies each field to
-temp cells via dynamic loads at `flatIndex + fieldOffset`.
+Method calls resolve the receiver's struct type via
+`resolveExprTypeName`, which walks the AST without evaluating.
+This supports method calls on any expression that produces a struct:
+variables (`p.sum()`), array elements (`a[i].sum()`), function
+returns (`makePoint(1, 2).sum()`), and chained methods
+(`p.scale(3).sum()`). The receiver expression is evaluated via
+`lowerExpr` and passed as the first argument to the inlined method.
+
+## Expression Results
+
+`exprResult` is the return type of `lowerExpr` and related functions.
+It carries the cell, ownership, and composite/indexing metadata:
+
+| Field | Meaning |
+| ----- | ------- |
+| `cell` | cell ID (or pointer slot for `isPtr` results) |
+| `temp` | if true, caller must free via `freeCell` |
+| `size` | total cells; 0 means scalar (1 cell) |
+| `elemSize` | element size for indexable results; 0 = not indexable |
+| `elemCount` | number of elements for indexable results |
+| `elemType` | struct type name for composite array elements |
+| `typeName` | struct type name of this result (for field resolution) |
+| `isPtr` | cell is a pointer (stack slot index) for indirect access |
+| `flatBase` | for flat-offset results: base of the original array |
+
+`lowerExpr` returns composite results for arrays (`elemSize`/`elemCount`
+set), structs (`size`/`typeName` set), pointer-to-array variables
+(`isPtr`/`elemType` set), and pointer-to-struct variables
+(`isPtr`/`typeName` set). Function calls returning arrays or structs
+also return composite results with proper metadata.
+
+`typeName` enables field resolution without re-inspecting the AST:
+`lowerSelectorExpr` and `lowerFieldAssign` use `base.typeName` to
+look up the `StructDef` directly. `elemType` propagates through
+`indexInto` so that `a[i].x` resolves the struct type from the
+indexed result. This allows chained access on any expression
+(e.g., `f().x`, `f()[i].x`, `f().data[i]`).
+
+### Variable Initialization
+
+Simple assignments (`x = expr`, `x := expr`) and `var x = expr`
+declarations share a unified path through `lowerVarInit`, which
+handles composite literals, pointer tracking, and composite variable
+copies. For composite RHS (struct/array variables), `lowerExpr`
+returns a multi-cell result and `emitCopyOrMove` handles the
+cell-by-cell transfer.
+
+### Field Assignment
+
+`lowerFieldAssign` resolves the base via `lowerExpr(sel.X)`, then
+dispatches by result type:
+
+- **Pointer** (`isPtr`): `ptrOffset` + `ptrStore`
+- **Nested struct**: `lowerStructValueTo` for composite field writes
+- **Direct/flat-offset**: `writeInto` with the field offset as a
+  constant index expression
 
 ## Arrays
 
@@ -105,6 +152,28 @@ Variable-indexed access (`a[i]`) cannot use a direct cell reference
 because the index is not known at compile time. The lowerer emits
 `IRDynLoad`/`IRDynStore`, which the codegen implements via
 counter-walk (see [`stack.md`](stack.md)).
+
+### Unified Indexing
+
+All index operations (read and write) go through two central functions:
+
+- **`indexInto(base, indexExpr)`** -- reads from a composite at the
+  given index. Handles direct arrays, pointer arrays, flat-offset
+  chained access, constant indices, and variable indices.
+- **`writeInto(base, indexExpr, val)`** -- writes to a composite at
+  the given index. Same dispatch as `indexInto`.
+
+`lowerIndexExpr` evaluates `e.X` via `lowerExpr` (which returns
+composite metadata), then calls `indexInto`. `lowerArrayAssign`
+does the same with `writeInto`. This replaces per-type dispatch
+(previously separate functions for pointer arrays, chained indices,
+selector bases, etc.).
+
+For pointer-based access (`isPtr` results), `indexInto`/`writeInto`
+use `ptrDynIndex` + `ptrLoad`/`ptrStore`. For variable-index
+composite arrays, `indexInto` returns a flat-offset result with
+`flatBase` set, so the next level of indexing knows the original
+array base for dynamic access.
 
 ### Arrays of Structs
 
@@ -117,15 +186,15 @@ temp cells and dynamic-stores each field.
 
 ### Arrays of Arrays
 
-`[N][M]byte` occupies `N * M` contiguous cells. `a[i][j]` computes
-a flat index `i * M + j`. Both constant and variable indexing are
-supported at both levels for reads and writes. Whole-subarray
-assignment `a[i] = [M]byte{...}` with variable index evaluates
-the subarray into temp cells and dynamic-stores each element.
+`[N][M]byte` occupies `N * M` contiguous cells. `a[i][j]` is
+handled by recursive evaluation: `lowerExpr(a[i])` returns a
+composite result (with `elemSize=1, elemCount=M` for constant `i`,
+or a flat-offset result with `flatBase` for variable `i`), then
+`indexInto` handles `[j]`.
 
 Variable-index reads and writes use `IRDynLoad`/`IRDynStore`, which
 compute a walk distance (`base + index`) and navigate to the target
-slot via counter-walk (see [stack.md](stack.md)). This avoids
+slot via counter-walk (see [`stack.md`](stack.md)). This avoids
 generating code proportional to the array size.
 
 Array parameters and returns are passed by cell-by-cell copying.
@@ -144,16 +213,23 @@ Struct pointers (`ptr := &myStruct`) are tracked in the scope's
 `ptr.x = val` emits `IRDynStore`.
 
 Array pointers (`ptr := &myArray`) are tracked in `ptrArray`.
+`lowerExpr(ptr)` returns an `exprResult` with `isPtr: true` and
+the array's `elemSize`/`elemCount`. All pointer indexing then goes
+through the generic `indexInto`/`writeInto` path, which uses
+`ptrDynIndex` + `ptrLoad`/`ptrStore` for `isPtr` results.
+
 `ptr[i]` computes `*ptr + i * elemSize` and loads/stores via
-`IRDynLoad`/`IRDynStore`. `ptr[i][j]` computes
-`*ptr + i * elemSize + j` for 2D arrays.
+`IRDynLoad`/`IRDynStore`. `ptr[i][j]` is handled by recursive
+`indexInto`: the first level returns a pointer sub-array result,
+the second level indexes into it.
 
 Mixed access patterns are supported:
 
-- `ptr[i].x` for array-of-structs pointers: computes
-  `*ptr + i * elemSize + fieldOffset`
-- `ptr.data[i]` for struct-with-array pointers: computes
-  `*ptr + fieldOffset + i`
+- `ptr[i].x` for array-of-structs pointers: `indexInto` returns
+  a pointer sub-array, `lowerSelectorExpr` adds the field offset
+- `ptr.data[i]` for struct-with-array pointers: `lowerSelectorExpr`
+  returns an `isPtr` result with the field's array metadata,
+  then `indexInto` handles the index
 
 Pointer types are tracked both for local assignments (`ptr := &myStruct`)
 and for typed pointer parameters (`func f(p *Point)`, `func f(a *[3]byte)`).

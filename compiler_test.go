@@ -1518,6 +1518,26 @@ func main() { println(f([2][3]byte{{1, 2, 3}, {4, 5, 6}})) }`,
 			"", "21\n",
 		},
 		{
+			"2d array element as function argument",
+			`package main
+func sum(a [3]byte) byte { return a[0] + a[1] + a[2] }
+func main() {
+	m := [2][3]byte{{1, 2, 3}, {4, 5, 6}}
+	println(sum(m[0]), sum(m[1]))
+	i := byte(1)
+	println(sum(m[i]))
+}`,
+			"", "6 15\n15\n",
+		},
+		{
+			"function returning array as argument",
+			`package main
+func makeArr(x byte) [3]byte { return [3]byte{x, x + 1, x + 2} }
+func sum(a [3]byte) byte { return a[0] + a[1] + a[2] }
+func main() { println(sum(makeArr(10))) }`,
+			"", "33\n",
+		},
+		{
 			"struct with array field as argument",
 			`package main
 type Vec struct { d [3]byte; n byte }
@@ -4564,6 +4584,44 @@ func main() {
 			"", "1 2 3\n",
 		},
 		{
+			"index function returning array",
+			`package main
+func f() [3]byte { return [3]byte{10, 20, 30} }
+func main() {
+	println(f()[0], f()[1], f()[2])
+}`,
+			"", "10 20 30\n",
+		},
+		{
+			"index function returning array variable index",
+			`package main
+func f() [3]byte { return [3]byte{10, 20, 30} }
+func main() {
+	i := byte(2)
+	println(f()[i])
+}`,
+			"", "30\n",
+		},
+		{
+			"field of function returning struct",
+			`package main
+type Point struct { x byte; y byte }
+func makePoint() Point { return Point{x: 5, y: 7} }
+func main() { println(makePoint().x, makePoint().y) }`,
+			"", "5 7\n",
+		},
+		{
+			"field array of function returning struct",
+			`package main
+type Row struct { data [3]byte; n byte }
+func makeRow() Row { return Row{data: [3]byte{1, 2, 3}, n: 3} }
+func main() {
+	println(makeRow().data[0], makeRow().data[1], makeRow().data[2])
+	println(makeRow().n)
+}`,
+			"", "1 2 3\n3\n",
+		},
+		{
 			"array copy assignment",
 			`package main
 func main() {
@@ -4585,6 +4643,34 @@ func main() {
 	println(a[0], a[1], a[2])
 }`,
 			"", "2 2 2\n",
+		},
+		{
+			"array element inc dec variable index",
+			`package main
+func main() {
+	a := [3]byte{10, 20, 30}
+	i := byte(1)
+	a[i]++
+	a[i]++
+	println(a[0], a[1], a[2])
+	j := byte(0)
+	a[j]--
+	println(a[0], a[1], a[2])
+}`,
+			"", "10 22 30\n9 22 30\n",
+		},
+		{
+			"pointer array element inc dec variable index",
+			`package main
+func main() {
+	a := [3]byte{10, 20, 30}
+	p := &a
+	p[1]++
+	i := byte(2)
+	p[i]--
+	println(a[0], a[1], a[2])
+}`,
+			"", "10 21 29\n",
 		},
 		{
 			"array element assign op",
@@ -4753,6 +4839,17 @@ func main() {
 	println(a[0].x, a[0].y, a[1].x, a[1].y)
 }`,
 			"", "3 7 1 2\n",
+		},
+		{
+			"array of structs composite lit from func call",
+			`package main
+type Point struct { x byte; y byte }
+func makePoint(a, b byte) Point { return Point{x: a, y: b} }
+func main() {
+	a := [2]Point{makePoint(3, 7), makePoint(10, 20)}
+	println(a[0].x, a[0].y, a[1].x, a[1].y)
+}`,
+			"", "3 7 10 20\n",
 		},
 		{
 			"struct with nested struct init",
@@ -5844,6 +5941,45 @@ func main() {
 }`,
 			"", "4 6\n",
 		},
+		{
+			"method call on function return",
+			`package main
+type Point struct { x byte; y byte }
+func (p Point) sum() byte { return p.x + p.y }
+func makePoint(a, b byte) Point { return Point{x: a, y: b} }
+func main() { println(makePoint(3, 7).sum()) }`,
+			"", "10\n",
+		},
+		{
+			"chained method call on function return",
+			`package main
+type Point struct { x byte; y byte }
+func (p Point) sum() byte { return p.x + p.y }
+func (p Point) scale(n byte) Point { return Point{x: p.x * n, y: p.y * n} }
+func makePoint(a, b byte) Point { return Point{x: a, y: b} }
+func main() { println(makePoint(1, 2).scale(3).sum()) }`,
+			"", "9\n",
+		},
+		{
+			"method call on function return as statement",
+			`package main
+type W struct { n byte }
+func (w W) emit() { print(w.n) }
+func makeW(n byte) W { return W{n: n} }
+func main() {
+	makeW(42).emit()
+	println()
+}`,
+			"", "42\n",
+		},
+		{
+			"function return field in arithmetic",
+			`package main
+type Point struct { x byte; y byte }
+func makePoint(a, b byte) Point { return Point{x: a, y: b} }
+func main() { println(makePoint(3, 7).x + makePoint(1, 2).y) }`,
+			"", "5\n",
+		},
 		// --- Pointers ---
 		{
 			"pointer read",
@@ -6570,7 +6706,7 @@ func main() { print(cap(1, 2)) }`,
 			"cap on non-array",
 			`package main
 func main() { x := byte(1); print(cap(x)) }`,
-			"undefined array",
+			"must be an array",
 		},
 		{
 			"len wrong args",
@@ -6588,7 +6724,7 @@ func main() { putchar(byte(1, 2)) }`,
 			"len on non-array",
 			`package main
 func main() { x := byte(1); print(len(x)) }`,
-			"undefined array",
+			"must be an array",
 		},
 		{
 			"putchar no args",
@@ -6905,7 +7041,7 @@ func main() {
 	p := &s
 	print(p.x[0])
 }`,
-			"field x is not an array",
+			"cannot index non-array expression",
 		},
 	}
 	for _, tt := range tests {

@@ -45,10 +45,11 @@ Converts the AST into a structured IR (see [`ir.md`](ir.md)).
   (see [`recursion.md`](recursion.md))
 - Handles structs as contiguous cell ranges with compile-time field
   offsets (`p.x` becomes a direct cell access)
-- Handles arrays with constant-index access (direct cell) and
-  variable-index access (`IRDynLoad`/`IRDynStore`)
+- Handles arrays and pointers through unified `indexInto`/`writeInto`
+  functions that dispatch on `exprResult` metadata (`elemSize`,
+  `elemCount`, `isPtr`, `flatBase`)
 - Lowers composite types (arrays, structs) passed to/from functions
-  by cell-by-cell copying
+  by cell-by-cell copying via composite-aware `emitCopyOrMove`
 - Lowers `defer` by capturing arguments into cells and emitting deferred
   blocks before each return
 - **Skip guard elimination**: the first statement in each block skips

@@ -241,7 +241,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					} else if star, ok := field.Type.(*ast.StarExpr); ok {
 						pi.IsPointer = true
 						if at, ok := star.X.(*ast.ArrayType); ok {
-							count := arrayTypeSizeWith(star.X, result.ByteConsts)
+							count := arrayTypeSizePart(at.Len, result.ByteConsts)
 							if count > 0 {
 								elemSize := 1
 								elemType := ""
