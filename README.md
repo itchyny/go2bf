@@ -269,7 +269,8 @@ No `int` or `string` types.
 
 ### Arrays
 
-- Fixed-size: `[N]byte`, `[N]Point`, `[N][M]byte`
+- Fixed-size: `[N]byte`, `[N]Point`, `[N][M]byte`,
+  `[N][M][K]byte`, `[N][M]Point`
 - Constant and variable indexing
 - Composite literals: `[N]byte{...}`, `[N]byte{0: v}`
 - `len(array)`, `cap(array)`, `for i, v := range a`
@@ -278,12 +279,12 @@ No `int` or `string` types.
 
 ### Structs
 
-- Fields: `byte`, struct, or array types
+- Fields: `byte`, struct, array, or nested array types
 - Field access, nested field access (`p.a.x`)
 - Composite literals, copy assignment
 - `p.x++`, `p.x += v`, `a[i].x = v`
 - Pass to and return from functions
-- Method receivers, method calls on array elements
+- Method receivers and method calls
 
 ### Pointers
 
@@ -309,8 +310,8 @@ No `int` or `string` types.
 
 - No import statements.
 - No slices, maps, interfaces, or channels.
-- Arrays of arrays and arrays of structs support up
-  to two levels of nesting.
+- Array nesting up to 3 levels of bytes (`[N][M][K]byte`)
+  or 2 levels of structs (`[N][M]Point`).
 - No `select`, `go`, or `goto` statements.
 - No closures or function pointers.
 - Recursive functions do not support recursive calls

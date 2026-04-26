@@ -107,6 +107,7 @@ It carries the cell, ownership, and composite/indexing metadata:
 | `elemSize` | element size for indexable results; 0 = not indexable |
 | `elemCount` | number of elements for indexable results |
 | `elemType` | struct type name for composite array elements |
+| `innerElemSize` | for nested arrays: cells per inner element (0 if flat) |
 | `typeName` | struct type name of this result (for field resolution) |
 | `isPtr` | cell is a pointer (stack slot index) for indirect access |
 | `flatBase` | for flat-offset results: base of the original array |
@@ -191,6 +192,17 @@ handled by recursive evaluation: `lowerExpr(a[i])` returns a
 composite result (with `elemSize=1, elemCount=M` for constant `i`,
 or a flat-offset result with `flatBase` for variable `i`), then
 `indexInto` handles `[j]`.
+
+Up to 3 levels of nesting are supported (`[N][M][K]byte`).
+The `innerElemSize` field in `arrayInfo` and `exprResult` tracks
+the sub-element size. When `indexInto` returns a composite
+sub-element, it uses `innerElemSize` to set the next level's
+`elemSize` and `elemCount`. Nested struct arrays (`[N][M]Point`)
+propagate `elemType` through all levels.
+
+Struct fields may also contain nested arrays. `FieldInnerSizes`
+in `StructDef` stores the inner element size for nested array
+fields (e.g., `data [2][3]byte` has inner size 3).
 
 Variable-index reads and writes use `IRDynLoad`/`IRDynStore`, which
 compute a walk distance (`base + index`) and navigate to the target

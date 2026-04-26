@@ -51,11 +51,12 @@ type scope struct {
 }
 
 type arrayInfo struct {
-	base     Cell
-	size     int    // total cells (count * elemSize)
-	count    int    // number of elements
-	elemSize int    // cells per element (1 for byte, >1 for struct)
-	elemType string // struct type name (empty for byte)
+	base          Cell
+	size          int    // total cells (count * elemSize)
+	count         int    // number of elements
+	elemSize      int    // cells per element (1 for byte, >1 for struct)
+	elemType      string // struct type name (empty for byte)
+	innerElemSize int    // for nested arrays: cells per inner element (0 if flat)
 }
 
 type structInfo struct {
@@ -64,15 +65,16 @@ type structInfo struct {
 }
 
 type exprResult struct {
-	cell      Cell
-	temp      bool   // if true, the caller should free this cell via freeCell
-	size      int    // total number of cells; 0 means 1 (scalar)
-	elemSize  int    // element size for indexable results; 0 means not indexable
-	elemCount int    // number of elements for indexable results
-	elemType  string // struct type name for composite elements (empty for byte)
-	typeName  string // struct type name of this result (empty for non-struct)
-	isPtr     bool   // if true, cell is a pointer (slot index) for indirect access
-	flatBase  Cell   // for flat-offset results: base of the original array
+	cell          Cell
+	temp          bool   // if true, the caller should free this cell via freeCell
+	size          int    // total number of cells; 0 means 1 (scalar)
+	elemSize      int    // element size for indexable results; 0 means not indexable
+	elemCount     int    // number of elements for indexable results
+	elemType      string // struct type name for composite elements (empty for byte)
+	innerElemSize int    // for nested arrays: cells per inner element (0 if flat)
+	typeName      string // struct type name of this result (empty for non-struct)
+	isPtr         bool   // if true, cell is a pointer (slot index) for indirect access
+	flatBase      Cell   // for flat-offset results: base of the original array
 }
 
 // cellCount returns the number of cells in this result (1 for scalars).
@@ -347,10 +349,10 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 					// Check for composite literal: a := [N]byte{...} or p := Point{...}
 					if i < len(s.Rhs) {
 						if comp, ok := s.Rhs[i].(*ast.CompositeLit); ok {
-							if count, elemSize, elemType := l.arrayElementInfo(comp.Type); count > 0 {
+							if count, elemSize, elemType, ies := l.arrayElementInfo(comp.Type); count > 0 {
 								if _, exists := sc.arrays[id.Name]; !exists {
 									if elemSize > 1 {
-										l.defineStructArray(sc, id.Name, count, elemType, elemSize)
+										l.defineStructArray(sc, id.Name, count, elemType, elemSize, ies)
 									} else {
 										l.defineArray(sc, id.Name, count)
 									}
@@ -412,9 +414,9 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 				}
 				for _, name := range vs.Names {
 					if _, exists := sc.vars[name.Name]; !exists {
-						if count, elemSize, elemType := l.arrayElementInfo(vs.Type); count > 0 {
+						if count, elemSize, elemType, ies := l.arrayElementInfo(vs.Type); count > 0 {
 							if elemSize > 1 {
-								l.defineStructArray(sc, name.Name, count, elemType, elemSize)
+								l.defineStructArray(sc, name.Name, count, elemType, elemSize, ies)
 							} else {
 								l.defineArray(sc, name.Name, count)
 							}
@@ -571,10 +573,10 @@ func (l *Lowerer) defineArray(sc *scope, name string, size int) {
 	sc.arrays[name] = arrayInfo{base: base, size: size, count: size, elemSize: 1}
 }
 
-func (l *Lowerer) defineStructArray(sc *scope, name string, count int, elemType string, elemSize int) {
+func (l *Lowerer) defineStructArray(sc *scope, name string, count int, elemType string, elemSize, innerElemSize int) {
 	total := count * elemSize
 	base := l.allocCells(total)
-	sc.arrays[name] = arrayInfo{base: base, size: total, count: count, elemSize: elemSize, elemType: elemType}
+	sc.arrays[name] = arrayInfo{base: base, size: total, count: count, elemSize: elemSize, elemType: elemType, innerElemSize: innerElemSize}
 }
 
 // arrayTypeSize returns N for [N]byte types, 0 for non-array types.
@@ -591,36 +593,51 @@ func arrayTypeSize(expr ast.Expr) int {
 }
 
 func (l *Lowerer) arraySize(expr ast.Expr) int {
-	count, elemSize, _ := l.arrayElementInfo(expr)
+	count, elemSize, _, _ := l.arrayElementInfo(expr)
 	return count * elemSize
 }
 
 // arrayElementInfo returns (count, elemSize, elemType) for an array type.
 // For [N]byte: (N, 1, ""). For [N]StructType: (N, structSize, typeName).
-// For [N][M]byte: (N, M, "").
-func (l *Lowerer) arrayElementInfo(expr ast.Expr) (int, int, string) {
+// arrayElementInfo returns (count, elemSize, elemType, innerElemSize) for an array type.
+// For [N]byte: (N, 1, "", 0). For [N]Point: (N, pointSize, "Point", 0).
+// For [N][M]byte: (N, M, "", 0). For [N][M][K]byte: (N, M*K, "", K).
+// For [N][M]Point: (N, M*pointSize, "Point", pointSize).
+func (l *Lowerer) arrayElementInfo(expr ast.Expr) (count, elemSize int, elemType string, innerElemSize int) {
 	at, ok := expr.(*ast.ArrayType)
 	if !ok {
-		return 0, 0, ""
+		return 0, 0, "", 0
 	}
-	count := arrayTypeSizePart(at.Len, l.result.ByteConsts)
+	count = arrayTypeSizePart(at.Len, l.result.ByteConsts)
 	if count < 0 {
-		return 0, 0, ""
+		return 0, 0, "", 0
 	}
-	// Check element type: byte, struct, or nested array.
 	if id, ok := at.Elt.(*ast.Ident); ok {
 		if def, ok := l.result.Structs[id.Name]; ok {
-			return count, def.Size, id.Name
+			return count, def.Size, id.Name, 0
 		}
 	}
-	// Nested array: [N][M]byte
-	if innerAt, ok := at.Elt.(*ast.ArrayType); ok {
-		innerSize := arrayTypeSizePart(innerAt.Len, l.result.ByteConsts)
-		if innerSize > 0 {
-			return count, innerSize, ""
+	if _, ok := at.Elt.(*ast.ArrayType); ok {
+		innerCount, innerES, innerET, _ := l.arrayElementInfo(at.Elt)
+		if innerCount > 0 {
+			return count, innerCount * innerES, innerET, innerES
 		}
 	}
-	return count, 1, ""
+	return count, 1, "", 0
+}
+
+// arrayNestingDepth returns the nesting depth of an array type.
+// [N]byte = 1, [N][M]byte = 2, [N][M][K]byte = 3.
+func arrayNestingDepth(expr ast.Expr) int {
+	depth := 0
+	for {
+		at, ok := expr.(*ast.ArrayType)
+		if !ok || at.Len == nil {
+			return depth
+		}
+		depth++
+		expr = at.Elt
+	}
 }
 
 // arrayTypeSizePart extracts the length from an array length expression.
@@ -926,6 +943,8 @@ func (l *Lowerer) resolveExprTypeName(expr ast.Expr) string {
 				return ptrAI.elemType
 			}
 		}
+		// Nested index: a[i][j] -> resolve a[i]'s type.
+		return l.resolveExprTypeName(x.X)
 	case *ast.CallExpr:
 		funcName, _ := l.resolveCall(x)
 		if info, ok := l.result.Funcs[funcName]; ok {
@@ -1094,6 +1113,9 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 		if !ok {
 			continue
 		}
+		if vs.Type != nil && arrayNestingDepth(vs.Type) > 3 {
+			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
+		}
 		for i, name := range vs.Names {
 			if i >= len(vs.Values) {
 				// No initializer: zero the variable/array/struct.
@@ -1123,6 +1145,9 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 	// Composite literal: a = [N]byte{...} or p = Point{...}
 	if comp, ok := rhs.(*ast.CompositeLit); ok {
+		if comp.Type != nil && arrayNestingDepth(comp.Type) > 3 {
+			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
+		}
 		size := l.arraySize(comp.Type)
 		if size > 0 {
 			return l.lowerCompositeLit(name, comp)
@@ -1160,8 +1185,8 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 			sc := l.currentScope()
 			delete(sc.vars, name)
 			if _, exists := sc.arrays[name]; !exists {
-				if srcAI.elemType != "" {
-					l.defineStructArray(sc, name, srcAI.count, srcAI.elemType, srcAI.elemSize)
+				if srcAI.elemSize > 1 || srcAI.elemType != "" {
+					l.defineStructArray(sc, name, srcAI.count, srcAI.elemType, srcAI.elemSize, srcAI.innerElemSize)
 				} else {
 					l.defineArray(sc, name, srcAI.size)
 				}
@@ -1336,6 +1361,17 @@ func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 		return err
 	}
 	if base.elemCount == 0 {
+		depth := 0
+		for x := ast.Expr(idx); ; depth++ {
+			if ie, ok := x.(*ast.IndexExpr); ok {
+				x = ie.X
+			} else {
+				break
+			}
+		}
+		if depth > 3 {
+			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
+		}
 		return fmt.Errorf("cannot index non-array expression")
 	}
 	// Composite literal RHS: struct or array literal.
@@ -1522,8 +1558,6 @@ func (l *Lowerer) addFlatOffset(flatIdx Cell, offsetExpr ast.Expr) (Cell, error)
 	}
 	return t, nil
 }
-
-
 
 // constValue returns the constant integer value of an expression, if it is one.
 func (l *Lowerer) constValue(expr ast.Expr) (int, bool) {
@@ -2360,8 +2394,6 @@ func (l *Lowerer) emitDeferred() {
 	}
 }
 
-
-
 // resolveStructArg evaluates a struct argument expression, returning
 // the base cell and size. Handles variables, indexed elements,
 // composite literals, and function calls.
@@ -2416,7 +2448,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 			if size > 0 {
 				base := l.allocCells(size)
 				arr := arrayInfo{base: base, size: size, count: size, elemSize: 1}
-				if count, elemSize, elemType := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
+				if count, elemSize, elemType, _ := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
 					arr = arrayInfo{base: base, size: size, count: count, elemSize: elemSize, elemType: elemType}
 				}
 				if err := l.lowerCompositeLitInto(arr, comp); err != nil {
@@ -2462,7 +2494,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				if pt.ArraySize > 0 {
 					sc := l.currentScope()
 					if pt.ArrayElemSize > 1 {
-						l.defineStructArray(sc, paramName, pt.ArrayCount, pt.ArrayElemType, pt.ArrayElemSize)
+						l.defineStructArray(sc, paramName, pt.ArrayCount, pt.ArrayElemType, pt.ArrayElemSize, 0)
 					} else {
 						l.defineArray(sc, paramName, pt.ArraySize)
 					}
@@ -2687,7 +2719,7 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 			return exprResult{cell: si.base, size: si.def.Size, elemSize: 1, elemCount: si.def.Size, typeName: si.def.Name}, nil
 		}
 		if ai, ok := l.lookupArray(e.Name); ok {
-			return exprResult{cell: ai.base, size: ai.size, elemSize: ai.elemSize, elemCount: ai.count, elemType: ai.elemType}, nil
+			return exprResult{cell: ai.base, size: ai.size, elemSize: ai.elemSize, elemCount: ai.count, elemType: ai.elemType, innerElemSize: ai.innerElemSize}, nil
 		}
 		return exprResult{}, err
 	}
@@ -3226,6 +3258,17 @@ func (l *Lowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 		return exprResult{}, err
 	}
 	if base.elemCount == 0 {
+		depth := 0
+		for x := ast.Expr(e); ; depth++ {
+			if idx, ok := x.(*ast.IndexExpr); ok {
+				x = idx.X
+			} else {
+				break
+			}
+		}
+		if depth > 3 {
+			return exprResult{}, fmt.Errorf("array nesting deeper than 3 levels is not supported")
+		}
 		return exprResult{}, fmt.Errorf("cannot index non-array expression")
 	}
 	return l.indexInto(base, e.Index)
@@ -3249,8 +3292,26 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 	}
 
 	// Flat-offset result: cell holds i*elemSize relative to flatBase.
-	// Add the inner offset and do dynamic access on the flat array.
 	if base.flatBase != 0 {
+		if base.elemSize > 1 {
+			// Nested: compute deeper flat offset.
+			es := l.allocCell()
+			l.emit(&IRConst{Dst: es, Value: byte(base.elemSize)}) // #nosec G115
+			idxR, err := l.lowerExpr(indexExpr)
+			if err != nil {
+				return exprResult{}, err
+			}
+			t := l.allocCell()
+			l.emit(&IRMul{Dst: t, Src1: idxR.cell, Src2: es})
+			l.freeCell(es)
+			if idxR.temp {
+				l.freeCell(idxR.cell)
+			}
+			l.emit(&IRAdd{Dst: base.cell, Src1: base.cell, Src2: t})
+			l.freeCell(t)
+			return exprResult{cell: base.cell, temp: true, elemSize: 1, elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, flatBase: base.flatBase}, nil
+		}
+		// Scalar access on flat array.
 		totalSize := base.elemCount * base.elemSize
 		flatArr := arrayInfo{base: base.flatBase, size: totalSize, count: totalSize, elemSize: 1}
 		flatIdx, err := l.addFlatOffset(base.cell, indexExpr)
@@ -3272,8 +3333,16 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 		r := exprResult{cell: cell, typeName: base.elemType}
 		if base.elemSize > 1 {
 			r.size = base.elemSize
-			r.elemSize = 1
-			r.elemCount = base.elemSize
+			if base.innerElemSize > 0 {
+				// Nested array: preserve inner structure.
+				r.elemSize = base.innerElemSize
+				r.elemCount = base.elemSize / base.innerElemSize
+
+				r.elemType = base.elemType
+			} else {
+				r.elemSize = 1
+				r.elemCount = base.elemSize
+			}
 		}
 		return r, nil
 	}
@@ -3289,8 +3358,15 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 		if err != nil {
 			return exprResult{}, err
 		}
-		r.elemSize = 1
-		r.elemCount = base.elemSize
+		if base.innerElemSize > 0 {
+			r.elemSize = base.innerElemSize
+			r.elemCount = base.elemSize / base.innerElemSize
+
+			r.elemType = base.elemType
+		} else {
+			r.elemSize = 1
+			r.elemCount = base.elemSize
+		}
 		r.typeName = base.elemType
 		r.flatBase = base.cell
 		return r, nil
@@ -3458,8 +3534,13 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	r := exprResult{cell: base + offset}
 	if arrSize := def.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
 		r.size = arrSize
-		r.elemSize = 1
-		r.elemCount = arrSize
+		if ies := def.FieldInnerSizes[e.Sel.Name]; ies > 0 {
+			r.elemSize = ies
+			r.elemCount = arrSize / ies
+		} else {
+			r.elemSize = 1
+			r.elemCount = arrSize
+		}
 	} else if fieldType := def.FieldTypes[e.Sel.Name]; fieldType != "" {
 		fieldDef := l.result.Structs[fieldType]
 		r.size = fieldDef.Size

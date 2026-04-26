@@ -59,7 +59,28 @@ type StructDef struct {
 	Offsets         map[string]int    // field name -> offset
 	FieldTypes      map[string]string // field name -> struct type name (empty for byte)
 	FieldArraySizes map[string]int    // field name -> array size (0 for non-array)
+	FieldInnerSizes map[string]int    // field name -> inner element size for nested array fields
 	Size            int               // total number of cells
+}
+
+// arrayFieldInfo returns (totalSize, innerElemSize) for an array type expression.
+// For [N]byte: (N, 0). For [N][M]byte: (N*M, M).
+func arrayFieldInfo(expr ast.Expr) (int, int) {
+	at, ok := expr.(*ast.ArrayType)
+	if !ok || at.Len == nil {
+		return 0, 0
+	}
+	n := arrayTypeSize(expr)
+	if n <= 0 {
+		return 0, 0
+	}
+	if innerAt, ok := at.Elt.(*ast.ArrayType); ok && innerAt.Len != nil {
+		innerSize, _ := arrayFieldInfo(at.Elt)
+		if innerSize > 0 {
+			return n * innerSize, innerSize
+		}
+	}
+	return n, 0
 }
 
 // Analyze performs semantic analysis on the ASTs.
@@ -136,6 +157,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 						Offsets:         make(map[string]int),
 						FieldTypes:      make(map[string]string),
 						FieldArraySizes: make(map[string]int),
+						FieldInnerSizes: make(map[string]int),
 					}
 					offset := 0
 					for _, field := range st.Fields.List {
@@ -147,9 +169,14 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 								fieldSize = nested.Size
 								fieldType = id.Name
 							}
-						} else if arrSize := arrayTypeSize(field.Type); arrSize > 0 {
+						} else if arrSize, ies := arrayFieldInfo(field.Type); arrSize > 0 {
 							fieldSize = arrSize
 							fieldArraySize = arrSize
+							if ies > 0 {
+								for _, name := range field.Names {
+									def.FieldInnerSizes[name.Name] = ies
+								}
+							}
 						}
 						for _, name := range field.Names {
 							def.Fields = append(def.Fields, name.Name)

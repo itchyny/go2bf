@@ -5402,6 +5402,118 @@ func main() {
 }`,
 			"", "3 4",
 		},
+		{
+			"3d array constant index",
+			`package main
+func main() {
+	var a [2][3][4]byte
+	a[0][0][0] = 1
+	a[1][2][3] = 99
+	println(a[0][0][0], a[1][2][3])
+}`,
+			"", "1 99\n",
+		},
+		{
+			"3d array variable index",
+			`package main
+func main() {
+	var a [2][3][4]byte
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 3; j++ {
+			for k := byte(0); k < 4; k++ {
+				a[i][j][k] = i*12 + j*4 + k + 1
+			}
+		}
+	}
+	println(a[0][0][0], a[0][0][3], a[0][2][3], a[1][0][0], a[1][2][3])
+}`,
+			"", "1 4 12 13 24\n",
+		},
+		{
+			"2d array of structs",
+			`package main
+type Point struct { x byte; y byte }
+func main() {
+	var a [2][3]Point
+	a[0][0] = Point{x: 1, y: 2}
+	a[1][2] = Point{x: 5, y: 6}
+	println(a[0][0].x, a[0][0].y, a[1][2].x, a[1][2].y)
+}`,
+			"", "1 2 5 6\n",
+		},
+		{
+			"struct with 2d array field",
+			`package main
+type Matrix struct { data [2][3]byte; rows byte }
+func main() {
+	var m Matrix
+	m.data[0][0] = 1
+	m.data[0][2] = 3
+	m.data[1][1] = 5
+	m.rows = 2
+	println(m.data[0][0], m.data[0][2], m.data[1][1], m.rows)
+}`,
+			"", "1 3 5 2\n",
+		},
+		{
+			"2d array of structs variable index field write",
+			`package main
+type Point struct { x byte; y byte }
+func main() {
+	var a [2][3]Point
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 3; j++ {
+			a[i][j].x = i*3 + j + 1
+			a[i][j].y = (i*3 + j + 1) * 10
+		}
+	}
+	println(a[0][0].x, a[0][0].y, a[1][2].x, a[1][2].y)
+}`,
+			"", "1 10 6 60\n",
+		},
+		{
+			"2d array of structs method call",
+			`package main
+type Point struct { x byte; y byte }
+func (p Point) sum() byte { return p.x + p.y }
+func main() {
+	var a [2][2]Point
+	a[0][0] = Point{x: 1, y: 2}
+	a[1][1] = Point{x: 7, y: 8}
+	i := byte(1)
+	println(a[0][0].sum(), a[i][i].sum())
+}`,
+			"", "3 15\n",
+		},
+		{
+			"2d array copy preserves structure",
+			`package main
+func main() {
+	a := [2][3]byte{{1,2,3},{4,5,6}}
+	b := a
+	b[0][0] = 99
+	println(a[0][0], b[0][0], b[1][2])
+}`,
+			"", "1 99 6\n",
+		},
+		{
+			"struct with 2d array field variable index",
+			`package main
+type Matrix struct { data [2][3]byte; rows byte }
+func main() {
+	var m Matrix
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 3; j++ {
+			m.data[i][j] = i*3 + j + 1
+		}
+	}
+	m.rows = 2
+	i := byte(1)
+	j := byte(2)
+	println(m.data[i][j], m.rows)
+}`,
+			"", "6 2\n",
+		},
 		// --- Structs ---
 		{
 			"struct literal return as function argument",
@@ -5864,6 +5976,19 @@ func main() {
 	print(o.a.x + o.a.y + o.b)
 }`,
 			"", "60",
+		},
+		{
+			"3 level nested struct",
+			`package main
+type A struct { v byte }
+type B struct { a A; w byte }
+type C struct { b B; x byte }
+func main() {
+	c := C{b: B{a: A{v: 1}, w: 2}, x: 3}
+	c.b.a.v = 99
+	println(c.b.a.v, c.b.w, c.x)
+}`,
+			"", "99 2 3\n",
 		},
 		{
 			"struct array field variable index loop read",
@@ -6980,6 +7105,15 @@ func main() {
 	print(s.data[3])
 }`,
 			"out of bounds",
+		},
+		{
+			"array nesting too deep",
+			`package main
+func main() {
+	var a [2][3][4][5]byte
+	a[0][0][0][0] = 1
+}`,
+			"nesting deeper than 3",
 		},
 		{
 			"string literal in expression",

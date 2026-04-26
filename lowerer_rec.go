@@ -157,7 +157,7 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 					size := l.arraySize(comp.Type)
 					base := l.allocCells(size)
 					arr := arrayInfo{base: base, size: size, count: size, elemSize: 1}
-					if count, elemSize, elemType := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
+					if count, elemSize, elemType, _ := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
 						arr = arrayInfo{base: base, size: size, count: count, elemSize: elemSize, elemType: elemType}
 					}
 					for j := range size {
@@ -268,7 +268,7 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
 			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
 				if comp, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
-					count, elemSize, elemType := l.arrayElementInfo(comp.Type)
+					count, elemSize, elemType, _ := l.arrayElementInfo(comp.Type)
 					size := count * elemSize
 					if size > 0 {
 						register(id.Name, recArrayInfo{size, count, elemSize, elemType})
@@ -315,7 +315,7 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 			if gd, ok := decl.Decl.(*ast.GenDecl); ok {
 				for _, spec := range gd.Specs {
 					if vs, ok := spec.(*ast.ValueSpec); ok {
-						count, elemSize, elemType := l.arrayElementInfo(vs.Type)
+						count, elemSize, elemType, _ := l.arrayElementInfo(vs.Type)
 						size := count * elemSize
 						if size > 0 {
 							for _, name := range vs.Names {
