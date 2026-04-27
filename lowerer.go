@@ -36,6 +36,9 @@ type Lowerer struct {
 	loopBreakFlag Cell // 1 after break (skip post/condition, exit loop)
 	loopDepth     int  // nesting depth of for/range loops
 
+	// Heap allocator for slices.
+	heapPtr Cell // cell holding the next free stack slot index
+
 	// Defer context.
 	deferredCalls []*IRBlock // deferred call blocks, emitted in LIFO order at return
 }
@@ -46,8 +49,20 @@ type scope struct {
 	consts   map[string]byte       // compile-time constants
 	arrays   map[string]arrayInfo  // base cell and size
 	structs  map[string]structInfo // base cell and field layout
+	slices   map[string]sliceInfo  // slice header (ptr, len, cap)
 	ptrType  map[string]string     // variable name -> pointed-to struct type name
 	ptrArray map[string]arrayInfo  // variable name -> pointed-to array info
+}
+
+// sliceInfo holds the 3-cell header for a slice variable.
+type sliceInfo struct {
+	ptr         Cell   // cell holding stack slot index of first element
+	len         Cell   // cell holding current length
+	cap         Cell   // cell holding capacity
+	elemSize    int    // cells per element (1 for byte)
+	elemType    string // struct type name (empty for byte)
+	elemSlice   bool   // true if element is a slice ([][]byte)
+	elemPtrType string // struct type for pointer elements ([]*Point)
 }
 
 type arrayInfo struct {
@@ -71,10 +86,14 @@ type exprResult struct {
 	elemSize      int    // element size for indexable results; 0 means not indexable
 	elemCount     int    // number of elements for indexable results
 	elemType      string // struct type name for composite elements (empty for byte)
+	elemSlice     bool   // true if elements are slices ([][]byte)
+	elemPtrType   string // struct type for pointer elements ([]*Point)
 	innerElemSize int    // for nested arrays: cells per inner element (0 if flat)
 	typeName      string // struct type name of this result (empty for non-struct)
-	isPtr         bool   // if true, cell is a pointer (slot index) for indirect access
+	isPointer     bool   // if true, cell is a pointer (slot index) for indirect access
 	flatBase      Cell   // for flat-offset results: base of the original array
+	lenCell       Cell   // runtime length cell (0 if compile-time elemCount)
+	capCell       Cell   // runtime capacity cell (0 if not applicable)
 }
 
 // cellCount returns the number of cells in this result (1 for scalars).
@@ -91,6 +110,9 @@ func Lower(result *AnalysisResult) (*Program, error) {
 	}
 
 	info := result.Funcs["main"]
+	// Reserve slot 0 for heapPtr so that no user variable occupies slot 0.
+	// This makes pointer value 0 a reliable nil sentinel.
+	l.heapPtr = l.allocCell()
 	l.pushScope()
 	// Load top-level constants into scope.
 	maps.Copy(l.currentScope().consts, result.ByteConsts)
@@ -114,6 +136,15 @@ func Lower(result *AnalysisResult) (*Program, error) {
 		l.returnFlag = 0
 	}
 	l.popScope()
+
+	// Initialize heap pointer for slices (after all cells allocated).
+	if l.heapPtr != 0 {
+		heapStart := byte(slotOf(l.nextCell)) // #nosec G115
+		initNodes := []IRNode{
+			&IRConst{Dst: l.heapPtr, Value: heapStart},
+		}
+		l.nodes = append(initNodes, l.nodes...)
+	}
 
 	return &Program{
 		Main:      &IRBlock{Nodes: l.nodes},
@@ -232,6 +263,7 @@ func (l *Lowerer) pushScope() {
 		consts:   make(map[string]byte),
 		arrays:   make(map[string]arrayInfo),
 		structs:  make(map[string]structInfo),
+		slices:   make(map[string]sliceInfo),
 		ptrType:  make(map[string]string),
 		ptrArray: make(map[string]arrayInfo),
 	})
@@ -321,7 +353,751 @@ func (l *Lowerer) lookupPtrArray(name string) (arrayInfo, bool) {
 	return arrayInfo{}, false
 }
 
-// structTypeSize returns the StructDef for a named struct type, or nil.
+func (l *Lowerer) lookupSlice(name string) (sliceInfo, bool) {
+	for i := len(l.scopes) - 1; i >= 0; i-- {
+		if si, ok := l.scopes[i].slices[name]; ok {
+			return si, true
+		}
+	}
+	return sliceInfo{}, false
+}
+
+func (l *Lowerer) defineSlice(sc *scope, name string, elemSize int, elemType string, elemSlice bool, elemPtrType ...string) sliceInfo {
+	si := sliceInfo{
+		ptr: l.allocCell(), len: l.allocCell(), cap: l.allocCell(),
+		elemSize: elemSize, elemType: elemType, elemSlice: elemSlice,
+	}
+	if len(elemPtrType) > 0 {
+		si.elemPtrType = elemPtrType[0]
+	}
+	sc.slices[name] = si
+	return si
+}
+
+// isSliceType returns true if the type expression is a slice ([]T).
+func isSliceType(expr ast.Expr) bool {
+	at, ok := expr.(*ast.ArrayType)
+	return ok && at.Len == nil
+}
+
+// sliceElemInfo returns (elemSize, elemType, isSliceOfSlice, ptrType) for a slice type.
+// ptrType is non-empty for pointer-to-struct elements ([]*Point).
+func (l *Lowerer) sliceElemInfo(expr ast.Expr) (int, string, bool, string) {
+	at, ok := expr.(*ast.ArrayType)
+	if !ok || at.Len != nil {
+		return 1, "", false, ""
+	}
+	if id, ok := at.Elt.(*ast.Ident); ok {
+		if def, ok := l.result.Structs[id.Name]; ok {
+			return def.Size, id.Name, false, ""
+		}
+	}
+	if size := arrayTypeSize(at.Elt); size > 0 {
+		return size, "", false, ""
+	}
+	if isSliceType(at.Elt) {
+		return 3, "", true, ""
+	}
+	// Pointer-to-struct: []*Point
+	if star, ok := at.Elt.(*ast.StarExpr); ok {
+		if id, ok := star.X.(*ast.Ident); ok {
+			if _, ok := l.result.Structs[id.Name]; ok {
+				return 1, "", false, id.Name
+			}
+		}
+	}
+	return 1, "", false, ""
+}
+
+func (l *Lowerer) allocSliceInfo() sliceInfo {
+	return sliceInfo{
+		ptr: l.allocCell(), len: l.allocCell(), cap: l.allocCell(),
+	}
+}
+
+func (l *Lowerer) freeSliceInfo(si sliceInfo) {
+	l.freeCell(si.ptr)
+	l.freeCell(si.len)
+	l.freeCell(si.cap)
+}
+
+// lowerSliceExpr evaluates a slice-producing expression into a
+// temporary sliceInfo. The caller must free the result with freeSliceInfo.
+func (l *Lowerer) lowerSliceExpr(expr ast.Expr) (sliceInfo, error) {
+	switch e := expr.(type) {
+	case *ast.CallExpr:
+		if fn, ok := e.Fun.(*ast.Ident); ok {
+			if fn.Name == "make" && len(e.Args) >= 2 && isSliceType(e.Args[0]) {
+				return l.evalSliceMake(e.Args[0], e.Args[1:])
+			}
+			if fn.Name == "append" && len(e.Args) >= 2 {
+				si, err := l.lowerSliceExpr(e.Args[0])
+				if err != nil {
+					return sliceInfo{}, err
+				}
+				if e.Ellipsis.IsValid() && len(e.Args) == 2 {
+					if err := l.lowerSliceAppendSpread(si, e.Args[1]); err != nil {
+						return sliceInfo{}, err
+					}
+				} else {
+					for _, arg := range e.Args[1:] {
+						if err := l.lowerSliceAppend(si, arg); err != nil {
+							return sliceInfo{}, err
+						}
+					}
+				}
+				return si, nil
+			}
+		}
+	case *ast.CompositeLit:
+		if isSliceType(e.Type) {
+			return l.evalSliceLiteral(e)
+		}
+	}
+	// Fallback: evaluate via lowerExpr and convert to sliceInfo.
+	r, err := l.lowerExpr(expr)
+	if err != nil {
+		return sliceInfo{}, err
+	}
+	if r.lenCell == 0 {
+		// nil produces a zero slice header.
+		if id, ok := expr.(*ast.Ident); ok && id.Name == "nil" {
+			tmp := l.allocSliceInfo()
+			l.emit(&IRZero{Dst: tmp.ptr})
+			l.emit(&IRZero{Dst: tmp.len})
+			l.emit(&IRZero{Dst: tmp.cap})
+			return tmp, nil
+		}
+		return sliceInfo{}, fmt.Errorf("unsupported slice expression: %T", expr)
+	}
+	// Copy to temp cells for mutable use.
+	tmp := l.allocSliceInfo()
+	tmp.elemSize = r.elemSize
+	tmp.elemType = r.elemType
+	tmp.elemSlice = r.elemSlice
+	tmp.elemPtrType = r.elemPtrType
+	l.emit(&IRCopy{Dst: tmp.ptr, Src: r.cell})
+	l.emit(&IRCopy{Dst: tmp.len, Src: r.lenCell})
+	l.emit(&IRCopy{Dst: tmp.cap, Src: r.capCell})
+	return tmp, nil
+}
+
+// lowerSliceAssign evaluates a slice RHS and copies to the destination header.
+func (l *Lowerer) lowerSliceAssign(si sliceInfo, rhs ast.Expr) error {
+	// Optimize s = append(s, v...): append directly to s.
+	if call, ok := rhs.(*ast.CallExpr); ok {
+		if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "append" && len(call.Args) >= 2 {
+			if srcID, ok := call.Args[0].(*ast.Ident); ok {
+				if src, ok := l.lookupSlice(srcID.Name); ok && src.ptr == si.ptr {
+					if call.Ellipsis.IsValid() && len(call.Args) == 2 {
+						return l.lowerSliceAppendSpread(si, call.Args[1])
+					}
+					for _, arg := range call.Args[1:] {
+						if err := l.lowerSliceAppend(si, arg); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+			}
+		}
+	}
+	tmp, err := l.lowerSliceExpr(rhs)
+	if err != nil {
+		return err
+	}
+	l.emit(&IRMove{Dst: si.ptr, Src: tmp.ptr})
+	l.emit(&IRMove{Dst: si.len, Src: tmp.len})
+	l.emit(&IRMove{Dst: si.cap, Src: tmp.cap})
+	l.freeSliceInfo(tmp)
+	return nil
+}
+
+func (l *Lowerer) evalSliceMake(typeExpr ast.Expr, args []ast.Expr) (sliceInfo, error) {
+	if sliceNestingDepth(typeExpr) > 2 {
+		return sliceInfo{}, fmt.Errorf("slice nesting deeper than 2 levels is not supported")
+	}
+	si := l.allocSliceInfo()
+	es, et, esl, ept := l.sliceElemInfo(typeExpr)
+	si.elemSize = es
+	si.elemType = et
+	si.elemSlice = esl
+	si.elemPtrType = ept
+	if err := l.lowerSliceMake(si, args); err != nil {
+		return sliceInfo{}, err
+	}
+	return si, nil
+}
+
+func (l *Lowerer) lowerSliceMake(si sliceInfo, args []ast.Expr) error {
+	lenR, err := l.lowerExpr(args[0])
+	if err != nil {
+		return err
+	}
+	var capR exprResult
+	if len(args) >= 2 {
+		capR, err = l.lowerExpr(args[1])
+		if err != nil {
+			return err
+		}
+	} else {
+		capR = lenR
+	}
+	l.emitCopyOrMove(si.len, lenR)
+	if len(args) >= 2 {
+		l.emitCopyOrMove(si.cap, capR)
+	} else {
+		l.emit(&IRCopy{Dst: si.cap, Src: si.len})
+	}
+	// Allocate backing array: ptr = heapPtr; heapPtr += cap * elemSize.
+	l.emit(&IRCopy{Dst: si.ptr, Src: l.heapPtr})
+	t := l.allocCell()
+	l.emit(&IRCopy{Dst: t, Src: si.cap})
+	if si.elemSize > 1 {
+		es := l.allocCell()
+		l.emit(&IRConst{Dst: es, Value: byte(si.elemSize)}) // #nosec G115
+		l.emit(&IRMul{Dst: t, Src1: t, Src2: es})
+		l.freeCell(es)
+	}
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: t})
+	l.freeCell(t)
+	capArg := args[0]
+	if len(args) >= 2 {
+		capArg = args[1]
+	}
+	if constCap, ok := l.constValue(capArg); ok {
+		slots := constCap * max(si.elemSize, 1)
+		if slots > 0 {
+			l.emit(&IRFramePush{Slots: slots})
+		}
+	} else {
+		pushSize := l.allocCell()
+		l.emit(&IRCopy{Dst: pushSize, Src: si.cap})
+		if si.elemSize > 1 {
+			es := l.allocCell()
+			l.emit(&IRConst{Dst: es, Value: byte(si.elemSize)}) // #nosec G115
+			l.emit(&IRMul{Dst: pushSize, Src1: pushSize, Src2: es})
+			l.freeCell(es)
+		}
+		l.emit(&IRFramePushDyn{Size: pushSize})
+		l.freeCell(pushSize)
+	}
+	return nil
+}
+
+func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
+	si := l.allocSliceInfo()
+	es, et, esl, ept := l.sliceElemInfo(comp.Type)
+	si.elemSize = es
+	si.elemType = et
+	si.elemSlice = esl
+	si.elemPtrType = ept
+	n := len(comp.Elts)
+	l.emit(&IRConst{Dst: si.len, Value: byte(n)}) // #nosec G115
+	l.emit(&IRConst{Dst: si.cap, Value: byte(n)}) // #nosec G115
+	l.emit(&IRCopy{Dst: si.ptr, Src: l.heapPtr})
+	t := l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(n * max(si.elemSize, 1))}) // #nosec G115
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: t})
+	l.freeCell(t)
+	if n > 0 {
+		l.emit(&IRFramePush{Slots: n * max(si.elemSize, 1)})
+	}
+	for i, elt := range comp.Elts {
+		idx := l.allocCell()
+		l.emit(&IRCopy{Dst: idx, Src: si.ptr})
+		l.emit(&IRAddI{Dst: idx, Value: byte(i * max(es, 1))}) // #nosec G115
+		if es > 1 {
+			// Multi-cell element: resolve struct/array literal.
+			base, size, err := l.resolveStructArg(elt)
+			if err != nil {
+				return sliceInfo{}, err
+			}
+			for j := range size {
+				l.ptrStore(idx, base+j)
+				if j < size-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			l.freeCellRange(base, size)
+		} else {
+			r, err := l.lowerExpr(elt)
+			if err != nil {
+				return sliceInfo{}, err
+			}
+			t := l.allocCell()
+			l.emitCopyOrMove(t, r)
+			l.ptrStore(idx, t)
+			l.freeCell(t)
+		}
+		l.freeCell(idx)
+	}
+	return si, nil
+}
+
+// evalSliceExpr handles s[low:high] or a[low:high].
+func (l *Lowerer) evalSliceExpr(se *ast.SliceExpr) (sliceInfo, error) {
+	id, ok := se.X.(*ast.Ident)
+	if !ok {
+		return sliceInfo{}, fmt.Errorf("unsupported slice expression")
+	}
+	// Determine element metadata.
+	si := l.allocSliceInfo()
+	if src, ok := l.lookupSlice(id.Name); ok {
+		si.elemSize = src.elemSize
+		si.elemType = src.elemType
+		si.elemSlice = src.elemSlice
+		si.elemPtrType = src.elemPtrType
+	} else if ai, ok := l.lookupArray(id.Name); ok {
+		si.elemSize = 1
+		_ = ai
+	}
+	if err := l.lowerSliceFromSliceExpr(si, se); err != nil {
+		l.freeSliceInfo(si)
+		return sliceInfo{}, err
+	}
+	return si, nil
+}
+
+func (l *Lowerer) lowerSliceFromSliceExpr(si sliceInfo, se *ast.SliceExpr) error {
+	id, ok := se.X.(*ast.Ident)
+	if !ok {
+		return fmt.Errorf("unsupported slice expression")
+	}
+	// Slice from array: s = a[low:high]
+	if ai, ok := l.lookupArray(id.Name); ok {
+		baseSlot := ai.base - numFixed
+		var low, high int
+		if se.Low != nil {
+			v, ok := l.constValue(se.Low)
+			if !ok {
+				return fmt.Errorf("slice bounds must be constant for arrays")
+			}
+			low = v
+		}
+		if se.High != nil {
+			v, ok := l.constValue(se.High)
+			if !ok {
+				return fmt.Errorf("slice bounds must be constant for arrays")
+			}
+			high = v
+		} else {
+			high = ai.count
+		}
+		capVal := ai.count - low
+		if se.Max != nil {
+			v, ok := l.constValue(se.Max)
+			if !ok {
+				return fmt.Errorf("slice bounds must be constant for arrays")
+			}
+			capVal = v - low
+		}
+		l.emit(&IRConst{Dst: si.ptr, Value: byte(baseSlot + low)}) // #nosec G115
+		l.emit(&IRConst{Dst: si.len, Value: byte(high - low)})     // #nosec G115
+		l.emit(&IRConst{Dst: si.cap, Value: byte(capVal)})         // #nosec G115
+		return nil
+	}
+	// Reslice: s = t[low:high]
+	src, ok := l.lookupSlice(id.Name)
+	if !ok {
+		return fmt.Errorf("unsupported slice expression base: %s", id.Name)
+	}
+	sameSlice := si.ptr == src.ptr
+	if se.Low == nil && se.High == nil {
+		if !sameSlice {
+			l.emit(&IRCopy{Dst: si.ptr, Src: src.ptr})
+			l.emit(&IRCopy{Dst: si.len, Src: src.len})
+			l.emit(&IRCopy{Dst: si.cap, Src: src.cap})
+		}
+		return nil
+	}
+	if se.Low != nil {
+		lowR, err := l.lowerExpr(se.Low)
+		if err != nil {
+			return err
+		}
+		if se.High != nil {
+			highR, err := l.lowerExpr(se.High)
+			if err != nil {
+				return err
+			}
+			l.emit(&IRSub{Dst: si.len, Src1: highR.cell, Src2: lowR.cell})
+			if highR.temp {
+				l.freeCell(highR.cell)
+			}
+		} else {
+			l.emit(&IRSub{Dst: si.len, Src1: src.len, Src2: lowR.cell})
+		}
+		if se.Max != nil {
+			maxR, err := l.lowerExpr(se.Max)
+			if err != nil {
+				return err
+			}
+			l.emit(&IRSub{Dst: si.cap, Src1: maxR.cell, Src2: lowR.cell})
+			if maxR.temp {
+				l.freeCell(maxR.cell)
+			}
+		} else {
+			l.emit(&IRSub{Dst: si.cap, Src1: src.cap, Src2: lowR.cell})
+		}
+		ptrOff := l.allocCell()
+		l.emit(&IRCopy{Dst: ptrOff, Src: lowR.cell})
+		if src.elemSize > 1 {
+			es := l.allocCell()
+			l.emit(&IRConst{Dst: es, Value: byte(src.elemSize)}) // #nosec G115
+			l.emit(&IRMul{Dst: ptrOff, Src1: ptrOff, Src2: es})
+			l.freeCell(es)
+		}
+		l.emit(&IRAdd{Dst: si.ptr, Src1: src.ptr, Src2: ptrOff})
+		l.freeCell(ptrOff)
+		if lowR.temp {
+			l.freeCell(lowR.cell)
+		}
+	} else {
+		if !sameSlice {
+			l.emit(&IRCopy{Dst: si.ptr, Src: src.ptr})
+		}
+		if se.Max != nil {
+			maxR, err := l.lowerExpr(se.Max)
+			if err != nil {
+				return err
+			}
+			l.emitCopyOrMove(si.cap, maxR)
+		} else if !sameSlice {
+			l.emit(&IRCopy{Dst: si.cap, Src: src.cap})
+		}
+		if se.High != nil {
+			highR, err := l.lowerExpr(se.High)
+			if err != nil {
+				return err
+			}
+			l.emitCopyOrMove(si.len, highR)
+		} else if !sameSlice {
+			l.emit(&IRCopy{Dst: si.len, Src: src.len})
+		}
+	}
+	return nil
+}
+
+// lowerSliceAppend handles s = append(s, val).
+func (l *Lowerer) lowerSliceAppend(si sliceInfo, valArg ast.Expr) error {
+	es := max(si.elemSize, 1)
+	// Evaluate the value to append.
+	var valBase Cell
+	if si.elemSlice {
+		// Slice-of-slices: evaluate inner slice header.
+		inner, err := l.lowerSliceExpr(valArg)
+		if err != nil {
+			return err
+		}
+		valBase = l.allocCells(3)
+		l.emit(&IRCopy{Dst: valBase, Src: inner.ptr})
+		l.emit(&IRCopy{Dst: valBase + 1, Src: inner.len})
+		l.emit(&IRCopy{Dst: valBase + 2, Src: inner.cap})
+		l.freeSliceInfo(inner)
+	} else if es > 1 {
+		// Multi-cell element: resolve struct arg (handles composite literals).
+		base, size, err := l.resolveStructArg(valArg)
+		if err != nil {
+			return err
+		}
+		if size != es {
+			return fmt.Errorf("append element size mismatch: got %d, want %d", size, es)
+		}
+		// Copy into temp cells to avoid freeing permanent struct cells
+		// and to snapshot the values before conditional branches.
+		valBase = l.allocCells(es)
+		for j := range es {
+			l.emit(&IRCopy{Dst: valBase + j, Src: base + j})
+		}
+	} else {
+		val, err := l.lowerExpr(valArg)
+		if err != nil {
+			return err
+		}
+		valBase = l.ensureTemp(val).cell
+	}
+
+	// emitStoreVal stores elemSize cells from valBase at the given heap address.
+	emitStoreVal := func(addr Cell) {
+		for j := range es {
+			l.ptrStore(addr, valBase+j)
+			if j < es-1 {
+				l.emit(&IRAddI{Dst: addr, Value: 1})
+			}
+		}
+	}
+	// emitAddr computes ptr + len * elemSize into a new temp cell.
+	emitAddr := func() Cell {
+		addr := l.allocCell()
+		if es == 1 {
+			l.emit(&IRAdd{Dst: addr, Src1: si.ptr, Src2: si.len})
+		} else {
+			t := l.allocCell()
+			l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+			l.emit(&IRMul{Dst: addr, Src1: si.len, Src2: t})
+			l.freeCell(t)
+			l.emit(&IRAdd{Dst: addr, Src1: si.ptr, Src2: addr})
+		}
+		return addr
+	}
+
+	// Compare len < cap.
+	cond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: si.len, Src2: si.cap})
+
+	// Fast path: has room.
+	saved := l.nodes
+	l.nodes = nil
+	addr := emitAddr()
+	emitStoreVal(addr)
+	l.freeCell(addr)
+	l.emit(&IRAddI{Dst: si.len, Value: 1})
+	fastNodes := l.nodes
+
+	// Slow path: reallocate.
+	l.nodes = nil
+	// Compute newCap = cap * 2 (min 1 if cap == 0). newCap counts elements.
+	newCap := l.allocCell()
+	capIsZero := l.allocCell()
+	zero := l.allocCell()
+	l.emit(&IRZero{Dst: zero})
+	l.emit(&IRCmp{Op: CmpEq, Dst: capIsZero, Src1: si.cap, Src2: zero})
+	l.freeCell(zero)
+	savedInner := l.nodes
+	l.nodes = nil
+	l.emit(&IRConst{Dst: newCap, Value: 1})
+	thenNodes := l.nodes
+	l.nodes = nil
+	l.emit(&IRAdd{Dst: newCap, Src1: si.cap, Src2: si.cap})
+	elseNodes := l.nodes
+	l.nodes = savedInner
+	l.emit(&IRIf{Cond: capIsZero, Then: &IRBlock{Nodes: thenNodes}, Else: &IRBlock{Nodes: elseNodes}})
+	l.freeCell(capIsZero)
+
+	// newCapCells = newCap * elemSize (total cells for allocation).
+	// capCells = cap * elemSize, lenCells = len * elemSize.
+	emitMulES := func(dst, src Cell) {
+		if es == 1 {
+			l.emit(&IRCopy{Dst: dst, Src: src})
+		} else {
+			t := l.allocCell()
+			l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+			l.emit(&IRMul{Dst: dst, Src1: src, Src2: t})
+			l.freeCell(t)
+		}
+	}
+	newCapCells := l.allocCell()
+	emitMulES(newCapCells, newCap)
+
+	// Check if backing array is at heap top: ptr + cap * elemSize == heapPtr.
+	// If so, extend in-place (no copy needed).
+	ptrCopy := l.allocCell()
+	l.emit(&IRCopy{Dst: ptrCopy, Src: si.ptr})
+	capCells := l.allocCell()
+	emitMulES(capCells, si.cap)
+	endPtr := l.allocCell()
+	l.emit(&IRAdd{Dst: endPtr, Src1: ptrCopy, Src2: capCells})
+	l.freeCell(ptrCopy)
+	l.freeCell(capCells)
+	atEnd := l.allocCell()
+	l.emit(&IRCmp{Op: CmpEq, Dst: atEnd, Src1: endPtr, Src2: l.heapPtr})
+	l.freeCell(endPtr)
+
+	// In-place extend: bump heapPtr, push extra guards, no copy.
+	savedExtend := l.nodes
+	l.nodes = nil
+	oldCapCells := l.allocCell()
+	emitMulES(oldCapCells, si.cap)
+	extraCells := l.allocCell()
+	l.emit(&IRSub{Dst: extraCells, Src1: newCapCells, Src2: oldCapCells})
+	l.freeCell(oldCapCells)
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: extraCells})
+	pushExt := l.allocCell()
+	l.emit(&IRCopy{Dst: pushExt, Src: extraCells})
+	l.emit(&IRFramePushDyn{Size: pushExt})
+	l.freeCell(pushExt)
+	l.freeCell(extraCells)
+	l.emit(&IRCopy{Dst: si.cap, Src: newCap})
+	extAddr := emitAddr()
+	emitStoreVal(extAddr)
+	l.freeCell(extAddr)
+	l.emit(&IRAddI{Dst: si.len, Value: 1})
+	extendNodes := l.nodes
+
+	// Full reallocation: allocate newCapCells, copy lenCells, store new element.
+	l.nodes = nil
+	newPtr := l.allocCell()
+	l.emit(&IRCopy{Dst: newPtr, Src: l.heapPtr})
+	t := l.allocCell()
+	l.emit(&IRCopy{Dst: t, Src: newCapCells})
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: t})
+	l.freeCell(t)
+	pushSize := l.allocCell()
+	l.emit(&IRCopy{Dst: pushSize, Src: newCapCells})
+	l.emit(&IRFramePushDyn{Size: pushSize})
+	l.freeCell(pushSize)
+	// Copy len * elemSize cells from old to new.
+	lenCells := l.allocCell()
+	emitMulES(lenCells, si.len)
+	counter := l.allocCell()
+	l.emit(&IRZero{Dst: counter})
+	loopCond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: loopCond, Src1: counter, Src2: lenCells})
+	loopSaved := l.nodes
+	l.nodes = nil
+	srcAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: srcAddr, Src1: si.ptr, Src2: counter})
+	tmpVal := l.ptrLoad(srcAddr)
+	l.freeCell(srcAddr)
+	dstAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: dstAddr, Src1: newPtr, Src2: counter})
+	l.ptrStore(dstAddr, tmpVal)
+	l.freeCell(dstAddr)
+	l.freeCell(tmpVal)
+	l.emit(&IRAddI{Dst: counter, Value: 1})
+	l.emit(&IRCmp{Op: CmpLt, Dst: loopCond, Src1: counter, Src2: lenCells})
+	loopBody := &IRBlock{Nodes: l.nodes}
+	l.nodes = loopSaved
+	l.emit(&IRLoop{Cond: loopCond, Body: loopBody})
+	l.freeCell(counter)
+	l.freeCell(loopCond)
+	l.freeCell(lenCells)
+	// Store new element at ptr + len * elemSize.
+	l.emit(&IRCopy{Dst: si.ptr, Src: newPtr})
+	l.freeCell(newPtr)
+	storeAddr := emitAddr()
+	emitStoreVal(storeAddr)
+	l.freeCell(storeAddr)
+	l.emit(&IRCopy{Dst: si.cap, Src: newCap})
+	l.freeCell(newCap)
+	l.freeCell(newCapCells)
+	l.emit(&IRAddI{Dst: si.len, Value: 1})
+	reallocNodes := l.nodes
+
+	l.nodes = savedExtend
+	l.emit(&IRIf{Cond: atEnd, Then: &IRBlock{Nodes: extendNodes}, Else: &IRBlock{Nodes: reallocNodes}})
+	l.freeCell(atEnd)
+	slowNodes := l.nodes
+
+	l.nodes = saved
+	l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: fastNodes}, Else: &IRBlock{Nodes: slowNodes}})
+	for j := range es {
+		l.freeCell(valBase + j)
+	}
+	return nil
+}
+
+// lowerSliceAppendSpread handles s = append(s, t...) by ensuring
+// capacity and copying elements from t to s.
+func (l *Lowerer) lowerSliceAppendSpread(si sliceInfo, srcExpr ast.Expr) error {
+	srcID, ok := srcExpr.(*ast.Ident)
+	if !ok {
+		return fmt.Errorf("append spread requires a slice identifier")
+	}
+	src, ok := l.lookupSlice(srcID.Name)
+	if !ok {
+		return fmt.Errorf("append spread requires a slice argument")
+	}
+	es := max(si.elemSize, 1)
+	// Compute needed = len(dst) + len(src). If needed > cap, reallocate.
+	needed := l.allocCell()
+	l.emit(&IRAdd{Dst: needed, Src1: si.len, Src2: src.len})
+	growCond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpGt, Dst: growCond, Src1: needed, Src2: si.cap})
+	savedGrow := l.nodes
+	l.nodes = nil
+	// Reallocate: newCap = needed, allocate, copy old, update header.
+	newPtr := l.allocCell()
+	l.emit(&IRCopy{Dst: newPtr, Src: l.heapPtr})
+	pushSize := l.allocCell()
+	t := l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+	l.emit(&IRMul{Dst: pushSize, Src1: needed, Src2: t})
+	l.freeCell(t)
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: pushSize})
+	l.emit(&IRFramePushDyn{Size: pushSize})
+	l.freeCell(pushSize)
+	// Copy old elements: len * es cells.
+	oldCells := l.allocCell()
+	t = l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+	l.emit(&IRMul{Dst: oldCells, Src1: si.len, Src2: t})
+	l.freeCell(t)
+	counter := l.allocCell()
+	l.emit(&IRZero{Dst: counter})
+	copyCond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: copyCond, Src1: counter, Src2: oldCells})
+	savedCopy := l.nodes
+	l.nodes = nil
+	sAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: sAddr, Src1: si.ptr, Src2: counter})
+	v := l.ptrLoad(sAddr)
+	l.freeCell(sAddr)
+	dAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: dAddr, Src1: newPtr, Src2: counter})
+	l.ptrStore(dAddr, v)
+	l.freeCell(v)
+	l.freeCell(dAddr)
+	l.emit(&IRAddI{Dst: counter, Value: 1})
+	l.emit(&IRCmp{Op: CmpLt, Dst: copyCond, Src1: counter, Src2: oldCells})
+	copyBody := &IRBlock{Nodes: l.nodes}
+	l.nodes = savedCopy
+	l.emit(&IRLoop{Cond: copyCond, Body: copyBody})
+	l.freeCell(counter)
+	l.freeCell(copyCond)
+	l.freeCell(oldCells)
+	l.emit(&IRCopy{Dst: si.ptr, Src: newPtr})
+	l.emit(&IRCopy{Dst: si.cap, Src: needed})
+	l.freeCell(newPtr)
+	growNodes := l.nodes
+	l.nodes = savedGrow
+	l.emit(&IRIf{Cond: growCond, Then: &IRBlock{Nodes: growNodes}})
+	l.freeCell(growCond)
+	l.freeCell(needed)
+	// Copy src elements to dst[len*es..].
+	counter = l.allocCell()
+	l.emit(&IRZero{Dst: counter})
+	srcCells := l.allocCell()
+	t = l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+	l.emit(&IRMul{Dst: srcCells, Src1: src.len, Src2: t})
+	l.freeCell(t)
+	cond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: srcCells})
+	saved := l.nodes
+	l.nodes = nil
+	sAddr = l.allocCell()
+	l.emit(&IRAdd{Dst: sAddr, Src1: src.ptr, Src2: counter})
+	v = l.ptrLoad(sAddr)
+	l.freeCell(sAddr)
+	// dst offset = len * es + counter
+	dstOff := l.allocCell()
+	t = l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+	l.emit(&IRMul{Dst: dstOff, Src1: si.len, Src2: t})
+	l.freeCell(t)
+	l.emit(&IRAdd{Dst: dstOff, Src1: dstOff, Src2: counter})
+	dAddr = l.allocCell()
+	l.emit(&IRAdd{Dst: dAddr, Src1: si.ptr, Src2: dstOff})
+	l.freeCell(dstOff)
+	l.ptrStore(dAddr, v)
+	l.freeCell(v)
+	l.freeCell(dAddr)
+	l.emit(&IRAddI{Dst: counter, Value: 1})
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: srcCells})
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+	l.emit(&IRLoop{Cond: cond, Body: body})
+	l.freeCell(counter)
+	l.freeCell(srcCells)
+	l.freeCell(cond)
+	// Update len.
+	l.emit(&IRAdd{Dst: si.len, Src1: si.len, Src2: src.len})
+	return nil
+}
+
+// structDef returns the StructDef for a named struct type, or nil.
 func (l *Lowerer) structDef(expr ast.Expr) *StructDef {
 	id, ok := expr.(*ast.Ident)
 	if !ok {
@@ -359,11 +1135,119 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 								}
 								continue
 							}
+							if isSliceType(comp.Type) {
+								if _, exists := sc.slices[id.Name]; !exists {
+									es, et, esl, ept := l.sliceElemInfo(comp.Type)
+									l.defineSlice(sc, id.Name, es, et, esl, ept)
+								}
+								continue
+							}
 							if def := l.structDef(comp.Type); def != nil {
 								if _, exists := sc.structs[id.Name]; !exists {
 									l.defineStruct(sc, id.Name, def)
 								}
 								continue
+							}
+						}
+					}
+					// s := make([]byte, n) or s := append(...)
+					if i < len(s.Rhs) {
+						if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
+							if fn, ok := call.Fun.(*ast.Ident); ok {
+								if fn.Name == "make" && len(call.Args) >= 2 && isSliceType(call.Args[0]) {
+									if _, exists := sc.slices[id.Name]; !exists {
+										es, et, esl, ept := l.sliceElemInfo(call.Args[0])
+										l.defineSlice(sc, id.Name, es, et, esl, ept)
+									}
+									continue
+								}
+								if fn.Name == "append" && len(call.Args) >= 2 {
+									if _, exists := sc.slices[id.Name]; !exists {
+										// append(s, ...) where s is a known slice.
+										if srcID, ok := call.Args[0].(*ast.Ident); ok {
+											if _, exists := sc.slices[srcID.Name]; exists {
+												es, et, esl, ept := l.sliceElemInfo(call.Args[0])
+												l.defineSlice(sc, id.Name, es, et, esl, ept)
+												continue
+											}
+										}
+										// append(make(...), ...) or append([]byte{...}, ...).
+										if innerCall, ok := call.Args[0].(*ast.CallExpr); ok {
+											if innerFn, ok := innerCall.Fun.(*ast.Ident); ok && innerFn.Name == "make" && len(innerCall.Args) >= 2 && isSliceType(innerCall.Args[0]) {
+												es, et, esl, ept := l.sliceElemInfo(innerCall.Args[0])
+												l.defineSlice(sc, id.Name, es, et, esl, ept)
+												continue
+											}
+										}
+										if comp, ok := call.Args[0].(*ast.CompositeLit); ok && isSliceType(comp.Type) {
+											es, et, esl, ept := l.sliceElemInfo(comp.Type)
+											l.defineSlice(sc, id.Name, es, et, esl, ept)
+											continue
+										}
+									}
+								}
+							}
+						}
+					}
+					// s := a[1:3] or s := t[:]
+					if i < len(s.Rhs) {
+						if se, ok := s.Rhs[i].(*ast.SliceExpr); ok {
+							if _, exists := sc.slices[id.Name]; !exists {
+								es, et, esl, ept := 1, "", false, ""
+								if srcID, ok := se.X.(*ast.Ident); ok {
+									if src, ok := sc.slices[srcID.Name]; ok {
+										es, et, esl, ept = src.elemSize, src.elemType, src.elemSlice, src.elemPtrType
+									}
+								}
+								l.defineSlice(sc, id.Name, es, et, esl, ept)
+							}
+							continue
+						}
+					}
+					// inner := s[i] where s is [][]byte or []P
+					if i < len(s.Rhs) {
+						if idxExpr, ok := s.Rhs[i].(*ast.IndexExpr); ok {
+							if arrID, ok := idxExpr.X.(*ast.Ident); ok {
+								if si, ok := sc.slices[arrID.Name]; ok {
+									if si.elemSlice {
+										if _, exists := sc.slices[id.Name]; !exists {
+											l.defineSlice(sc, id.Name, 1, "", false)
+										}
+										continue
+									}
+									if si.elemType != "" {
+										if _, exists := sc.structs[id.Name]; !exists {
+											def := l.result.Structs[si.elemType]
+											l.defineStruct(sc, id.Name, def)
+										}
+										continue
+									}
+								}
+							}
+						}
+					}
+					// s := t where t is a slice
+					if i < len(s.Rhs) {
+						if rhsID, ok := s.Rhs[i].(*ast.Ident); ok {
+							if src, ok := sc.slices[rhsID.Name]; ok {
+								if _, exists := sc.slices[id.Name]; !exists {
+									l.defineSlice(sc, id.Name, src.elemSize, src.elemType, src.elemSlice, src.elemPtrType)
+								}
+								continue
+							}
+						}
+					}
+					// s := f() where f returns a slice
+					if i < len(s.Rhs) {
+						if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
+							if fn, ok := call.Fun.(*ast.Ident); ok {
+								if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
+									if _, exists := sc.slices[id.Name]; !exists {
+										es := max(info.ReturnType.SliceElemSize, 1)
+										l.defineSlice(sc, id.Name, es, info.ReturnType.SliceElemType, false)
+									}
+									continue
+								}
 							}
 						}
 					}
@@ -398,6 +1282,42 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 			if s.Value != nil {
 				if id, ok := s.Value.(*ast.Ident); ok {
 					if _, exists := sc.vars[id.Name]; !exists {
+						// Struct/pointer slice range: allocate appropriately.
+						var rangeElemType string
+						if rangeID, ok := s.X.(*ast.Ident); ok {
+							if si, ok := sc.slices[rangeID.Name]; ok {
+								if si.elemType != "" {
+									rangeElemType = si.elemType
+								} else if si.elemPtrType != "" {
+									sc.vars[id.Name] = l.allocCell()
+									sc.ptrType[id.Name] = si.elemPtrType
+									break
+								}
+							}
+						}
+						if rangeElemType == "" {
+							if call, ok := s.X.(*ast.CallExpr); ok {
+								if fn, ok := call.Fun.(*ast.Ident); ok {
+									if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
+										rangeElemType = info.ReturnType.SliceElemType
+									}
+								}
+							}
+						}
+						if rangeElemType == "" {
+							if se, ok := s.X.(*ast.SliceExpr); ok {
+								if srcID, ok := se.X.(*ast.Ident); ok {
+									if si, ok := sc.slices[srcID.Name]; ok {
+										rangeElemType = si.elemType
+									}
+								}
+							}
+						}
+						if rangeElemType != "" {
+							def := l.result.Structs[rangeElemType]
+							l.defineStruct(sc, id.Name, def)
+							break
+						}
 						sc.vars[id.Name] = l.allocCell()
 					}
 				}
@@ -419,6 +1339,11 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 								l.defineStructArray(sc, name.Name, count, elemType, elemSize, ies)
 							} else {
 								l.defineArray(sc, name.Name, count)
+							}
+						} else if isSliceType(vs.Type) {
+							if _, exists := sc.slices[name.Name]; !exists {
+								es, et, esl, ept := l.sliceElemInfo(vs.Type)
+								l.defineSlice(sc, name.Name, es, et, esl, ept)
 							}
 						} else if def := l.structDef(vs.Type); def != nil {
 							if _, exists := sc.structs[name.Name]; !exists {
@@ -626,8 +1551,18 @@ func (l *Lowerer) arrayElementInfo(expr ast.Expr) (count, elemSize int, elemType
 	return count, 1, "", 0
 }
 
-// arrayNestingDepth returns the nesting depth of an array type.
-// [N]byte = 1, [N][M]byte = 2, [N][M][K]byte = 3.
+func sliceNestingDepth(expr ast.Expr) int {
+	depth := 0
+	for {
+		at, ok := expr.(*ast.ArrayType)
+		if !ok || at.Len != nil {
+			return depth
+		}
+		depth++
+		expr = at.Elt
+	}
+}
+
 func arrayNestingDepth(expr ast.Expr) int {
 	depth := 0
 	for {
@@ -942,6 +1877,14 @@ func (l *Lowerer) resolveExprTypeName(expr ast.Expr) string {
 			if ptrAI, ok := l.lookupPtrArray(id.Name); ok && ptrAI.elemType != "" {
 				return ptrAI.elemType
 			}
+			if si, ok := l.lookupSlice(id.Name); ok {
+				if si.elemType != "" {
+					return si.elemType
+				}
+				if si.elemPtrType != "" {
+					return si.elemPtrType
+				}
+			}
 		}
 		// Nested index: a[i][j] -> resolve a[i]'s type.
 		return l.resolveExprTypeName(x.X)
@@ -966,92 +1909,86 @@ func (l *Lowerer) resolveExprTypeName(expr ast.Expr) string {
 func (l *Lowerer) lowerBuiltinCall(name string, args []ast.Expr, lowerExpr func(ast.Expr) (exprResult, error)) (bool, error) {
 	switch name {
 	case "putchar":
-		if len(args) != 1 {
-			return true, fmt.Errorf("putchar expects 1 argument, got %d", len(args))
-		}
-		r, err := lowerExpr(args[0])
-		if err != nil {
-			return true, err
-		}
-		if r.size > 0 {
-			if r.typeName != "" {
-				return true, fmt.Errorf("cannot use struct %s as byte value", r.typeName)
-			}
-			if r.elemCount > 0 {
-				return true, fmt.Errorf("cannot use array as byte value")
-			}
-			return true, fmt.Errorf("cannot use composite value as byte")
-		}
-		l.emit(&IRPutc{Src: r.cell})
-		if r.temp {
-			l.freeCell(r.cell)
-		}
-		return true, nil
+		return true, l.lowerPutchar(args, lowerExpr)
 	case "print", "println":
-		for i, arg := range args {
-			if i > 0 && name == "println" {
-				t := l.allocCell()
-				l.emit(&IRConst{Dst: t, Value: ' '})
-				l.emit(&IRPutc{Src: t})
-				l.freeCell(t)
-			}
-			if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				s, _ := strconv.Unquote(lit.Value)
-				t := l.allocCell()
-				for _, b := range []byte(s) {
-					l.emit(&IRConst{Dst: t, Value: b})
-					l.emit(&IRPutc{Src: t})
-				}
-				l.freeCell(t)
-			} else if id, ok := arg.(*ast.Ident); ok && l.lookupStringConst(id.Name) != "" {
-				s := l.lookupStringConst(id.Name)
-				t := l.allocCell()
-				for _, b := range []byte(s) {
-					l.emit(&IRConst{Dst: t, Value: b})
-					l.emit(&IRPutc{Src: t})
-				}
-				l.freeCell(t)
-			} else if call, ok := arg.(*ast.CallExpr); ok && len(call.Args) == 1 {
-				if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "string" {
-					// string(x) -- print as raw character.
-					r, err := lowerExpr(call.Args[0])
-					if err != nil {
-						return true, err
-					}
-					l.emit(&IRPutc{Src: r.cell})
-					if r.temp {
-						l.freeCell(r.cell)
-					}
-				} else {
-					r, err := lowerExpr(arg)
-					if err != nil {
-						return true, err
-					}
-					l.emitPrintByte(r.cell)
-					if r.temp {
-						l.freeCell(r.cell)
-					}
-				}
-			} else {
-				r, err := lowerExpr(arg)
-				if err != nil {
-					return true, err
-				}
-				l.emitPrintByte(r.cell)
-				if r.temp {
-					l.freeCell(r.cell)
-				}
-			}
+		return true, l.lowerPrint(name, args, lowerExpr)
+	case "clear":
+		return true, l.lowerClear(args)
+	case "copy":
+		return true, l.lowerCopy(args)
+	}
+	return false, nil
+}
+
+func (l *Lowerer) lowerPutchar(args []ast.Expr, lowerExpr func(ast.Expr) (exprResult, error)) error {
+	if len(args) != 1 {
+		return fmt.Errorf("putchar expects 1 argument, got %d", len(args))
+	}
+	r, err := lowerExpr(args[0])
+	if err != nil {
+		return err
+	}
+	if r.size > 0 {
+		if r.typeName != "" {
+			return fmt.Errorf("cannot use struct %s as byte value", r.typeName)
 		}
-		if name == "println" {
+		if r.elemCount > 0 {
+			return fmt.Errorf("cannot use array as byte value")
+		}
+		return fmt.Errorf("cannot use composite value as byte")
+	}
+	l.emit(&IRPutc{Src: r.cell})
+	if r.temp {
+		l.freeCell(r.cell)
+	}
+	return nil
+}
+
+func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Expr) (exprResult, error)) error {
+	for i, arg := range args {
+		if i > 0 && name == "println" {
 			t := l.allocCell()
-			l.emit(&IRConst{Dst: t, Value: '\n'})
+			l.emit(&IRConst{Dst: t, Value: ' '})
 			l.emit(&IRPutc{Src: t})
 			l.freeCell(t)
 		}
-		return true, nil
+		if s := l.resolveStringArg(arg); s != "" {
+			t := l.allocCell()
+			for _, b := range []byte(s) {
+				l.emit(&IRConst{Dst: t, Value: b})
+				l.emit(&IRPutc{Src: t})
+			}
+			l.freeCell(t)
+			continue
+		}
+		// string(x) -- print as raw character.
+		rawChar := false
+		if call, ok := arg.(*ast.CallExpr); ok && len(call.Args) == 1 {
+			if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "string" {
+				arg = call.Args[0]
+				rawChar = true
+			}
+		}
+		r, err := lowerExpr(arg)
+		if err != nil {
+			return err
+		}
+		if rawChar {
+			l.emit(&IRPutc{Src: r.cell})
+		} else {
+			l.emitPrintByte(r.cell)
+		}
+		if r.temp {
+			l.freeCell(r.cell)
+		}
 	}
-	return false, nil
+	if name == "println" {
+		t := l.allocCell()
+		l.emit(&IRConst{Dst: t, Value: '\n'})
+		l.emit(&IRPutc{Src: t})
+		l.freeCell(t)
+	}
+	return nil
 }
 
 // emitPrintByte emits IR to print a byte value as a decimal number (0-255).
@@ -1103,6 +2040,115 @@ func (l *Lowerer) emitPrintByte(src Cell) {
 	l.freeCell(r)
 }
 
+func (l *Lowerer) resolveStringArg(expr ast.Expr) string {
+	if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+		s, _ := strconv.Unquote(lit.Value)
+		return s
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		return l.lookupStringConst(id.Name)
+	}
+	return ""
+}
+
+func (l *Lowerer) lowerClear(args []ast.Expr) error {
+	if len(args) != 1 {
+		return fmt.Errorf("clear expects 1 argument")
+	}
+	r, err := l.lowerExpr(args[0])
+	if err != nil || r.lenCell == 0 {
+		return fmt.Errorf("clear expects a slice argument")
+	}
+	es := max(r.elemSize, 1)
+	counter := l.allocCell()
+	l.emit(&IRZero{Dst: counter})
+	limit := l.allocCell()
+	t := l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+	l.emit(&IRMul{Dst: limit, Src1: r.lenCell, Src2: t})
+	l.freeCell(t)
+	cond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
+	saved := l.nodes
+	l.nodes = nil
+	addr := l.allocCell()
+	l.emit(&IRAdd{Dst: addr, Src1: r.cell, Src2: counter})
+	zero := l.allocCell()
+	l.emit(&IRZero{Dst: zero})
+	l.ptrStore(addr, zero)
+	l.freeCell(zero)
+	l.freeCell(addr)
+	l.emit(&IRAddI{Dst: counter, Value: 1})
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+	l.emit(&IRLoop{Cond: cond, Body: body})
+	l.freeCell(counter)
+	l.freeCell(limit)
+	l.freeCell(cond)
+	return nil
+}
+
+func (l *Lowerer) lowerCopy(args []ast.Expr) error {
+	if len(args) != 2 {
+		return fmt.Errorf("copy expects 2 arguments")
+	}
+	dst, err := l.lowerExpr(args[0])
+	if err != nil || dst.lenCell == 0 {
+		return fmt.Errorf("copy expects slice arguments")
+	}
+	src, err := l.lowerExpr(args[1])
+	if err != nil || src.lenCell == 0 {
+		return fmt.Errorf("copy expects slice arguments")
+	}
+	es := max(dst.elemSize, 1)
+	// n = min(len(dst), len(src)) * elemSize
+	n := l.allocCell()
+	cmpCell := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLeq, Dst: cmpCell, Src1: dst.lenCell, Src2: src.lenCell})
+	savedCopy := l.nodes
+	l.nodes = nil
+	l.emit(&IRCopy{Dst: n, Src: dst.lenCell})
+	thenNodes := l.nodes
+	l.nodes = nil
+	l.emit(&IRCopy{Dst: n, Src: src.lenCell})
+	elseNodes := l.nodes
+	l.nodes = savedCopy
+	l.emit(&IRIf{Cond: cmpCell, Then: &IRBlock{Nodes: thenNodes}, Else: &IRBlock{Nodes: elseNodes}})
+	l.freeCell(cmpCell)
+	limit := l.allocCell()
+	t := l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+	l.emit(&IRMul{Dst: limit, Src1: n, Src2: t})
+	l.freeCell(t)
+	l.freeCell(n)
+	// Copy loop: for i := 0; i < limit; i++ { dst[ptr+i] = src[ptr+i] }
+	counter := l.allocCell()
+	l.emit(&IRZero{Dst: counter})
+	cond := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
+	saved := l.nodes
+	l.nodes = nil
+	srcAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: srcAddr, Src1: src.cell, Src2: counter})
+	val := l.ptrLoad(srcAddr)
+	l.freeCell(srcAddr)
+	dstAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: dstAddr, Src1: dst.cell, Src2: counter})
+	l.ptrStore(dstAddr, val)
+	l.freeCell(val)
+	l.freeCell(dstAddr)
+	l.emit(&IRAddI{Dst: counter, Value: 1})
+	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+	l.emit(&IRLoop{Cond: cond, Body: body})
+	l.freeCell(counter)
+	l.freeCell(limit)
+	l.freeCell(cond)
+	return nil
+}
+
 func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 	gd, ok := s.Decl.(*ast.GenDecl)
 	if !ok {
@@ -1116,9 +2162,12 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 		if vs.Type != nil && arrayNestingDepth(vs.Type) > 3 {
 			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
 		}
+		if vs.Type != nil && sliceNestingDepth(vs.Type) > 2 {
+			return fmt.Errorf("slice nesting deeper than 2 levels is not supported")
+		}
 		for i, name := range vs.Names {
 			if i >= len(vs.Values) {
-				// No initializer: zero the variable/array/struct.
+				// No initializer: zero the variable/array/struct/slice.
 				if ai, ok := l.lookupArray(name.Name); ok {
 					for j := range ai.size {
 						l.emit(&IRZero{Dst: ai.base + j})
@@ -1127,6 +2176,10 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 					for j := range si.def.Size {
 						l.emit(&IRZero{Dst: si.base + j})
 					}
+				} else if si, ok := l.lookupSlice(name.Name); ok {
+					l.emit(&IRZero{Dst: si.ptr})
+					l.emit(&IRZero{Dst: si.len})
+					l.emit(&IRZero{Dst: si.cap})
 				} else if cell, err := l.lookupVar(name.Name); err == nil {
 					l.emit(&IRZero{Dst: cell})
 				}
@@ -1143,6 +2196,10 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 // lowerVarInit handles `name = rhs` where rhs can be a composite literal,
 // a composite variable, or a scalar expression.
 func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
+	// Slice assignment: s = make([]byte, n) or s = append(s, v) or s = expr
+	if si, ok := l.lookupSlice(name); ok {
+		return l.lowerSliceAssign(si, rhs)
+	}
 	// Composite literal: a = [N]byte{...} or p = Point{...}
 	if comp, ok := rhs.(*ast.CompositeLit); ok {
 		if comp.Type != nil && arrayNestingDepth(comp.Type) > 3 {
@@ -1171,6 +2228,11 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 				l.currentScope().ptrArray[name] = ai
 			}
 		}
+		if comp, ok := unary.X.(*ast.CompositeLit); ok {
+			if def := l.structDef(comp.Type); def != nil {
+				l.currentScope().ptrType[name] = def.Name
+			}
+		}
 	}
 	// Composite variable copy: b = a where a is array or struct.
 	// Must define the LHS as composite if it's a := declaration.
@@ -1197,15 +2259,45 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 	if err != nil {
 		return err
 	}
-	// Resolve destination.
+	// Track pointer type from expression result (function returns, etc.).
+	if r.isPointer {
+		sc := l.currentScope()
+		if r.typeName != "" {
+			sc.ptrType[name] = r.typeName
+		} else if r.elemCount > 0 && r.elemCount != 255 {
+			sc.ptrArray[name] = arrayInfo{
+				size: r.elemCount, count: r.elemCount,
+				elemSize: max(r.elemSize, 1), elemType: r.elemType,
+			}
+		}
+	}
+	// Resolve destination and copy.
 	dst, err := l.lowerExpr(&ast.Ident{Name: name})
 	if err != nil {
 		return err
 	}
+	return l.assignResult(dst, r)
+}
+
+// assignResult copies an expression result to a destination.
+func (l *Lowerer) assignResult(dst, r exprResult) error {
 	if r.cell == dst.cell {
 		if r.temp {
 			l.freeCell(r.cell)
 		}
+		return nil
+	}
+	// Pointer-based composite: materialize by loading each cell.
+	if r.isPointer && r.elemCount > 1 && dst.size > 1 {
+		for j := range min(r.elemCount, dst.size) {
+			val := l.ptrLoad(r.cell)
+			l.emit(&IRMove{Dst: dst.cell + j, Src: val})
+			l.freeCell(val)
+			if j < r.elemCount-1 {
+				l.emit(&IRAddI{Dst: r.cell, Value: 1})
+			}
+		}
+		l.freeCell(r.cell)
 		return nil
 	}
 	l.emitCopyOrMove(dst.cell, r)
@@ -1250,8 +2342,8 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				if info.Returns == len(s.Lhs) && info.Returns > 1 {
 					return l.lowerMultiReturnAssign(s, info, args)
 				}
-				// Composite return: p := f() where f returns struct or array.
-				if len(s.Lhs) == 1 && (info.ReturnType.ArraySize > 0 || info.ReturnType.StructType != "") {
+				// Composite return: p := f() where f returns struct, array, or slice.
+				if len(s.Lhs) == 1 && !info.ReturnType.IsPointer && (info.ReturnType.ArraySize > 0 || info.ReturnType.StructType != "" || info.ReturnType.IsSlice) {
 					return l.lowerCompositeReturnAssign(s.Lhs[0], info, args)
 				}
 			}
@@ -1355,7 +2447,6 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 }
 
 func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
-	// Generic: evaluate base and value, write at index.
 	base, err := l.lowerExpr(idx.X)
 	if err != nil {
 		return err
@@ -1374,7 +2465,19 @@ func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 		}
 		return fmt.Errorf("cannot index non-array expression")
 	}
-	// Composite literal RHS: struct or array literal.
+	// Slice element write: s[i] = t, s[i] = make(...), s[i] = []byte{...}.
+	if base.elemSlice {
+		inner, err := l.lowerSliceExpr(rhs)
+		if err != nil {
+			return err
+		}
+		addr, err := l.ptrDynIndex(base.cell, idx.Index, 3)
+		if err != nil {
+			return err
+		}
+		l.storeSliceHeader(addr, inner)
+		return nil
+	}
 	if comp, ok := rhs.(*ast.CompositeLit); ok {
 		return l.lowerCompositeElemAssign(base, idx.Index, comp)
 	}
@@ -1385,8 +2488,26 @@ func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 	return l.writeInto(base, idx.Index, r)
 }
 
+// storeSliceHeader stores a 3-cell slice header (ptr, len, cap) at the
+// given address via pointer writes. Frees addr and inner after storing.
+func (l *Lowerer) storeSliceHeader(addr Cell, inner sliceInfo) {
+	t := l.allocCell()
+	l.emit(&IRCopy{Dst: t, Src: inner.ptr})
+	l.ptrStore(addr, t)
+	l.emit(&IRAddI{Dst: addr, Value: 1})
+	l.emit(&IRCopy{Dst: t, Src: inner.len})
+	l.ptrStore(addr, t)
+	l.emit(&IRAddI{Dst: addr, Value: 1})
+	l.emit(&IRCopy{Dst: t, Src: inner.cap})
+	l.ptrStore(addr, t)
+	l.freeCell(t)
+	l.freeCell(addr)
+	l.freeSliceInfo(inner)
+}
+
 // lowerCompositeElemAssign handles a[i] = CompositeLit where the RHS is
 // a struct literal (Point{x: 1}) or array literal ([3]byte{1, 2, 3}).
+// Slice literals are handled by the elemSlice path in lowerArrayAssign.
 func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, comp *ast.CompositeLit) error {
 	// Determine how to lower the literal: struct or array.
 	lowerLitInto := func(dst Cell) error {
@@ -1401,6 +2522,29 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 		if constIdx >= base.elemCount {
 			return fmt.Errorf("array index %d out of bounds [0:%d]", constIdx, base.elemCount)
 		}
+		if base.isPointer {
+			// Pointer-based: evaluate literal into temps, then store via pointer.
+			valBase := l.allocCells(base.elemSize)
+			for j := range base.elemSize {
+				l.emit(&IRZero{Dst: valBase + j})
+			}
+			if err := lowerLitInto(valBase); err != nil {
+				return err
+			}
+			addr, err := l.ptrDynIndex(base.cell, indexExpr, base.elemSize)
+			if err != nil {
+				return err
+			}
+			for j := range base.elemSize {
+				l.ptrStore(addr, valBase+j)
+				l.freeCell(valBase + j)
+				if j < base.elemSize-1 {
+					l.emit(&IRAddI{Dst: addr, Value: 1})
+				}
+			}
+			l.freeCell(addr)
+			return nil
+		}
 		return lowerLitInto(base.cell + constIdx*base.elemSize)
 	}
 	// Variable index: evaluate into temp cells, then dynamic store.
@@ -1410,6 +2554,22 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 	}
 	if err := lowerLitInto(valBase); err != nil {
 		return err
+	}
+	if base.isPointer {
+		// Pointer-based: store via ptrStore at ptr + index * elemSize.
+		addr, err := l.ptrDynIndex(base.cell, indexExpr, base.elemSize)
+		if err != nil {
+			return err
+		}
+		for j := range base.elemSize {
+			l.ptrStore(addr, valBase+j)
+			l.freeCell(valBase + j)
+			if j < base.elemSize-1 {
+				l.emit(&IRAddI{Dst: addr, Value: 1})
+			}
+		}
+		l.freeCell(addr)
+		return nil
 	}
 	ai := arrayInfo{
 		base: base.cell, size: base.elemCount * base.elemSize,
@@ -1436,6 +2596,25 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 // a struct or array. Inlines the call and moves return cells to
 // the composite variable's base.
 func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args []ast.Expr) error {
+	// Index expression: s[i] = f() where f returns struct/array.
+	if idx, ok := lhs.(*ast.IndexExpr); ok {
+		retCells, err := l.inlineCall(info, args)
+		if err != nil {
+			return err
+		}
+		base, err := l.lowerExpr(idx.X)
+		if err != nil {
+			return err
+		}
+		retSize := info.Returns
+		if info.ReturnType.StructType != "" {
+			retSize = l.result.Structs[info.ReturnType.StructType].Size
+		} else if info.ReturnType.ArraySize > 0 {
+			retSize = info.ReturnType.ArraySize
+		}
+		val := exprResult{cell: retCells[0], temp: true, size: retSize}
+		return l.writeInto(base, idx.Index, val)
+	}
 	id, ok := lhs.(*ast.Ident)
 	if !ok {
 		return fmt.Errorf("unsupported assignment target for composite return")
@@ -1448,6 +2627,23 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 	// Remove any scalar cell allocated by scanAndAllocLocals,
 	// since the variable is actually a composite.
 	var base Cell
+	if info.ReturnType.IsSlice {
+		sc := l.currentScope()
+		delete(sc.vars, id.Name)
+		es := max(info.ReturnType.SliceElemSize, 1)
+		et := info.ReturnType.SliceElemType
+		if si, ok := l.lookupSlice(id.Name); ok {
+			l.emit(&IRMove{Dst: si.ptr, Src: retCells[0]})
+			l.emit(&IRMove{Dst: si.len, Src: retCells[1]})
+			l.emit(&IRMove{Dst: si.cap, Src: retCells[2]})
+		} else {
+			newSI := l.defineSlice(sc, id.Name, es, et, false)
+			l.emit(&IRMove{Dst: newSI.ptr, Src: retCells[0]})
+			l.emit(&IRMove{Dst: newSI.len, Src: retCells[1]})
+			l.emit(&IRMove{Dst: newSI.cap, Src: retCells[2]})
+		}
+		return nil
+	}
 	if info.ReturnType.StructType != "" {
 		def := l.result.Structs[info.ReturnType.StructType]
 		sc := l.currentScope()
@@ -1484,7 +2680,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	}
 	def := l.result.Structs[base.typeName]
 	offset := def.Offsets[sel.Sel.Name]
-	if base.isPtr {
+	if base.isPointer {
 		// Pointer write: compute slot = ptr + offset, then store.
 		slot := l.ptrOffset(base.cell, offset)
 		val, err := l.lowerExpr(rhs)
@@ -1682,25 +2878,22 @@ func (l *Lowerer) lowerFieldIncDec(sel *ast.SelectorExpr, tok token.Token) error
 			}
 		}
 	}
-	// Pointer-to-struct field inc/dec: ptr.x++ -> load, modify, store
-	if id, ok := sel.X.(*ast.Ident); ok {
-		if ptrDef, ok := l.lookupPtrType(id.Name); ok {
-			ptrCell, err := l.lookupVar(id.Name)
-			if err != nil {
-				return err
-			}
-			idx := l.ptrOffset(ptrCell, ptrDef.Offsets[sel.Sel.Name])
-			val := l.ptrLoad(idx)
-			if tok == token.INC {
-				l.emit(&IRAddI{Dst: val, Value: 1})
-			} else {
-				l.emit(&IRSubI{Dst: val, Value: 1})
-			}
-			l.ptrStore(idx, val)
-			l.freeCell(val)
-			l.freeCell(idx)
-			return nil
+	// Pointer-based field inc/dec: ptr.x++, s[i].x++ -> load, modify, store
+	base, err := l.lowerExpr(sel.X)
+	if err == nil && base.isPointer && base.typeName != "" {
+		def := l.result.Structs[base.typeName]
+		offset := def.Offsets[sel.Sel.Name]
+		idx := l.ptrOffset(base.cell, offset)
+		val := l.ptrLoad(idx)
+		if tok == token.INC {
+			l.emit(&IRAddI{Dst: val, Value: 1})
+		} else {
+			l.emit(&IRSubI{Dst: val, Value: 1})
 		}
+		l.ptrStore(idx, val)
+		l.freeCell(val)
+		l.freeCell(idx)
+		return nil
 	}
 	r, err := l.lowerSelectorExpr(sel)
 	if err != nil {
@@ -1985,8 +3178,6 @@ func (l *Lowerer) emitCondTo(dst Cell, expr ast.Expr) error {
 	return nil
 }
 
-// lowerRange handles `for i := range n` (Go 1.22+ range over integer).
-// Desugars to: i = 0; for i < n { body; i++ }.
 func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	var cell Cell
 	if s.Key != nil {
@@ -2005,20 +3196,23 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		defer l.freeCell(cell)
 	}
 
-	// Check if ranging over an array: for i, v := range arr
+	// Check if ranging over an array or slice: for i, v := range x
 	var valCell Cell
-	var arr arrayInfo
+	var rangeBase exprResult
 	var hasVal bool
 	if s.Value != nil {
-		if id, ok := s.X.(*ast.Ident); ok {
-			if ai, ok := l.lookupArray(id.Name); ok {
-				arr = ai
-				valID, ok := s.Value.(*ast.Ident)
-				if !ok {
-					return fmt.Errorf("unsupported range value: %T", s.Value)
-				}
+		r, err := l.lowerExpr(s.X)
+		if err == nil && r.elemCount > 0 {
+			rangeBase = r
+			hasVal = true
+			valID, ok := s.Value.(*ast.Ident)
+			if !ok {
+				return fmt.Errorf("unsupported range value: %T", s.Value)
+			}
+			if si, ok := l.lookupStruct(valID.Name); ok {
+				valCell = si.base
+			} else {
 				valCell, _ = l.lookupVar(valID.Name)
-				hasVal = true
 			}
 		}
 	}
@@ -2026,10 +3220,13 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	// Evaluate the range limit.
 	var limit exprResult
 	var err error
-	if hasVal {
-		// Range over array: limit = len(arr)
+	if rangeBase.lenCell != 0 {
 		t := l.allocCell()
-		l.emit(&IRConst{Dst: t, Value: byte(arr.size)}) // #nosec G115
+		l.emit(&IRCopy{Dst: t, Src: rangeBase.lenCell})
+		limit = exprResult{cell: t, temp: true}
+	} else if hasVal {
+		t := l.allocCell()
+		l.emit(&IRConst{Dst: t, Value: byte(rangeBase.elemCount)}) // #nosec G115
 		limit = exprResult{cell: t, temp: true}
 	} else {
 		limit, err = l.lowerExpr(s.X)
@@ -2055,9 +3252,33 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.emit(&IRZero{Dst: l.loopBreakFlag})
 	l.loopDepth++
 
-	// For range over array: load v = a[i] at the start of each iteration.
+	// For range over array/slice: load v = x[i] at the start of each iteration.
 	if hasVal {
-		l.emitVariableIndexRead(arr, cell, valCell)
+		if rangeBase.isPointer {
+			es := rangeBase.elemSize
+			idx := l.allocCell()
+			if es == 1 {
+				l.emit(&IRAdd{Dst: idx, Src1: rangeBase.cell, Src2: cell})
+			} else {
+				t := l.allocCell()
+				l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
+				l.emit(&IRMul{Dst: idx, Src1: cell, Src2: t})
+				l.freeCell(t)
+				l.emit(&IRAdd{Dst: idx, Src1: rangeBase.cell, Src2: idx})
+			}
+			for j := range es {
+				result := l.ptrLoad(idx)
+				l.emit(&IRMove{Dst: valCell + j, Src: result})
+				l.freeCell(result)
+				if j < es-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			l.freeCell(idx)
+		} else {
+			ai := arrayInfo{base: rangeBase.cell, size: rangeBase.elemCount, count: rangeBase.elemCount, elemSize: 1}
+			l.emitVariableIndexRead(ai, cell, valCell)
+		}
 	}
 
 	if err := l.lowerStmts(s.Body.List); err != nil {
@@ -2149,6 +3370,7 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 
 	if len(s.Results) == 1 {
 		result := s.Results[0]
+		// Struct/array variable.
 		if id, ok := result.(*ast.Ident); ok {
 			if si, ok := l.lookupStruct(id.Name); ok {
 				return l.returnComposite(si.base, si.def.Size)
@@ -2157,25 +3379,31 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 				return l.returnComposite(ai.base, ai.size)
 			}
 		}
-		// Handle return of composite literal: return [3]byte{...} or return Point{...}
-		if comp, ok := result.(*ast.CompositeLit); ok {
-			if size := l.arraySize(comp.Type); size > 0 {
-				for i, elt := range comp.Elts {
-					r, err := l.lowerExpr(elt)
-					if err != nil {
-						return err
-					}
-					l.emitCopyOrMove(l.returnDst[i], r)
-				}
+		// Slice, composite literal, or scalar via lowerExpr.
+		r, err := l.lowerExpr(result)
+		if err != nil {
+			// Slice composite literal: return []byte{...}.
+			if si, err := l.lowerSliceExpr(result); err == nil {
+				l.emitCopyOrMove(l.returnDst[0], exprResult{cell: si.ptr, temp: true})
+				l.emitCopyOrMove(l.returnDst[1], exprResult{cell: si.len, temp: true})
+				l.emitCopyOrMove(l.returnDst[2], exprResult{cell: si.cap, temp: true})
 				return l.returnFinish()
 			}
-			if def := l.structDef(comp.Type); def != nil {
-				if err := l.lowerStructValueTo(l.returnDst[0], def, comp); err != nil {
-					return err
-				}
-				return l.returnFinish()
+			// Struct/array composite literal.
+			base, size, err := l.resolveStructArg(result)
+			if err != nil {
+				return err
 			}
+			return l.returnComposite(base, size)
 		}
+		if r.lenCell != 0 {
+			l.emitCopyOrMove(l.returnDst[0], exprResult{cell: r.cell, temp: r.temp})
+			l.emitCopyOrMove(l.returnDst[1], exprResult{cell: r.lenCell})
+			l.emitCopyOrMove(l.returnDst[2], exprResult{cell: r.capCell})
+			return l.returnFinish()
+		}
+		l.emitCopyOrMove(l.returnDst[0], r)
+		return l.returnFinish()
 	}
 	// Fuse return a/b, a%b or return a%b, a/b into IRDivMod.
 	if len(s.Results) == 2 {
@@ -2350,10 +3578,23 @@ func (l *Lowerer) lowerDefer(s *ast.DeferStmt) error {
 			capturedArgs[i] = arg
 			continue
 		}
+		// String constant: pass as a string literal for the deferred call.
 		if id, ok := arg.(*ast.Ident); ok && l.lookupStringConst(id.Name) != "" {
-			// String constant: pass as a string literal for the deferred call.
 			capturedArgs[i] = &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(l.lookupStringConst(id.Name))}
 			continue
+		}
+		// Slice argument: capture the 3-cell header.
+		if id, ok := arg.(*ast.Ident); ok {
+			if si, ok := l.lookupSlice(id.Name); ok {
+				name := fmt.Sprintf("$defer_%d_%d", len(l.deferredCalls), i)
+				sc := l.currentScope()
+				capSI := l.defineSlice(sc, name, si.elemSize, si.elemType, si.elemSlice, si.elemPtrType)
+				l.emit(&IRCopy{Dst: capSI.ptr, Src: si.ptr})
+				l.emit(&IRCopy{Dst: capSI.len, Src: si.len})
+				l.emit(&IRCopy{Dst: capSI.cap, Src: si.cap})
+				capturedArgs[i] = ast.NewIdent(name)
+				continue
+			}
 		}
 		r, err := l.lowerExpr(arg)
 		if err != nil {
@@ -2400,22 +3641,43 @@ func (l *Lowerer) emitDeferred() {
 func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
 	// Composite literal: must be handled before lowerExpr.
 	if comp, ok := expr.(*ast.CompositeLit); ok {
-		def := l.structDef(comp.Type)
-		if def == nil {
-			return 0, 0, fmt.Errorf("unsupported composite literal argument")
+		if def := l.structDef(comp.Type); def != nil {
+			base := l.allocCells(def.Size)
+			for j := range def.Size {
+				l.emit(&IRZero{Dst: base + j})
+			}
+			if err := l.lowerStructValueTo(base, def, comp); err != nil {
+				return 0, 0, err
+			}
+			return base, def.Size, nil
 		}
-		base := l.allocCells(def.Size)
-		for j := range def.Size {
-			l.emit(&IRZero{Dst: base + j})
+		if size := l.arraySize(comp.Type); size > 0 {
+			base := l.allocCells(size)
+			arr := arrayInfo{base: base, size: size, count: size, elemSize: 1}
+			if err := l.lowerCompositeLitInto(arr, comp); err != nil {
+				return 0, 0, err
+			}
+			return base, size, nil
 		}
-		if err := l.lowerStructValueTo(base, def, comp); err != nil {
-			return 0, 0, err
-		}
-		return base, def.Size, nil
+		return 0, 0, fmt.Errorf("unsupported composite literal argument")
 	}
 	r, err := l.lowerExpr(expr)
 	if err != nil {
 		return 0, 0, err
+	}
+	// Pointer-based composite: materialize into contiguous temp cells.
+	if r.isPointer && r.elemCount > 1 && !r.elemSlice {
+		base := l.allocCells(r.elemCount)
+		for j := range r.elemCount {
+			val := l.ptrLoad(r.cell)
+			l.emit(&IRMove{Dst: base + j, Src: val})
+			l.freeCell(val)
+			if j < r.elemCount-1 {
+				l.emit(&IRAddI{Dst: r.cell, Value: 1})
+			}
+		}
+		l.freeCell(r.cell)
+		return base, r.elemCount, nil
 	}
 	return r.cell, r.cellCount(), nil
 }
@@ -2430,7 +3692,17 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 
 	// Evaluate all arguments before pushScope.
 	args := make([]exprResult, len(argExprs))
+	sliceArgs := map[int]sliceInfo{}
 	for i, expr := range argExprs {
+		// Slice argument: evaluate to sliceInfo for later param copy.
+		if i < len(info.ParamTypes) && info.ParamTypes[i].IsSlice {
+			tmp, err := l.lowerSliceExpr(expr)
+			if err != nil {
+				return nil, err
+			}
+			sliceArgs[i] = tmp
+			continue
+		}
 		// Composite literal: lower into temp cells (lowerExpr doesn't handle these).
 		if comp, ok := expr.(*ast.CompositeLit); ok {
 			if def := l.structDef(comp.Type); def != nil {
@@ -2462,6 +3734,20 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		if err != nil {
 			return nil, err
 		}
+		// Pointer-based composite: materialize into contiguous temp cells.
+		if r.isPointer && r.elemCount > 1 && !r.elemSlice {
+			base := l.allocCells(r.elemCount)
+			for j := range r.elemCount {
+				val := l.ptrLoad(r.cell)
+				l.emit(&IRMove{Dst: base + j, Src: val})
+				l.freeCell(val)
+				if j < r.elemCount-1 {
+					l.emit(&IRAddI{Dst: r.cell, Value: 1})
+				}
+			}
+			l.freeCell(r.cell)
+			r = exprResult{cell: base, temp: true, size: r.elemCount, typeName: r.typeName}
+		}
 		// Flat-offset results: materialize into contiguous temp cells.
 		if r.flatBase != 0 {
 			totalSize := r.elemCount * r.elemSize
@@ -2488,6 +3774,17 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	for i, paramName := range info.Params {
 		if i < len(info.ParamTypes) {
 			pt := info.ParamTypes[i]
+			if pt.IsSlice {
+				if inner, ok := sliceArgs[i]; ok {
+					sc := l.currentScope()
+					paramSI := l.defineSlice(sc, paramName, inner.elemSize, inner.elemType, inner.elemSlice, inner.elemPtrType)
+					l.emit(&IRMove{Dst: paramSI.ptr, Src: inner.ptr})
+					l.emit(&IRMove{Dst: paramSI.len, Src: inner.len})
+					l.emit(&IRMove{Dst: paramSI.cap, Src: inner.cap})
+					l.freeSliceInfo(inner)
+					continue
+				}
+			}
 			if pt.ArraySize > 0 || pt.StructType != "" {
 				var paramBase Cell
 				var paramSize int
@@ -2548,7 +3845,9 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	// Allocate return value cells.
 	// For composite return types (struct/array), allocate contiguous cells.
 	retSize := info.Returns
-	if info.ReturnType.ArraySize > 0 {
+	if info.ReturnType.IsSlice {
+		retSize = 3 // ptr, len, cap
+	} else if info.ReturnType.ArraySize > 0 && !info.ReturnType.IsPointer {
 		retSize = info.ReturnType.ArraySize
 	} else if info.ReturnType.StructType != "" {
 		retSize = l.result.Structs[info.ReturnType.StructType].Size
@@ -2669,6 +3968,12 @@ func (l *Lowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 		return l.lowerIndexExpr(e)
 	case *ast.SelectorExpr:
 		return l.lowerSelectorExpr(e)
+	case *ast.SliceExpr:
+		si, err := l.evalSliceExpr(e)
+		if err != nil {
+			return exprResult{}, err
+		}
+		return exprResult{cell: si.ptr, temp: true, elemSize: si.elemSize, elemCount: 255, elemType: si.elemType, elemSlice: si.elemSlice, elemPtrType: si.elemPtrType, isPointer: true, lenCell: si.len, capCell: si.cap}, nil
 	default:
 		return exprResult{}, fmt.Errorf("unsupported expression: %T", expr)
 	}
@@ -2712,6 +4017,11 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		l.emit(&IRConst{Dst: t, Value: val})
 		return exprResult{cell: t, temp: true}, nil
 	}
+	if e.Name == "nil" {
+		t := l.allocCell()
+		l.emit(&IRZero{Dst: t})
+		return exprResult{cell: t, temp: true}, nil
+	}
 	cell, err := lookupVar(e.Name)
 	if err != nil {
 		// Fall back to composite types.
@@ -2721,15 +4031,18 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		if ai, ok := l.lookupArray(e.Name); ok {
 			return exprResult{cell: ai.base, size: ai.size, elemSize: ai.elemSize, elemCount: ai.count, elemType: ai.elemType, innerElemSize: ai.innerElemSize}, nil
 		}
+		if si, ok := l.lookupSlice(e.Name); ok {
+			return exprResult{cell: si.ptr, elemSize: si.elemSize, elemCount: 255, elemType: si.elemType, elemSlice: si.elemSlice, elemPtrType: si.elemPtrType, isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+		}
 		return exprResult{}, err
 	}
 	// Pointer-to-array: return as indexable pointer.
 	if ptrAI, ok := l.lookupPtrArray(e.Name); ok {
-		return exprResult{cell: cell, elemSize: ptrAI.elemSize, elemCount: ptrAI.count, elemType: ptrAI.elemType, isPtr: true}, nil
+		return exprResult{cell: cell, elemSize: ptrAI.elemSize, elemCount: ptrAI.count, elemType: ptrAI.elemType, isPointer: true}, nil
 	}
 	// Pointer-to-struct: return as indexable pointer (fields as byte offsets).
 	if ptrDef, ok := l.lookupPtrType(e.Name); ok {
-		return exprResult{cell: cell, size: ptrDef.Size, elemSize: 1, elemCount: ptrDef.Size, typeName: ptrDef.Name, isPtr: true}, nil
+		return exprResult{cell: cell, size: ptrDef.Size, elemSize: 1, elemCount: ptrDef.Size, typeName: ptrDef.Name, isPointer: true}, nil
 	}
 	return exprResult{cell: cell}, nil
 }
@@ -2786,22 +4099,27 @@ func (l *Lowerer) ptrDynIndex(ptr Cell, indexExpr ast.Expr, elemSize int) (Cell,
 		}
 		return idx, nil
 	}
+	// Pre-evaluate the index expression into idx. This stores the
+	// result to idx's stack slot, preventing register cache conflicts
+	// when ptr is later loaded for the addition.
 	idxR, err := l.lowerExpr(indexExpr)
 	if err != nil {
 		return 0, err
 	}
+	l.emitCopyOrMove(idx, idxR)
 	if elemSize > 1 {
 		es := l.allocCell()
 		l.emit(&IRConst{Dst: es, Value: byte(elemSize)}) // #nosec G115
-		l.emit(&IRMul{Dst: idx, Src1: idxR.cell, Src2: es})
+		l.emit(&IRMul{Dst: idx, Src1: idx, Src2: es})
 		l.freeCell(es)
-	} else {
-		l.emitCopyOrMove(idx, idxR)
 	}
-	l.emit(&IRAdd{Dst: idx, Src1: idx, Src2: ptr})
-	if idxR.temp {
-		l.freeCell(idxR.cell)
-	}
+	// Copy ptr to a fresh temp and add, ensuring ptr's value is
+	// loaded from stack AFTER expression evaluation (not stale in cache).
+	ptrTemp := l.allocCell()
+	l.emit(&IRCopy{Dst: ptrTemp, Src: ptr})
+	l.emit(&IRAdd{Dst: idx, Src1: idx, Src2: ptrTemp})
+	l.freeCell(ptrTemp)
+	// Note: idxR.cell is already freed by emitCopyOrMove above.
 	return idx, nil
 }
 
@@ -2809,7 +4127,6 @@ func (l *Lowerer) ptrDynIndex(ptr Cell, indexExpr ast.Expr, elemSize int) (Cell,
 func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 	switch e := expr.(type) {
 	case *ast.Ident:
-		// &struct or &array -- return base slot.
 		if si, ok := l.lookupStruct(e.Name); ok {
 			t := l.allocCell()
 			l.emit(&IRConst{Dst: t, Value: byte(slotOf(si.base))}) // #nosec G115
@@ -2828,23 +4145,43 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		l.emit(&IRConst{Dst: t, Value: byte(slotOf(cell))}) // #nosec G115
 		return exprResult{cell: t, temp: true}, nil
 	case *ast.IndexExpr:
-		// &a[i] -- compute slotOf(a.base) + i
 		id, ok := e.X.(*ast.Ident)
 		if !ok {
 			return exprResult{}, fmt.Errorf("cannot take address of chained index expression")
 		}
+		// &s[i] on slice: return ptr + i * elemSize (heap slot index).
+		if si, ok := l.lookupSlice(id.Name); ok {
+			idx, err := l.ptrDynIndex(si.ptr, e.Index, max(si.elemSize, 1))
+			if err != nil {
+				return exprResult{}, err
+			}
+			r := exprResult{cell: idx, temp: true}
+			if si.elemType != "" {
+				r.isPointer = true
+				r.typeName = si.elemType
+			}
+			return r, nil
+		}
+		// &a[i] -- compute slotOf(a.base) + i
 		ai, ok := l.lookupArray(id.Name)
 		if !ok {
 			return exprResult{}, fmt.Errorf("cannot take address of non-array index: %s", id.Name)
 		}
 		baseSlot := slotOf(ai.base)
+		es := max(ai.elemSize, 1)
 		t := l.allocCell()
 		if constIdx, ok := l.constValue(e.Index); ok {
-			l.emit(&IRConst{Dst: t, Value: byte(baseSlot + constIdx)}) // #nosec G115
+			l.emit(&IRConst{Dst: t, Value: byte(baseSlot + constIdx*es)}) // #nosec G115
 		} else {
 			idxR, err := l.lowerExpr(e.Index)
 			if err != nil {
 				return exprResult{}, err
+			}
+			if es > 1 {
+				esCell := l.allocCell()
+				l.emit(&IRConst{Dst: esCell, Value: byte(es)}) // #nosec G115
+				l.emit(&IRMul{Dst: idxR.cell, Src1: idxR.cell, Src2: esCell})
+				l.freeCell(esCell)
 			}
 			l.emit(&IRConst{Dst: t, Value: byte(baseSlot)}) // #nosec G115
 			l.emit(&IRAdd{Dst: t, Src1: t, Src2: idxR.cell})
@@ -2852,7 +4189,12 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 				l.freeCell(idxR.cell)
 			}
 		}
-		return exprResult{cell: t, temp: true}, nil
+		r := exprResult{cell: t, temp: true}
+		if ai.elemType != "" {
+			r.isPointer = true
+			r.typeName = ai.elemType
+		}
+		return r, nil
 	case *ast.SelectorExpr:
 		// &p.x -- base slot + field offset
 		r, err := l.lowerSelectorExpr(e)
@@ -2862,6 +4204,31 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: byte(slotOf(r.cell))}) // #nosec G115
 		return exprResult{cell: t, temp: true}, nil
+	case *ast.CompositeLit:
+		// &Point{x: 1, y: 2} -- lower into cells, return pointer.
+		if def := l.structDef(e.Type); def != nil {
+			base := l.allocCells(def.Size)
+			for j := range def.Size {
+				l.emit(&IRZero{Dst: base + j})
+			}
+			if err := l.lowerStructValueTo(base, def, e); err != nil {
+				return exprResult{}, err
+			}
+			t := l.allocCell()
+			l.emit(&IRConst{Dst: t, Value: byte(slotOf(base))}) // #nosec G115
+			return exprResult{cell: t, temp: true}, nil
+		}
+		if size := l.arraySize(e.Type); size > 0 {
+			base := l.allocCells(size)
+			arr := arrayInfo{base: base, size: size, count: size, elemSize: 1}
+			if err := l.lowerCompositeLitInto(arr, e); err != nil {
+				return exprResult{}, err
+			}
+			t := l.allocCell()
+			l.emit(&IRConst{Dst: t, Value: byte(slotOf(base))}) // #nosec G115
+			return exprResult{cell: t, temp: true}, nil
+		}
+		return exprResult{}, fmt.Errorf("cannot take address of %T", expr)
 	default:
 		return exprResult{}, fmt.Errorf("cannot take address of %T", expr)
 	}
@@ -3160,14 +4527,31 @@ func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
 	}
 	// Composite return: return all cells with array/struct metadata.
 	if info.ReturnType.ArraySize > 0 {
+		if info.ReturnType.IsPointer {
+			return exprResult{
+				cell: retCells[0], temp: true, isPointer: true,
+				elemSize: 1, elemCount: info.ReturnType.ArraySize,
+			}, nil
+		}
 		return exprResult{
 			cell: retCells[0], temp: true, size: info.ReturnType.ArraySize,
 			elemSize: 1, elemCount: info.ReturnType.ArraySize,
 		}, nil
 	}
 	if info.ReturnType.StructType != "" {
+		if info.ReturnType.IsPointer {
+			return exprResult{cell: retCells[0], temp: true, isPointer: true, typeName: info.ReturnType.StructType}, nil
+		}
 		def := l.result.Structs[info.ReturnType.StructType]
 		return exprResult{cell: retCells[0], temp: true, size: def.Size, typeName: info.ReturnType.StructType}, nil
+	}
+	if info.ReturnType.IsSlice {
+		return exprResult{
+			cell: retCells[0], temp: true, isPointer: true,
+			elemSize:  max(info.ReturnType.SliceElemSize, 1),
+			elemCount: 255, elemType: info.ReturnType.SliceElemType,
+			lenCell: retCells[1], capCell: retCells[2],
+		}, nil
 	}
 	// Scalar return.
 	for i := 1; i < len(retCells); i++ {
@@ -3199,6 +4583,16 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		r, err := lowerExpr(arg)
 		if err != nil {
 			return exprResult{}, true, err
+		}
+		// Slice: len/cap are runtime values from the header.
+		if r.lenCell != 0 {
+			t := l.allocCell()
+			if fn.Name == "len" {
+				l.emit(&IRCopy{Dst: t, Src: r.lenCell})
+			} else {
+				l.emit(&IRCopy{Dst: t, Src: r.capCell})
+			}
+			return exprResult{cell: t, temp: true}, true, nil
 		}
 		if r.elemCount == 0 {
 			return exprResult{}, true, fmt.Errorf("%s() argument must be an array", fn.Name)
@@ -3277,7 +4671,7 @@ func (l *Lowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 // indexInto indexes a composite result by the given expression.
 // The base must have elemSize and elemCount set.
 func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, error) {
-	if base.isPtr {
+	if base.isPointer {
 		idx, err := l.ptrDynIndex(base.cell, indexExpr, base.elemSize)
 		if err != nil {
 			return exprResult{}, err
@@ -3285,10 +4679,35 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 		if base.elemSize == 1 {
 			result := l.ptrLoad(idx)
 			l.freeCell(idx)
-			return exprResult{cell: result, temp: true}, nil
+			r := exprResult{cell: result, temp: true}
+			if base.elemPtrType != "" {
+				r.isPointer = true
+				r.typeName = base.elemPtrType
+				def := l.result.Structs[base.elemPtrType]
+				r.elemSize = 1
+				r.elemCount = def.Size
+			}
+			return r, nil
+		}
+		if base.elemSlice {
+			// Slice-of-slices: load inner 3-cell header (ptr, len, cap).
+			inner := l.allocSliceInfo()
+			tmpPtr := l.ptrLoad(idx)
+			l.emit(&IRMove{Dst: inner.ptr, Src: tmpPtr})
+			l.freeCell(tmpPtr)
+			l.emit(&IRAddI{Dst: idx, Value: 1})
+			tmpLen := l.ptrLoad(idx)
+			l.emit(&IRMove{Dst: inner.len, Src: tmpLen})
+			l.freeCell(tmpLen)
+			l.emit(&IRAddI{Dst: idx, Value: 1})
+			tmpCap := l.ptrLoad(idx)
+			l.emit(&IRMove{Dst: inner.cap, Src: tmpCap})
+			l.freeCell(tmpCap)
+			l.freeCell(idx)
+			return exprResult{cell: inner.ptr, temp: true, elemSize: 1, elemCount: 255, isPointer: true, lenCell: inner.len, capCell: inner.cap}, nil
 		}
 		// Multi-byte element: return pointer to sub-array.
-		return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, isPtr: true}, nil
+		return exprResult{cell: idx, temp: true, size: base.elemSize, elemSize: 1, elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, isPointer: true}, nil
 	}
 
 	// Flat-offset result: cell holds i*elemSize relative to flatBase.
@@ -3387,15 +4806,37 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 // writeInto writes val into a composite at the given index.
 // The base must have elemSize and elemCount set.
 func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult) error {
-	if base.isPtr {
+	if base.isPointer {
 		idx, err := l.ptrDynIndex(base.cell, indexExpr, base.elemSize)
 		if err != nil {
 			return err
 		}
-		t := l.allocCell()
-		l.emitCopyOrMove(t, val)
-		l.ptrStore(idx, t)
-		l.freeCell(t)
+		if val.isPointer && val.size > 1 {
+			// Multi-cell pointer-to-pointer copy: read from val, write to idx.
+			for j := range val.elemCount {
+				t := l.ptrLoad(val.cell)
+				l.ptrStore(idx, t)
+				l.freeCell(t)
+				if j < val.elemCount-1 {
+					l.emit(&IRAddI{Dst: val.cell, Value: 1})
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			l.freeCell(val.cell)
+		} else if val.size > 1 {
+			// Multi-cell direct struct: write each cell via pointer store.
+			for j := range val.size {
+				l.ptrStore(idx, val.cell+j)
+				if j < val.size-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+		} else {
+			t := l.allocCell()
+			l.emitCopyOrMove(t, val)
+			l.ptrStore(idx, t)
+			l.freeCell(t)
+		}
 		l.freeCell(idx)
 		return nil
 	}
@@ -3445,7 +4886,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	// Resolve the base: a variable, a chained selector, or an array element.
 	var base Cell
 	var def *StructDef
-	baseIsPtr := false
+	baseIsPointer := false
 	switch x := e.X.(type) {
 	case *ast.Ident:
 		si, ok := l.lookupStruct(x.Name)
@@ -3461,7 +4902,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			idx := l.ptrOffset(ptrCell, ptrDef.Offsets[e.Sel.Name])
 			// Array field: return pointer for indexing.
 			if arrSize := ptrDef.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
-				return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPtr: true}, nil
+				return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPointer: true}, nil
 			}
 			result := l.ptrLoad(idx)
 			l.freeCell(idx)
@@ -3476,6 +4917,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			return exprResult{}, err
 		}
 		base = inner.cell
+		baseIsPointer = inner.isPointer
 		if inner.typeName == "" {
 			return exprResult{}, fmt.Errorf("field %s is not a struct", x.Sel.Name)
 		}
@@ -3504,7 +4946,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			return exprResult{cell: result, temp: true}, nil
 		}
 		base = inner.cell
-		baseIsPtr = inner.isPtr
+		baseIsPointer = inner.isPointer
 	default:
 		// Generic: evaluate e.X and resolve struct type.
 		inner, err := l.lowerExpr(e.X)
@@ -3521,11 +4963,16 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	if !ok {
 		return exprResult{}, fmt.Errorf("unknown field %s in struct %s", e.Sel.Name, def.Name)
 	}
-	if baseIsPtr {
+	if baseIsPointer {
 		idx := l.ptrOffset(base, offset)
 		// Array field: return pointer for indexing.
 		if arrSize := def.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
-			return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPtr: true}, nil
+			return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPointer: true}, nil
+		}
+		// Nested struct field: return pointer with struct type.
+		if fieldType := def.FieldTypes[e.Sel.Name]; fieldType != "" {
+			fieldDef := l.result.Structs[fieldType]
+			return exprResult{cell: idx, temp: true, size: fieldDef.Size, elemSize: 1, elemCount: fieldDef.Size, typeName: fieldType, isPointer: true}, nil
 		}
 		result := l.ptrLoad(idx)
 		l.freeCell(idx)

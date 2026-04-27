@@ -263,6 +263,14 @@ type IRFramePush struct {
 
 func (*IRFramePush) irNode() {}
 
+// IRFramePushDyn allocates stack slots with a runtime-determined count.
+// The Size cell holds the number of slots to push.
+type IRFramePushDyn struct {
+	Size Cell
+}
+
+func (*IRFramePushDyn) irNode() {}
+
 // IRFramePop deallocates the top stack frame.
 type IRFramePop struct {
 	Slots int

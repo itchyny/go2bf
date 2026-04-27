@@ -102,6 +102,11 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	// Scan for array locals and reallocate multi-slot frame space.
 	l.collectArrayLocals(rc, info.Body)
 
+	// Slices are not supported in recursive functions.
+	if hasSliceUsage(info.Body) {
+		return nil, fmt.Errorf("slices in recursive functions are not supported")
+	}
+
 	// Allocate active and retval in the PHASE TEMP area (direct tape positions,
 	// not stack slots). This avoids cache/storeToStack issues in the dispatch loop.
 	// Reserve positions 25, 26 for these; phase code allocs start at 27.
@@ -248,6 +253,22 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	// activeReg and retReg are phase temp positions, no need to free.
 
 	return retCells, nil
+}
+
+// hasSliceUsage checks if a block contains any slice type reference.
+func hasSliceUsage(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if at, ok := n.(*ast.ArrayType); ok && at.Len == nil {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // collectArrayLocals scans the function body for array variable declarations

@@ -887,6 +887,10 @@ func (g *Generator) genNode(node IRNode) {
 	case *IRFramePush:
 		g.cache.flushAndInvalidate()
 		g.genFramePush(n.Slots)
+	case *IRFramePushDyn:
+		src := g.ensureReg(n.Size, nil)
+		g.cache.flushAndInvalidate()
+		g.genFramePushDyn(src)
 	case *IRFramePop:
 		g.cache.flushAndInvalidate()
 		g.genFramePop(n.Slots)
@@ -1377,6 +1381,20 @@ func (g *Generator) genFramePush(slots int) {
 	}
 	g.backToSentinel()
 	g.backToHome()
+}
+
+// genFramePushDyn pushes a runtime-determined number of stack slots.
+// The count is in register src. Loops: each iteration scans to stack
+// end, sets one guard, returns home, decrements counter.
+func (g *Generator) genFramePushDyn(src int) {
+	g.comment("push frame dyn r%d", src)
+	g.while(src, func() {
+		g.goToBreadcrumb() // scan to stack end (no breadcrumb set)
+		g.emit("+")        // set guard=1
+		g.backToSentinel()
+		g.backToHome()
+		g.decr(src)
+	})
 }
 
 // genFramePop deallocates the topmost stack frame.

@@ -30,6 +30,7 @@ func TestIRNode(t *testing.T) {
 		&IRDynLoad{Dst: 1, BaseSlot: 0, Index: 2},
 		&IRDynStore{BaseSlot: 0, Index: 1, Src: 2},
 		&IRFramePush{Slots: 8},
+		&IRFramePushDyn{Size: 1},
 		&IRFramePop{Slots: 8},
 		&IRLoadFrame{Dst: 1, Slot: 0, FrameSize: 8},
 		&IRStoreFrame{Slot: 0, Src: 1, FrameSize: 8},
@@ -39,8 +40,8 @@ func TestIRNode(t *testing.T) {
 	for _, n := range nodes {
 		n.irNode()
 	}
-	if len(nodes) != 30 {
-		t.Errorf("expected 30 IR node types, got %d", len(nodes))
+	if len(nodes) != 31 {
+		t.Errorf("expected 31 IR node types, got %d", len(nodes))
 	}
 }
 

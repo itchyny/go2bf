@@ -286,36 +286,69 @@ No `int` or `string` types.
 - Pass to and return from functions
 - Method receivers and method calls
 
+### Slices
+
+- `[]byte`, `[]Point`, `[][N]byte`, `[][]byte`,
+  `[]*byte`, `[]*Point` slices
+- Composite literals: `[]byte{1, 2, 3}`,
+  `[]Point{Point{1, 2}, Point{3, 4}}`
+- `make([]byte, n)`, `make([]Point, n, cap)`
+- Indexing: `s[i]`, `s[i].x` for struct slices
+- `len(s)`, `cap(s)`, `for _, v := range s`
+- `append(s, v)`, `append(s, a, b, c)`,
+  `append(s, t...)` with automatic reallocation
+- `copy(dst, src)`, `clear(s)`
+- Array slicing: `a[i:j]`, `a[i:]`, `a[:j]`, `a[i:j:k]`, `a[:]`
+- Reslicing: `s[i:j]`, `s[i:]`, `s[:j]`, `s[i:j:k]`
+- `s == nil`, `s != nil` comparison
+- Copy assignment, `s[i]++`, `s[i].x++`
+- Pass to and return from functions
+- Backed by a dynamic allocator with in-place growth
+  when possible (old arrays not freed otherwise)
+
 ### Pointers
 
 - `*byte` pointers: `&x`, `*p`, `*p = v`, `*p++`
-- `&myStruct`, `&myArray` -- address of composite values
+- `&myStruct`, `&myArray`, `&Point{x: 1, y: 2}`
+- `&a[i]`, `&s[i]` -- address of array/slice elements
 - `ptr.x` read/write for struct pointers (`ptr := &myStruct`)
 - `ptr[i]` read/write, `ptr[i][j]` read/write for array pointers
 - `ptr[i].x` read/write for array-of-structs pointers
 - `ptr.data[i]` read/write for struct-with-array pointers
 - `len(ptr)`, `len(*ptr)`, `cap(ptr)` for array pointers
+- `p == nil`, `p != nil` comparison
 - Typed pointer parameters: `func f(p *[N]byte)`, `func f(p *Point)`
 - Pass pointers to functions for by-reference semantics
 
 ### Built-in functions
 
 - `print`, `println` -- decimal output, string literals
+- `len(x)`, `cap(x)` -- arrays, slices, pointers
+- `make([]T, n)`, `make([]T, n, cap)` -- slices of byte,
+  struct, or array types
+- `append(s, v)`, `append(s, a, b, c)`,
+  `append(s, t...)` -- with automatic reallocation
+- `copy(dst, src)` -- copy slice elements
+- `clear(s)` -- zero all slice elements
 - `min(a, b, ...)`, `max(a, b, ...)` -- variadic
-- `len(array)`, `cap(array)`
+
+go2bf extensions:
+
 - `putchar(byte)` -- raw byte output
 - `getchar()` -- read a byte from stdin
 
 ## Limitations
 
 - No import statements.
-- No slices, maps, interfaces, or channels.
-- Array nesting up to 3 levels of bytes (`[N][M][K]byte`)
-  or 2 levels of structs (`[N][M]Point`).
+- No maps, interfaces, or channels.
+- Array nesting up to `[N][M][K]byte` or `[N][M]Point`.
+- Slice nesting up to `[][]byte`
+  (`[][][]byte`, `[][]Point` not supported).
+- Old backing arrays are not freed on reallocation.
 - No `select`, `go`, or `goto` statements.
 - No closures or function pointers.
 - Recursive functions do not support recursive calls
-  inside `for` loops, mutual recursion, or pointers.
+  inside `for` loops, mutual recursion, pointers, or slices.
 - Maximum 255 stack slots (variables + temporaries)
   per program.
 - The built-in Brainfuck interpreter uses a 30,000-cell

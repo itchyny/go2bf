@@ -41,6 +41,7 @@ type ParamInfo struct {
 	ArrayElemSize int        // >0 for arrays: cells per element
 	ArrayElemType string     // non-empty for arrays of structs
 	StructType    string     // non-empty if the parameter is a struct type
+	IsSlice       bool       // true if []byte or []StructType
 	IsPointer     bool       // true if *byte, *[N]byte, or *StructType
 	PtrArrayInfo  *ParamInfo // non-nil for *[N]byte -- inner array info
 	PtrStructType string     // non-empty for *StructType
@@ -48,8 +49,12 @@ type ParamInfo struct {
 
 // ReturnInfo describes a function's return type.
 type ReturnInfo struct {
-	ArraySize  int    // >0 if returning a [N]byte array
-	StructType string // non-empty if returning a struct
+	ArraySize     int    // >0 if returning a [N]byte or *[N]byte
+	StructType    string // non-empty if returning a struct
+	IsSlice       bool   // true if returning a slice
+	IsPointer     bool   // true if returning a pointer (*[N]byte)
+	SliceElemSize int    // cells per slice element (1 for byte)
+	SliceElemType string // struct type name for slice elements
 }
 
 // StructDef holds a struct type definition.
@@ -244,6 +249,10 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 				for _, field := range fn.Type.Params.List {
 					var pi ParamInfo
 					if at, ok := field.Type.(*ast.ArrayType); ok {
+						if at.Len == nil {
+							// Slice parameter: []byte or []Point.
+							pi.IsSlice = true
+						}
 						count := arrayTypeSize(field.Type)
 						if count > 0 {
 							elemSize := 1
@@ -319,6 +328,29 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					} else if id, ok := retType.(*ast.Ident); ok {
 						if _, ok := result.Structs[id.Name]; ok {
 							info.ReturnType.StructType = id.Name
+						}
+					} else if star, ok := retType.(*ast.StarExpr); ok {
+						if size := arrayTypeSize(star.X); size > 0 {
+							info.ReturnType.ArraySize = size
+							info.ReturnType.IsPointer = true
+						} else if id, ok := star.X.(*ast.Ident); ok {
+							if _, ok := result.Structs[id.Name]; ok {
+								info.ReturnType.StructType = id.Name
+								info.ReturnType.IsPointer = true
+							}
+						}
+					} else if isSliceType(retType) {
+						info.ReturnType.IsSlice = true
+						info.Returns = 3 // ptr, len, cap
+						at := retType.(*ast.ArrayType)
+						if id, ok := at.Elt.(*ast.Ident); ok {
+							if def, ok := result.Structs[id.Name]; ok {
+								info.ReturnType.SliceElemSize = def.Size
+								info.ReturnType.SliceElemType = id.Name
+							}
+						}
+						if size := arrayTypeSize(at.Elt); size > 0 {
+							info.ReturnType.SliceElemSize = size
 						}
 					}
 				}

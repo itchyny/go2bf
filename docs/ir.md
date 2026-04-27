@@ -95,6 +95,7 @@ at runtime.
 | Node | Semantics |
 | ------ | ----------- |
 | `IRFramePush{Slots}` | allocate a new frame on the stack |
+| `IRFramePushDyn{Size}` | allocate runtime-determined slots |
 | `IRFramePop{Slots}` | deallocate the topmost frame |
 | `IRLoadFrame{Dst, Slot, FrameSize}` | load from the topmost frame |
 | `IRStoreFrame{Slot, Src, FrameSize}` | store to the topmost frame |

@@ -225,7 +225,7 @@ func invalidateNodeDst(known map[Cell]byte, node IRNode) {
 		// Writes to dynamic slot - can't track.
 	case *IRLoadFrame:
 		delete(known, n.Dst)
-	case *IRFramePush, *IRFramePop, *IRStoreFrame, *IRPutc:
+	case *IRFramePush, *IRFramePushDyn, *IRFramePop, *IRStoreFrame, *IRPutc:
 		// No register destination to invalidate.
 	}
 }

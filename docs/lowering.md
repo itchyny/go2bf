@@ -34,9 +34,65 @@ Each Go variable maps to one or more abstract cells:
 - `byte` variable: 1 cell
 - `[N]byte` array: N contiguous cells
 - Struct: contiguous cells (one per `byte` field)
+- Slice: 3 cells (`ptr`, `len`, `cap`)
+- Pointer: 1 cell (stack slot index)
 
 Temporaries for intermediate expression results are allocated and freed
 as needed. The allocator reuses freed cell IDs.
+
+## Expression Results
+
+`exprResult` is the return type of `lowerExpr` and related functions.
+It carries the cell, ownership, and composite/indexing metadata:
+
+| Field | Description |
+| ----- | ------- |
+| `cell` | cell ID (or pointer slot for `isPointer` results) |
+| `temp` | if true, caller must free via `freeCell` |
+| `size` | total cells; 0 means scalar (1 cell) |
+| `elemSize` | element size for indexable results; 0 = not indexable |
+| `elemCount` | number of elements for indexable results |
+| `elemType` | struct type name for composite array elements |
+| `elemSlice` | true if elements are slices (`[][]byte`) |
+| `elemPtrType` | struct type for pointer elements (`[]*Point`) |
+| `innerElemSize` | for nested arrays: cells per inner element (0 if flat) |
+| `typeName` | struct type name of this result (for field resolution) |
+| `isPointer` | cell is a pointer (stack slot index) for indirect access |
+| `flatBase` | for flat-offset results: base of the original array |
+| `lenCell` | runtime length cell for slices (0 if compile-time) |
+| `capCell` | runtime capacity cell for slices (0 if not applicable) |
+
+`lowerExpr` returns composite results for arrays (`elemSize`/`elemCount`
+set), structs (`size`/`typeName` set), pointer-to-array variables
+(`isPointer`/`elemType` set), and pointer-to-struct variables
+(`isPointer`/`typeName` set). Function calls returning arrays or structs
+also return composite results with proper metadata.
+
+`typeName` enables field resolution without re-inspecting the AST:
+`lowerSelectorExpr` and `lowerFieldAssign` use `base.typeName` to
+look up the `StructDef` directly. `elemType` propagates through
+`indexInto` so that `a[i].x` resolves the struct type from the
+indexed result. This allows chained access on any expression
+(e.g., `f().x`, `f()[i].x`, `f().data[i]`).
+
+### Variable Initialization
+
+Simple assignments (`x = expr`, `x := expr`) and `var x = expr`
+declarations share a unified path through `lowerVarInit`, which
+handles composite literals, pointer tracking, and composite variable
+copies. For composite RHS (struct/array variables), `lowerExpr`
+returns a multi-cell result and `emitCopyOrMove` handles the
+cell-by-cell transfer.
+
+### Field Assignment
+
+`lowerFieldAssign` resolves the base via `lowerExpr(sel.X)`, then
+dispatches by result type:
+
+- **Pointer** (`isPointer`): `ptrOffset` + `ptrStore`
+- **Nested struct**: `lowerStructValueTo` for composite field writes
+- **Direct/flat-offset**: `writeInto` with the field offset as a
+  constant index expression
 
 ## Structs
 
@@ -94,56 +150,6 @@ returns (`makePoint(1, 2).sum()`), and chained methods
 (`p.scale(3).sum()`). The receiver expression is evaluated via
 `lowerExpr` and passed as the first argument to the inlined method.
 
-## Expression Results
-
-`exprResult` is the return type of `lowerExpr` and related functions.
-It carries the cell, ownership, and composite/indexing metadata:
-
-| Field | Meaning |
-| ----- | ------- |
-| `cell` | cell ID (or pointer slot for `isPtr` results) |
-| `temp` | if true, caller must free via `freeCell` |
-| `size` | total cells; 0 means scalar (1 cell) |
-| `elemSize` | element size for indexable results; 0 = not indexable |
-| `elemCount` | number of elements for indexable results |
-| `elemType` | struct type name for composite array elements |
-| `innerElemSize` | for nested arrays: cells per inner element (0 if flat) |
-| `typeName` | struct type name of this result (for field resolution) |
-| `isPtr` | cell is a pointer (stack slot index) for indirect access |
-| `flatBase` | for flat-offset results: base of the original array |
-
-`lowerExpr` returns composite results for arrays (`elemSize`/`elemCount`
-set), structs (`size`/`typeName` set), pointer-to-array variables
-(`isPtr`/`elemType` set), and pointer-to-struct variables
-(`isPtr`/`typeName` set). Function calls returning arrays or structs
-also return composite results with proper metadata.
-
-`typeName` enables field resolution without re-inspecting the AST:
-`lowerSelectorExpr` and `lowerFieldAssign` use `base.typeName` to
-look up the `StructDef` directly. `elemType` propagates through
-`indexInto` so that `a[i].x` resolves the struct type from the
-indexed result. This allows chained access on any expression
-(e.g., `f().x`, `f()[i].x`, `f().data[i]`).
-
-### Variable Initialization
-
-Simple assignments (`x = expr`, `x := expr`) and `var x = expr`
-declarations share a unified path through `lowerVarInit`, which
-handles composite literals, pointer tracking, and composite variable
-copies. For composite RHS (struct/array variables), `lowerExpr`
-returns a multi-cell result and `emitCopyOrMove` handles the
-cell-by-cell transfer.
-
-### Field Assignment
-
-`lowerFieldAssign` resolves the base via `lowerExpr(sel.X)`, then
-dispatches by result type:
-
-- **Pointer** (`isPtr`): `ptrOffset` + `ptrStore`
-- **Nested struct**: `lowerStructValueTo` for composite field writes
-- **Direct/flat-offset**: `writeInto` with the field offset as a
-  constant index expression
-
 ## Arrays
 
 Constant-indexed access (`a[3]`) is a direct cell reference at
@@ -170,7 +176,7 @@ does the same with `writeInto`. This replaces per-type dispatch
 (previously separate functions for pointer arrays, chained indices,
 selector bases, etc.).
 
-For pointer-based access (`isPtr` results), `indexInto`/`writeInto`
+For pointer-based access (`isPointer` results), `indexInto`/`writeInto`
 use `ptrDynIndex` + `ptrLoad`/`ptrStore`. For variable-index
 composite arrays, `indexInto` returns a flat-offset result with
 `flatBase` set, so the next level of indexing knows the original
@@ -179,7 +185,7 @@ array base for dynamic access.
 ### Arrays of Structs
 
 `[N]Point` occupies `N * sizeof(Point)` contiguous cells. Constant
-index `a[0].x` is a direct cell access at `base + 0*2 + 0`. Variable
+index `a[3].x` is a direct cell access at `base + 3*2 + 0`. Variable
 index `a[i].x` computes a flat index `i * elemSize + fieldOffset`
 and uses a single dynamic load/store. Whole-struct assignment
 `a[i] = Point{...}` with variable index evaluates the struct into
@@ -213,22 +219,112 @@ Array parameters and returns are passed by cell-by-cell copying.
 For a function `func f(a [3]byte)`, the caller copies 3 cells into
 the function's parameter slots.
 
+## Slices
+
+A slice variable occupies 3 cells (`ptr`, `len`, `cap`) plus
+compile-time metadata (`elemSize`, `elemType`, `elemSlice`,
+`elemPtrType`). Slice operations reuse the pointer
+infrastructure (`ptrDynIndex`, `ptrLoad`, `ptrStore`) for
+indexed access. For struct slices, `s[i].x` computes
+`ptr + i * elemSize + fieldOffset`. For pointer slices
+(`[]*Point`), `elemPtrType` tracks the pointed-to struct
+type; `s[i]` loads the pointer and tags the result with
+`isPointer` and `typeName` so field access and method calls
+dispatch through the pointer-to-struct path.
+
+`lowerSliceExpr` evaluates any slice-producing expression
+(`make`, `append`, literals, slice expressions, variables,
+function calls) into a temporary 3-cell header, separating
+evaluation from assignment. Nested expressions like
+`append(make([]byte, n), v)` work via recursive evaluation.
+
+Backing arrays are allocated from a bump allocator
+(`heapPtr` cell). The heap starts after all statically
+allocated cells. `heapPtr` is always the first cell
+allocated (slot 0), reserving slot 0 so that no user
+variable occupies it. This makes pointer value 0 a
+reliable nil sentinel for both slices and pointers.
+`s == nil` and `p == nil` compare the cell against 0.
+Each allocation pushes guard slots via `IRFramePush`
+(constant sizes) or `IRFramePushDyn` (variable sizes), and
+bumps `heapPtr` by `cap * elemSize` cells. `var r []byte`
+initializes all header cells to 0 (`nil`).
+Appending to a `nil` slice triggers full reallocation.
+
+`append(s, v)` checks `len < cap`. If room, stores the
+value at `ptr + len * elemSize` and increments `len`. If
+full, doubles the capacity (or sets it to 1 if zero).
+For struct slices, `resolveStructArg` evaluates the value
+into temp cells. For `[][]byte`, `lowerSliceExpr` evaluates
+the inner header. When `ptr + cap * elemSize == heapPtr`
+(backing array at heap top), the array is extended in-place.
+Otherwise, a new array is allocated, old elements are copied
+via a counted loop, and the old array is leaked.
+Variadic `append(s, a, b, c)` emits multiple single-element
+appends. `append(s, t...)` ensures capacity, then bulk
+copies `len(t) * elemSize` cells from source to destination.
+
+`copy(dst, src)` copies `min(len(dst), len(src)) * elemSize`
+cells via a counted loop. Both arguments can be any slice
+expression (variable, reslice, array slice).
+
+`clear(s)` zeroes `len(s) * elemSize` cells via a counted
+loop starting at `ptr`.
+
+Three-index slicing `s[low:high:max]` sets `cap = max - low`
+instead of inheriting the source capacity.
+
+Composite literals (`[]Point{P{1,2}, P{3,4}}`) use
+`resolveStructArg` per element, storing each at
+`ptr + i * elemSize` via `ptrStore`.
+
+`len(m[i])` and `cap(m[i])` for `[][]byte` inner slices
+are handled by loading the inner header via
+`loadSliceElement` in the `len`/`cap` handler.
+
+Composite slices (`[]Point`, `[][N]byte`, `[][]byte`)
+use `elemSize > 1`. For `[][]byte`, each element is a
+3-cell inner header; `indexInto` detects `elemSlice` and
+loads it automatically. Element-to-element copy
+(`s[0] = s[1]`) loads and stores each field via
+`ptrLoad`/`ptrStore`. Pointer-based struct results
+(e.g., `s[0]` for `[]Point`) are materialized into
+contiguous temp cells when passed as function arguments
+or assigned to local struct variables.
+
+Reslicing (`s[i:j]`) propagates `elemSize`, `elemType`,
+and `elemSlice` from the source. The analyzer stores
+`SliceElemSize` and `SliceElemType` in `ReturnInfo` for
+functions returning struct slices. `scanAndAllocLocals`
+detects struct slice range values and `tmp := s[i]`
+patterns to allocate struct-sized variables.
+
 ## Pointers
 
 Pointers are byte values holding stack slot indices. `&x` emits
 `IRConst` with the compile-time slot index. `&a[i]` with variable
-index computes `slotOf(a.base) + i` at runtime. Dereference (`*p`)
-uses `IRDynLoad{BaseSlot: 0, Index: p}` and `IRDynStore` for writes.
+index computes `slotOf(a.base) + i` at runtime. `&s[i]` for slices
+computes `ptr + i * elemSize` via `ptrDynIndex`. `&Point{x: 1}`
+lowers the composite literal into cells and returns the slot index.
+Dereference (`*p`) uses `IRDynLoad{BaseSlot: 0, Index: p}` and
+`IRDynStore` for writes. `nil` is lowered as 0. There is no
+bounds checking on pointer values: out-of-range dereferences
+silently read/write arbitrary stack slots.
 
-Struct pointers (`ptr := &myStruct`) are tracked in the scope's
-`ptrType` map. `ptr.x` emits `IRDynLoad` at `*ptr + fieldOffset`.
-`ptr.x = val` emits `IRDynStore`.
+Struct pointers (`ptr := &myStruct` or `ptr := &Point{...}`) are
+tracked in the scope's `ptrType` map. `ptr.x` emits `IRDynLoad`
+at `*ptr + fieldOffset`. Functions returning `*Point` set
+`ReturnType.StructType` with `IsPointer`, so `lowerCallExpr`
+tags the result for `ptrType` tracking by the caller.
 
 Array pointers (`ptr := &myArray`) are tracked in `ptrArray`.
-`lowerExpr(ptr)` returns an `exprResult` with `isPtr: true` and
-the array's `elemSize`/`elemCount`. All pointer indexing then goes
-through the generic `indexInto`/`writeInto` path, which uses
-`ptrDynIndex` + `ptrLoad`/`ptrStore` for `isPtr` results.
+`lowerExpr(ptr)` returns an `exprResult` with `isPointer: true` and
+the array's `elemSize`/`elemCount`. Functions returning `*[N]byte`
+set `ReturnType.IsPointer` and `ReturnType.ArraySize` so that
+`lowerCallExpr` tags the result as a pointer-to-array. All pointer
+indexing goes through the generic `indexInto`/`writeInto` path,
+which uses `ptrDynIndex` + `ptrLoad`/`ptrStore` for `isPointer`
+results.
 
 `ptr[i]` computes `*ptr + i * elemSize` and loads/stores via
 `IRDynLoad`/`IRDynStore`. `ptr[i][j]` is handled by recursive
@@ -240,7 +336,7 @@ Mixed access patterns are supported:
 - `ptr[i].x` for array-of-structs pointers: `indexInto` returns
   a pointer sub-array, `lowerSelectorExpr` adds the field offset
 - `ptr.data[i]` for struct-with-array pointers: `lowerSelectorExpr`
-  returns an `isPtr` result with the field's array metadata,
+  returns an `isPointer` result with the field's array metadata,
   then `indexInto` handles the index
 
 Pointer types are tracked both for local assignments (`ptr := &myStruct`)
@@ -255,8 +351,9 @@ semantics where these operations work on both arrays and array pointers.
 
 ## Defer
 
-`defer` captures the function call arguments at defer-time and executes
-the call at function return.
+`defer` captures the function call arguments at defer-time
+and executes the call at function return. Slice arguments
+are captured as a 3-cell header copy (shared backing array).
 
 ### Non-recursive Functions
 
@@ -332,6 +429,15 @@ C-style `for init; cond; post { body }` becomes:
 [init]
 IRLoop{cond, [body; post]}
 ```
+
+`for range n` desugars to `for i := 0; i < n; i++`.
+
+`for i, v := range a` over arrays uses `len(a)` as the
+limit and loads `v = a[i]` at each iteration via
+`emitVariableIndexRead`. For slices, `len(s)` is a runtime
+value from the header. For struct slices, `v` is allocated
+as a struct and loaded via `ptrLoad` (`elemSize` cells per
+iteration).
 
 ### Switch
 

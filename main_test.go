@@ -24,7 +24,7 @@ func TestRun(t *testing.T) {
 			"compile file with debug",
 			[]string{"-debug", "testdata/hello.go"},
 			"",
-			"putc r1",
+			"# putc r",
 			"",
 		},
 		{

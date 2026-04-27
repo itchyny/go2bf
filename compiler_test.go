@@ -511,9 +511,9 @@ func main() { print(f(42)) }`,
 			"selector on function result",
 			`package main
 type P struct { x byte; y byte }
-func make_point(a, b byte) P { return P{x: a, y: b} }
+func makePoint(a, b byte) P { return P{x: a, y: b} }
 func main() {
-	p := make_point(3, 7)
+	p := makePoint(3, 7)
 	print(p.x + p.y)
 }`,
 			"", "10",
@@ -3430,6 +3430,33 @@ func main() { print(f(4)) }`,
 			"", "10",
 		},
 		{
+			"recursive with array not equal",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	a := [2]byte{n, n + 1}
+	b := [2]byte{n, n + 2}
+	if a != b { return 1 + f(n-1) }
+	return f(n-1)
+}
+func main() { print(f(3)) }`,
+			"", "3",
+		},
+		{
+			"recursive with struct array field access",
+			`package main
+type P struct { x, y byte }
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	var a [2]P
+	a[0].x = n
+	a[0].y = n + 1
+	return a[0].x + a[0].y + f(n-1)
+}
+func main() { print(f(2)) }`,
+			"", "8",
+		},
+		{
 			"nested recursive call ackermann",
 			`package main
 func ack(m, n byte) byte {
@@ -4041,6 +4068,79 @@ func f(n byte) byte {
 func main() { println(f(3)) }`,
 			"", "10\n",
 		},
+		{
+			"recursive 2d array both variable indices",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	var a [3][3]byte
+	i := n % 3
+	j := (n + 1) % 3
+	a[i][j] = n
+	return a[i][j] + f(n-1)
+}
+func main() { print(f(4)) }`,
+			"", "10",
+		},
+		{
+			"recursive switch with cases",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	switch n % 3 {
+	case 0:
+		return f(n - 1)
+	case 1:
+		return 1 + f(n - 1)
+	default:
+		return 2 + f(n - 1)
+	}
+}
+func main() { print(f(6)) }`,
+			"", "6",
+		},
+		{
+			"recursive if with init statement",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	if x := n * 2; x > 5 {
+		return x + f(n-1)
+	}
+	return f(n-1)
+}
+func main() { print(f(4)) }`,
+			"", "14",
+		},
+		{
+			"recursive nested struct field access",
+			`package main
+type Inner struct { v byte }
+type Outer struct { i Inner }
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	var o Outer
+	o.i.v = n
+	return o.i.v + f(n-1)
+}
+func main() { print(f(3)) }`,
+			"", "6",
+		},
+		{
+			"recursive struct array variable index field assign",
+			`package main
+type P struct { x, y byte }
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	var a [2]P
+	i := n % 2
+	a[i].x = n
+	a[i].y = n + 1
+	return a[i].x + a[i].y + f(n-1)
+}
+func main() { print(f(3)) }`,
+			"", "15",
+		},
 		// --- Defer ---
 		{
 			"defer basic",
@@ -4274,6 +4374,21 @@ func main() {
 	inner()
 }`,
 			"", "ABCD\n",
+		},
+		{
+			"defer with slice argument",
+			`package main
+func show(s []byte) {
+	for _, v := range s { print(v); print(" ") }
+	println()
+}
+func main() {
+	s := make([]byte, 3)
+	s[0] = 1; s[1] = 2; s[2] = 3
+	defer show(s)
+	s[1] = 99
+}`,
+			"", "1 99 3 \n",
 		},
 		// --- Constants ---
 		{
@@ -4561,12 +4676,12 @@ func main() {
 		{
 			"array return from function",
 			`package main
-func make_array() [3]byte {
+func makeArray() [3]byte {
 	a := [3]byte{10, 20, 30}
 	return a
 }
 func main() {
-	a := make_array()
+	a := makeArray()
 	println(a[0], a[1], a[2])
 }`,
 			"", "10 20 30\n",
@@ -4744,6 +4859,15 @@ func main() {
 	}
 }`,
 			"", "ABC",
+		},
+		{
+			"array cap",
+			`package main
+func main() {
+	a := [5]byte{1, 2, 3, 4, 5}
+	print(cap(a))
+}`,
+			"", "5",
 		},
 		{
 			"array variable index range",
@@ -4982,15 +5106,6 @@ func main() {
 	}
 }`,
 			"", "ABC",
-		},
-		{
-			"cap",
-			`package main
-func main() {
-	a := [5]byte{1, 2, 3, 4, 5}
-	print(cap(a))
-}`,
-			"", "5",
 		},
 		{
 			"array keyed literal sparse",
@@ -5514,6 +5629,1160 @@ func main() {
 }`,
 			"", "6 2\n",
 		},
+		// --- Slices ---
+		{
+			"slice make len cap",
+			`package main
+func main() {
+	s := make([]byte, 3, 5)
+	println(len(s), cap(s))
+}`,
+			"", "3 5\n",
+		},
+		{
+			"slice index write read",
+			`package main
+func main() {
+	s := make([]byte, 3)
+	s[0] = 10; s[1] = 20; s[2] = 30
+	println(s[0], s[1], s[2])
+}`,
+			"", "10 20 30\n",
+		},
+		{
+			"slice append no reallocation",
+			`package main
+func main() {
+	s := make([]byte, 0, 3)
+	s = append(s, 10)
+	s = append(s, 20)
+	s = append(s, 30)
+	println(s[0], s[1], s[2])
+}`,
+			"", "10 20 30\n",
+		},
+		{
+			"slice append with reallocation",
+			`package main
+func main() {
+	s := make([]byte, 0, 1)
+	s = append(s, 10)
+	s = append(s, 20)
+	println(s[0], s[1], len(s))
+}`,
+			"", "10 20 2\n",
+		},
+		{
+			"slice append from nil",
+			`package main
+func main() {
+	var s []byte
+	s = append(s, 10)
+	s = append(s, 20)
+	println(s[0], s[1], len(s))
+}`,
+			"", "10 20 2\n",
+		},
+		{
+			"slice append to new variable",
+			`package main
+func main() {
+	s := []byte{1, 2, 3}
+	t := append(s, 4)
+	println(t[0], t[1], t[2], t[3], len(t))
+}`,
+			"", "1 2 3 4 4\n",
+		},
+		{
+			"slice from array",
+			`package main
+func main() {
+	a := [5]byte{10, 20, 30, 40, 50}
+	s := a[1:4]
+	println(len(s), cap(s), s[0], s[1], s[2])
+}`,
+			"", "3 4 20 30 40\n",
+		},
+		{
+			"slice range with value",
+			`package main
+func main() {
+	s := []byte{10, 20, 30}
+	sum := byte(0)
+	for _, v := range s { sum += v }
+	println(sum)
+}`,
+			"", "60\n",
+		},
+		{
+			"slice copy shared backing",
+			`package main
+func main() {
+	s := make([]byte, 2)
+	s[0] = 10; s[1] = 20
+	t := s
+	t[0] = 99
+	println(s[0], t[0], t[1])
+}`,
+			"", "99 99 20\n",
+		},
+		{
+			"slice element inc dec",
+			`package main
+func main() {
+	s := make([]byte, 3)
+	s[0] = 10; s[1] = 20; s[2] = 30
+	s[1]++
+	s[2] += 5
+	println(s[0], s[1], s[2])
+}`,
+			"", "10 21 35\n",
+		},
+		{
+			"slice reverse in place",
+			`package main
+func main() {
+	s := make([]byte, 5)
+	for i := range byte(5) { s[i] = i + 1 }
+	for i := byte(0); i < 2; i++ {
+		j := 4 - i
+		t := s[i]; s[i] = s[j]; s[j] = t
+	}
+	for i, v := range s {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+	println()
+}`,
+			"", "5 4 3 2 1\n",
+		},
+		{
+			"slice index with len expression",
+			`package main
+func main() {
+	s := make([]byte, 0, 10)
+	s = append(s, 10)
+	s = append(s, 20)
+	s = append(s, 30)
+	i := len(s) - 1
+	top := s[i]
+	s = s[:i]
+	println(top, len(s))
+}`,
+			"", "30 2\n",
+		},
+		{
+			"slice reslice with low",
+			`package main
+func main() {
+	s := make([]byte, 5)
+	for i := range byte(5) { s[i] = i + 10 }
+	t := s[1:4]
+	println(len(t), cap(t), t[0], t[1], t[2])
+}`,
+			"", "3 4 11 12 13\n",
+		},
+		{
+			"slice reslice same slice with low",
+			`package main
+func main() {
+	s := make([]byte, 5)
+	for i := range byte(5) { s[i] = i + 10 }
+	s = s[2:]
+	for i, v := range s {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+	println()
+}`,
+			"", "12 13 14\n",
+		},
+		{
+			"slice reslice with both bounds",
+			`package main
+func main() {
+	s := []byte{10, 20, 30, 40, 50}
+	t := s[1:3]
+	println(t[0], t[1], len(t), cap(t))
+}`,
+			"", "20 30 2 4\n",
+		},
+		{
+			"slice reslice after append",
+			`package main
+func main() {
+	a := make([]byte, 0, 4)
+	a = append(a, 10)
+	a = append(a, 20)
+	a = append(a, 30)
+	b := a[:2]
+	println(b[0], b[1], len(b), cap(b))
+}`,
+			"", "10 20 2 4\n",
+		},
+		{
+			"slice function param",
+			`package main
+func sum(s []byte) byte {
+	t := byte(0)
+	for _, v := range s { t += v }
+	return t
+}
+func main() {
+	s := make([]byte, 3)
+	s[0] = 10; s[1] = 20; s[2] = 30
+	println(sum(s))
+}`,
+			"", "60\n",
+		},
+		{
+			"slice of structs function param",
+			`package main
+type Point struct { x, y byte }
+func total(pts []Point) byte {
+	sum := byte(0)
+	for i := range byte(len(pts)) {
+		sum += pts[i].x + pts[i].y
+	}
+	return sum
+}
+func main() {
+	s := make([]Point, 2)
+	s[0].x = 3; s[0].y = 4
+	s[1].x = 10; s[1].y = 20
+	println(total(s))
+}`,
+			"", "37\n",
+		},
+		{
+			"slice of slices element as param",
+			`package main
+func sum(s []byte) byte {
+	t := byte(0)
+	for _, v := range s { t += v }
+	return t
+}
+func main() {
+	m := make([][]byte, 2)
+	m[0] = []byte{1, 2, 3}
+	m[1] = []byte{4, 5, 6}
+	a := m[0]
+	b := m[1]
+	println(sum(a), sum(b))
+}`,
+			"", "6 15\n",
+		},
+		{
+			"slice return from function",
+			`package main
+func collect(n byte) []byte {
+	s := make([]byte, 0, 10)
+	for i := byte(1); i <= n; i++ {
+		s = append(s, i)
+	}
+	return s
+}
+func main() {
+	s := collect(4)
+	println(s[0], s[1], s[2], s[3], len(s))
+}`,
+			"", "1 2 3 4 4\n",
+		},
+		{
+			"slice literal as function argument",
+			`package main
+func sum(s []byte) byte {
+	t := byte(0)
+	for _, v := range s { t += v }
+	return t
+}
+func main() { println(sum([]byte{10, 20, 30})) }`,
+			"", "60\n",
+		},
+		{
+			"struct slice composite literal",
+			`package main
+type P struct { x, y byte }
+func main() {
+	s := []P{P{x: 1, y: 2}, P{x: 3, y: 4}, P{x: 5, y: 6}}
+	for i := range byte(len(s)) { println(s[i].x, s[i].y) }
+}`,
+			"", "1 2\n3 4\n5 6\n",
+		},
+		{
+			"array slice composite literal",
+			`package main
+func main() {
+	s := [][2]byte{[2]byte{1, 2}, [2]byte{3, 4}}
+	println(s[0][0], s[0][1], s[1][0], s[1][1])
+}`,
+			"", "1 2 3 4\n",
+		},
+		{
+			"slice filter function",
+			`package main
+func filter(s []byte) []byte {
+	r := make([]byte, 0, 10)
+	for _, v := range s {
+		if v > 2 { r = append(r, v) }
+	}
+	return r
+}
+func main() {
+	s := filter([]byte{1, 2, 3, 4, 5})
+	println(s[0], s[1], s[2], len(s))
+}`,
+			"", "3 4 5 3\n",
+		},
+		{
+			"slice multi-assign swap",
+			`package main
+func main() {
+	s := make([]byte, 4)
+	s[0] = 1; s[1] = 2; s[2] = 3; s[3] = 4
+	s[0], s[3] = s[3], s[0]
+	s[1], s[2] = s[2], s[1]
+	for i, v := range s {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+}`,
+			"", "4 3 2 1",
+		},
+		{
+			"slice of structs read write",
+			`package main
+type Point struct { x, y byte }
+func main() {
+	s := make([]Point, 3)
+	s[0].x = 1; s[0].y = 2
+	s[1].x = 3; s[1].y = 4
+	s[2].x = 5; s[2].y = 6
+	for i := range byte(3) {
+		if i > 0 { print(" ") }
+		print(s[i].x); print(","); print(s[i].y)
+	}
+}`,
+			"", "1,2 3,4 5,6",
+		},
+		{
+			"slice of structs field inc",
+			`package main
+type Point struct { x, y byte }
+func main() {
+	s := make([]Point, 2)
+	s[0].x = 10; s[0].y = 20
+	s[1].x = 30; s[1].y = 40
+	s[0].x++; s[1].y += 5
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "11 20 30 45\n",
+		},
+		{
+			"slice of structs array field",
+			`package main
+type S struct { data [3]byte }
+func main() {
+	s := make([]S, 2)
+	s[0].data[0] = 10; s[0].data[1] = 20; s[0].data[2] = 30
+	s[1].data[0] = 40; s[1].data[1] = 50; s[1].data[2] = 60
+	for i := range byte(2) {
+		println(s[i].data[0], s[i].data[1], s[i].data[2])
+	}
+}`,
+			"", "10 20 30\n40 50 60\n",
+		},
+		{
+			"slice of arrays read write",
+			`package main
+func main() {
+	s := make([][3]byte, 2)
+	s[0][0] = 1; s[0][1] = 2; s[0][2] = 3
+	s[1][0] = 4; s[1][1] = 5; s[1][2] = 6
+	println(s[0][0], s[0][1], s[0][2], s[1][0], s[1][1], s[1][2])
+}`,
+			"", "1 2 3 4 5 6\n",
+		},
+		{
+			"slice of arrays variable index",
+			`package main
+func main() {
+	s := make([][2]byte, 3)
+	for i := range byte(3) {
+		s[i][0] = i + 1
+		s[i][1] = (i + 1) * 10
+	}
+	for i := range byte(3) {
+		println(s[i][0], s[i][1])
+	}
+}`,
+			"", "1 10\n2 20\n3 30\n",
+		},
+		{
+			"slice of slices read write",
+			`package main
+func main() {
+	s := make([][]byte, 2)
+	s[0] = []byte{1, 2, 3}
+	s[1] = []byte{4, 5}
+	println(s[0][0], s[0][2], s[1][0], s[1][1])
+}`,
+			"", "1 3 4 5\n",
+		},
+		{
+			"slice of slices element write",
+			`package main
+func main() {
+	s := make([][]byte, 2)
+	s[0] = []byte{1, 2, 3}
+	s[1] = []byte{4, 5}
+	s[0][1] = 99
+	s[1][0] = 88
+	println(s[0][1], s[1][0])
+}`,
+			"", "99 88\n",
+		},
+		{
+			"slice of slices inner len cap",
+			`package main
+func main() {
+	m := make([][]byte, 2)
+	m[0] = []byte{1, 2, 3}
+	m[1] = []byte{10, 20}
+	sum := byte(0)
+	for i := range byte(len(m)) {
+		inner := m[i]
+		for j := range byte(len(inner)) {
+			sum += inner[j]
+		}
+	}
+	println(sum, len(m[0]), len(m[1]))
+}`,
+			"", "36 3 2\n",
+		},
+		{
+			"slice reslice both bounds variable",
+			`package main
+func main() {
+	s := []byte{10, 20, 30, 40, 50}
+	low := byte(1)
+	high := byte(4)
+	t := s[low:high]
+	println(len(t), t[0], t[2])
+}`,
+			"", "3 20 40\n",
+		},
+		{
+			"slice make with cap",
+			`package main
+func main() {
+	s := make([]byte, 2, 5)
+	s[0] = 10
+	s[1] = 20
+	println(len(s), cap(s), s[0], s[1])
+}`,
+			"", "2 5 10 20\n",
+		},
+		{
+			"slice as accumulator across functions",
+			`package main
+func addRange(s []byte, lo, hi byte) []byte {
+	for i := lo; i <= hi; i++ { s = append(s, i) }
+	return s
+}
+func main() {
+	s := make([]byte, 0, 20)
+	s = addRange(s, 1, 3)
+	s = addRange(s, 10, 11)
+	println(s[0], s[1], s[2], s[3], s[4], len(s))
+}`,
+			"", "1 2 3 10 11 5\n",
+		},
+		{
+			"three slices growing interleaved",
+			`package main
+func main() {
+	var a, b, c []byte
+	for i := byte(0); i < 4; i++ {
+		a = append(a, i+1)
+		b = append(b, (i+1)*10)
+		c = append(c, (i+1)+50)
+	}
+	println(a[0], a[3], b[0], b[3], c[0], c[3])
+}`,
+			"", "1 4 10 40 51 54\n",
+		},
+		{
+			"slice with recursive function call",
+			`package main
+func fib(n byte) byte {
+	if n <= 1 { return n }
+	return fib(n-1) + fib(n-2)
+}
+func main() {
+	var s []byte
+	for i := byte(0); i < 6; i++ {
+		s = append(s, fib(i))
+	}
+	for _, v := range s {
+		print(v)
+		print(" ")
+	}
+	println(len(s))
+}`,
+			"", "0 1 1 2 3 5 6\n",
+		},
+		{
+			"slice append result to new variable",
+			`package main
+func main() {
+	s := make([]byte, 0, 4)
+	s = append(s, 1)
+	t := append(s, 2)
+	println(t[0], t[1], len(t))
+}`,
+			"", "1 2 2\n",
+		},
+		{
+			"reslice variable both bounds",
+			`package main
+func main() {
+	s := make([]byte, 5, 5)
+	for i := range byte(5) { s[i] = (i + 1) * 10 }
+	i := byte(1)
+	t := s[i:i+3]
+	println(t[0], t[1], t[2], len(t))
+}`,
+			"", "20 30 40 3\n",
+		},
+		{
+			"reslice variable high bound",
+			`package main
+func main() {
+	s := make([]byte, 5, 5)
+	for i := range byte(5) { s[i] = (i + 1) * 10 }
+	i := byte(3)
+	t := s[:i]
+	println(t[0], t[1], t[2], len(t))
+}`,
+			"", "10 20 30 3\n",
+		},
+		{
+			"reslice variable low bound",
+			`package main
+func main() {
+	s := make([]byte, 5, 5)
+	for i := range byte(5) { s[i] = (i + 1) * 10 }
+	i := byte(2)
+	t := s[i:]
+	println(t[0], t[1], t[2], len(t))
+}`,
+			"", "30 40 50 3\n",
+		},
+		{
+			"nil slice append does not corrupt earlier vars",
+			`package main
+func main() {
+	x := byte(10)
+	y := byte(20)
+	var s []byte
+	s = append(s, 42)
+	println(x, y, s[0])
+}`,
+			"", "10 20 42\n",
+		},
+		{
+			"slice struct composite literal assign",
+			`package main
+type P struct { x, y byte }
+func (p P) sum() byte { return p.x + p.y }
+func main() {
+	s := make([]P, 2)
+	s[0] = P{x: 3, y: 4}
+	s[1] = P{x: 5, y: 6}
+	println(s[0].sum(), s[1].sum())
+}`,
+			"", "7 11\n",
+		},
+		{
+			"slice struct composite literal variable index",
+			`package main
+type P struct { x, y byte }
+func main() {
+	s := make([]P, 3)
+	for i := range byte(3) {
+		s[i] = P{x: i + 1, y: (i + 1) * 10}
+	}
+	println(s[0].x, s[0].y, s[1].x, s[1].y, s[2].x, s[2].y)
+}`,
+			"", "1 10 2 20 3 30\n",
+		},
+		{
+			"slice struct append composite literal",
+			`package main
+type P struct { x, y byte }
+func main() {
+	var s []P
+	s = append(s, P{x: 10, y: 20})
+	s = append(s, P{x: 30, y: 40})
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "10 20 30 40\n",
+		},
+		{
+			"slice struct append variable",
+			`package main
+type P struct { x, y byte }
+func main() {
+	var s []P
+	p := P{x: 1, y: 2}
+	s = append(s, p)
+	println(s[0].x, s[0].y)
+}`,
+			"", "1 2\n",
+		},
+		{
+			"range over struct slice",
+			`package main
+type P struct { x, y byte }
+func (p P) sum() byte { return p.x + p.y }
+func main() {
+	s := make([]P, 3)
+	s[0] = P{x: 1, y: 2}
+	s[1] = P{x: 3, y: 4}
+	s[2] = P{x: 5, y: 6}
+	for i, p := range s {
+		if i > 0 { print(" ") }
+		print(p.sum())
+	}
+}`,
+			"", "3 7 11",
+		},
+		{
+			"struct slice append reuse variable",
+			`package main
+type P struct { x, y byte }
+func main() {
+	var s []P
+	var p P
+	p.x = 1; p.y = 2
+	s = append(s, p)
+	p.x = 3; p.y = 4
+	s = append(s, p)
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "1 2 3 4\n",
+		},
+		{
+			"slice of slices append named variable",
+			`package main
+func main() {
+	var s [][]byte
+	a := []byte{1, 2, 3}
+	b := []byte{4, 5}
+	s = append(s, a)
+	s = append(s, b)
+	println(s[0][0], s[0][2], s[1][0], s[1][1])
+}`,
+			"", "1 3 4 5\n",
+		},
+		{
+			"slice return from reslice",
+			`package main
+func first2(s []byte) []byte {
+	return s[:2]
+}
+func main() {
+	s := make([]byte, 4)
+	s[0] = 1; s[1] = 2; s[2] = 3; s[3] = 4
+	t := first2(s)
+	println(t[0], t[1], len(t))
+}`,
+			"", "1 2 2\n",
+		},
+		{
+			"struct slice return from function",
+			`package main
+type P struct { x, y byte }
+func makePts() []P {
+	var s []P
+	s = append(s, P{x: 1, y: 2})
+	s = append(s, P{x: 3, y: 4})
+	return s
+}
+func main() {
+	s := makePts()
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "1 2 3 4\n",
+		},
+		{
+			"struct slice reslice",
+			`package main
+type P struct { x, y byte }
+func main() {
+	s := make([]P, 3)
+	s[0] = P{x: 1, y: 2}; s[1] = P{x: 3, y: 4}; s[2] = P{x: 5, y: 6}
+	t := s[1:]
+	println(t[0].x, t[0].y, t[1].x, t[1].y)
+}`,
+			"", "3 4 5 6\n",
+		},
+		{
+			"array slice append composite literal",
+			`package main
+func main() {
+	var s [][3]byte
+	s = append(s, [3]byte{1, 2, 3})
+	s = append(s, [3]byte{4, 5, 6})
+	println(s[0][0], s[0][1], s[0][2], s[1][0], s[1][1], s[1][2])
+}`,
+			"", "1 2 3 4 5 6\n",
+		},
+		{
+			"struct slice element copy",
+			`package main
+type P struct { x, y byte }
+func main() {
+	s := make([]P, 2)
+	s[0] = P{x: 1, y: 2}; s[1] = P{x: 3, y: 4}
+	s[0] = s[1]
+	println(s[0].x, s[0].y)
+}`,
+			"", "3 4\n",
+		},
+		{
+			"local struct from slice element",
+			`package main
+type P struct { x, y byte }
+func main() {
+	s := make([]P, 2)
+	s[0] = P{x: 1, y: 2}; s[1] = P{x: 3, y: 4}
+	tmp := s[0]
+	s[1] = tmp
+	println(tmp.x, tmp.y, s[1].x, s[1].y)
+}`,
+			"", "1 2 1 2\n",
+		},
+		{
+			"make slice with variable length",
+			`package main
+func main() {
+	n := byte(5)
+	s := make([]byte, n)
+	for i := range n { s[i] = i * 10 }
+	println(s[0], s[1], s[2], s[3], s[4])
+}`,
+			"", "0 10 20 30 40\n",
+		},
+		{
+			"pointer slice deref and modify",
+			`package main
+func main() {
+	x := byte(10)
+	y := byte(20)
+	var s []*byte
+	s = append(s, &x)
+	s = append(s, &y)
+	*s[0] += 5
+	*s[1]++
+	println(x, y)
+}`,
+			"", "15 21\n",
+		},
+		{
+			"struct pointer slice field access and method",
+			`package main
+type P struct { x, y byte }
+func (p P) sum() byte { return p.x + p.y }
+func main() {
+	a := P{x: 3, y: 4}
+	b := P{x: 5, y: 6}
+	var s []*P
+	s = append(s, &a)
+	s = append(s, &b)
+	println(s[0].x, s[0].y, s[1].sum())
+	s[1].x++
+	println(b.x)
+}`,
+			"", "3 4 11\n6\n",
+		},
+		{
+			"struct pointer slice element assign",
+			`package main
+type P struct { x, y byte }
+func main() {
+	a := P{x: 1, y: 2}
+	b := P{x: 3, y: 4}
+	s := make([]*P, 2)
+	s[0] = &a; s[1] = &b
+	s[0] = s[1]
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "3 4 3 4\n",
+		},
+		{
+			"slice struct append indexed element",
+			`package main
+type P struct { x, y byte }
+func filter(pts []P, minX byte) []P {
+	var r []P
+	for i := range byte(len(pts)) {
+		if pts[i].x >= minX {
+			r = append(r, pts[i])
+		}
+	}
+	return r
+}
+func main() {
+	s := make([]P, 3)
+	s[0] = P{x: 1, y: 2}; s[1] = P{x: 5, y: 6}; s[2] = P{x: 3, y: 4}
+	t := filter(s, 3)
+	for _, p := range t { println(p.x, p.y) }
+}`,
+			"", "5 6\n3 4\n",
+		},
+		{
+			"nested struct field through slice",
+			`package main
+type Inner struct { x, y byte }
+type Outer struct { a Inner; b byte }
+func main() {
+	s := make([]Outer, 2)
+	s[0].a.x = 3; s[0].a.y = 4; s[0].b = 5
+	s[1].a.x = 6; s[1].a.y = 7; s[1].b = 8
+	println(s[0].a.x, s[0].a.y, s[0].b)
+	println(s[1].a.x, s[1].a.y, s[1].b)
+}`,
+			"", "3 4 5\n6 7 8\n",
+		},
+		{
+			"range over pointer slice",
+			`package main
+type P struct { x, y byte }
+func main() {
+	a := P{x: 1, y: 2}
+	b := P{x: 3, y: 4}
+	var s []*P
+	s = append(s, &a)
+	s = append(s, &b)
+	for _, p := range s {
+		println(p.x, p.y)
+	}
+}`,
+			"", "1 2\n3 4\n",
+		},
+		{
+			"range over function returning struct slice",
+			`package main
+type P struct { x, y byte }
+func makePts() []P {
+	var s []P
+	s = append(s, P{x: 1, y: 2})
+	s = append(s, P{x: 3, y: 4})
+	return s
+}
+func main() {
+	for _, p := range makePts() {
+		println(p.x, p.y)
+	}
+}`,
+			"", "1 2\n3 4\n",
+		},
+		{
+			"function return to slice element",
+			`package main
+type P struct { x, y byte }
+func makeP(a, b byte) P { return P{x: a, y: b} }
+func main() {
+	s := make([]P, 2)
+	s[0] = makeP(1, 2)
+	s[1] = makeP(3, 4)
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "1 2 3 4\n",
+		},
+		{
+			"range over slice expression",
+			`package main
+func main() {
+	s := []byte{10, 20, 30, 40, 50}
+	sum := byte(0)
+	for _, v := range s[1:4] {
+		sum += v
+	}
+	print(sum)
+}`,
+			"", "90",
+		},
+		{
+			"range over struct slice expression",
+			`package main
+type P struct { x, y byte }
+func main() {
+	s := make([]P, 3)
+	s[0] = P{x: 1, y: 2}; s[1] = P{x: 3, y: 4}; s[2] = P{x: 5, y: 6}
+	for _, p := range s[1:] {
+		println(p.x, p.y)
+	}
+}`,
+			"", "3 4\n5 6\n",
+		},
+		{
+			"binary search on sorted slice",
+			`package main
+func bsearch(s []byte, v byte) byte {
+	lo, hi := byte(0), byte(len(s))
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if s[mid] < v {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+func main() {
+	s := []byte{2, 5, 8, 12, 16, 23, 38, 56, 72, 91}
+	println(bsearch(s, 23), bsearch(s, 50))
+}`,
+			"", "5 7\n",
+		},
+		{
+			"computed index expression",
+			`package main
+func main() {
+	s := make([]byte, 5)
+	for i := range byte(5) { s[i] = (i + 1) * 10 }
+	j := byte(1)
+	println(s[j+1], s[j+1])
+}`,
+			"", "30 30\n",
+		},
+		{
+			"matrix multiply with computed indices",
+			`package main
+func main() {
+	a := make([]byte, 4)
+	b := make([]byte, 4)
+	a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4
+	b[0] = 5; b[1] = 6; b[2] = 7; b[3] = 8
+	for i := range byte(2) {
+		for j := range byte(2) {
+			sum := byte(0)
+			for k := range byte(2) {
+				sum += a[i*2+k] * b[k*2+j]
+			}
+			print(sum)
+			print(" ")
+		}
+	}
+}`,
+			"", "19 22 43 50 ",
+		},
+		{
+			"address of slice element",
+			`package main
+func swap(a, b *byte) { t := *a; *a = *b; *b = t }
+func main() {
+	s := make([]byte, 3)
+	s[0] = 10; s[1] = 20; s[2] = 30
+	swap(&s[0], &s[2])
+	println(s[0], s[1], s[2])
+}`,
+			"", "30 20 10\n",
+		},
+		{
+			"address of struct slice element",
+			`package main
+type P struct { x, y byte }
+func inc(p *P) { p.x++; p.y++ }
+func main() {
+	s := make([]P, 2)
+	s[0] = P{x: 10, y: 20}; s[1] = P{x: 30, y: 40}
+	inc(&s[0])
+	i := byte(1)
+	inc(&s[i])
+	println(s[0].x, s[0].y, s[1].x, s[1].y)
+}`,
+			"", "11 21 31 41\n",
+		},
+		{
+			"copy builtin dst shorter",
+			`package main
+func main() {
+	src := []byte{10, 20, 30, 40}
+	dst := make([]byte, 3)
+	copy(dst, src)
+	println(dst[0], dst[1], dst[2])
+}`,
+			"", "10 20 30\n",
+		},
+		{
+			"copy builtin dst longer",
+			`package main
+func main() {
+	src := []byte{10, 20, 30}
+	dst := make([]byte, 5)
+	copy(dst, src)
+	println(dst[0], dst[1], dst[2], dst[3], dst[4])
+}`,
+			"", "10 20 30 0 0\n",
+		},
+		{
+			"copy builtin from array slice",
+			`package main
+func main() {
+	a := [5]byte{1, 2, 3, 4, 5}
+	dst := make([]byte, 3)
+	copy(dst, a[:])
+	println(dst[0], dst[1], dst[2])
+}`,
+			"", "1 2 3\n",
+		},
+		{
+			"clear builtin",
+			`package main
+func main() {
+	s := []byte{1, 2, 3}
+	clear(s)
+	println(s[0], s[1], s[2])
+}`,
+			"", "0 0 0\n",
+		},
+		{
+			"three-index slice",
+			`package main
+func main() {
+	s := make([]byte, 5, 5)
+	for i := range byte(5) { s[i] = (i + 1) * 10 }
+	t := s[1:3:4]
+	println(t[0], t[1], len(t), cap(t))
+}`,
+			"", "20 30 2 3\n",
+		},
+		{
+			"variadic append",
+			`package main
+func main() {
+	var s []byte
+	s = append(s, 1, 2, 3, 4, 5)
+	for _, v := range s { print(v); print(" ") }
+	println()
+}`,
+			"", "1 2 3 4 5 \n",
+		},
+		{
+			"append spread",
+			`package main
+func main() {
+	a := []byte{1, 2, 3}
+	b := []byte{4, 5, 6}
+	a = append(a, b...)
+	for _, v := range a { print(v); print(" ") }
+	println(len(a))
+}`,
+			"", "1 2 3 4 5 6 6\n",
+		},
+		{
+			"append to make result",
+			`package main
+func main() {
+	s := append(make([]byte, 2), 30)
+	println(s[0], s[1], s[2], len(s))
+}`,
+			"", "0 0 30 3\n",
+		},
+		{
+			"append variadic to literal",
+			`package main
+func main() {
+	s := append([]byte{1, 2}, 3, 4, 5)
+	for _, v := range s { print(v); print(" ") }
+	println(len(s))
+}`,
+			"", "1 2 3 4 5 5\n",
+		},
+		{
+			"return slice literal from function",
+			`package main
+func f() []byte { return []byte{10, 20, 30} }
+func main() {
+	s := f()
+	println(s[0], s[1], s[2])
+}`,
+			"", "10 20 30\n",
+		},
+		{
+			"len and range of pointer array return",
+			`package main
+func f() *[3]byte {
+	a := [3]byte{10, 20, 30}
+	return &a
+}
+func main() {
+	println(len(f()))
+	for _, v := range f() { print(v); print(" ") }
+}`,
+			"", "3\n10 20 30 ",
+		},
+		{
+			"slice nil comparison",
+			`package main
+func main() {
+	var s []byte
+	if s == nil { print("Y") } else { print("N") }
+	s = make([]byte, 0)
+	if s == nil { print("Y") } else { print("N") }
+	s = append(s, 1)
+	if s != nil { print("Y") } else { print("N") }
+}`,
+			"", "YNY",
+		},
+		{
+			"return nil from slice function",
+			`package main
+func f() []byte { return nil }
+func main() {
+	s := f()
+	if s == nil { print("Y") } else { print("N") }
+}`,
+			"", "Y",
+		},
+		{
+			"nil as slice function argument",
+			`package main
+func f(s []byte) {
+	if s == nil { print("Y") } else { print("N") }
+}
+func main() { f(nil) }`,
+			"", "Y",
+		},
+		{
+			"return pointer to struct from function",
+			`package main
+type P struct { x, y byte }
+func makeP(a, b byte) *P {
+	p := &P{x: a, y: b}
+	return p
+}
+func main() {
+	pt := makeP(3, 4)
+	println(pt.x, pt.y)
+}`,
+			"", "3 4\n",
+		},
+		{
+			"return nil pointer from function",
+			`package main
+func f() *byte { return nil }
+func main() {
+	p := f()
+	if p == nil { print("Y") } else { print("N") }
+}`,
+			"", "Y",
+		},
 		// --- Structs ---
 		{
 			"struct literal return as function argument",
@@ -5582,12 +6851,12 @@ func main() {
 			"struct return from function",
 			`package main
 type Point struct { x byte; y byte }
-func make_point(x byte, y byte) Point {
+func makePoint(x byte, y byte) Point {
 	p := Point{x: x, y: y}
 	return p
 }
 func main() {
-	p := make_point(3, 7)
+	p := makePoint(3, 7)
 	println(p.x, p.y)
 }`,
 			"", "3 7\n",
@@ -5596,11 +6865,11 @@ func main() {
 			"return struct literal directly",
 			`package main
 type Point struct { x byte; y byte }
-func make_point() Point {
+func makePoint() Point {
 	return Point{x: 10, y: 20}
 }
 func main() {
-	p := make_point()
+	p := makePoint()
 	println(p.x, p.y)
 }`,
 			"", "10 20\n",
@@ -6039,7 +7308,7 @@ func main() {
 			"", "3 4",
 		},
 		{
-			"array of structs variable index field inc",
+			"array of structs variable index field inc dec",
 			`package main
 type P struct { x byte; y byte }
 func main() {
@@ -6047,9 +7316,10 @@ func main() {
 	a[0] = P{x: 10, y: 20}
 	i := byte(0)
 	a[i].x++
-	print(a[i].x)
+	a[i].y--
+	println(a[i].x, a[i].y)
 }`,
-			"", "11",
+			"", "11 19\n",
 		},
 		{
 			"method returning struct",
@@ -6104,6 +7374,18 @@ type Point struct { x byte; y byte }
 func makePoint(a, b byte) Point { return Point{x: a, y: b} }
 func main() { println(makePoint(3, 7).x + makePoint(1, 2).y) }`,
 			"", "5\n",
+		},
+		{
+			"nested struct field method call",
+			`package main
+type Inner struct { x byte }
+type Outer struct { a Inner }
+func (i Inner) val() byte { return i.x }
+func main() {
+	o := Outer{a: Inner{x: 42}}
+	print(o.a.val())
+}`,
+			"", "42",
 		},
 		// --- Pointers ---
 		{
@@ -6414,6 +7696,17 @@ func main() {
 			"", "10",
 		},
 		{
+			"deref function result",
+			`package main
+func getptr(p *byte) *byte { return p }
+func main() {
+	x := byte(42)
+	p := &x
+	print(*getptr(p))
+}`,
+			"", "42",
+		},
+		{
 			"pointer 2d array read variable inner index",
 			`package main
 func main() {
@@ -6555,6 +7848,31 @@ func main() {
 			"", "60",
 		},
 		{
+			"pointer struct field inc dec",
+			`package main
+type P struct { x, y byte }
+func main() {
+	p := P{x: 10, y: 20}
+	ptr := &p
+	ptr.x++
+	ptr.y--
+	println(ptr.x, ptr.y)
+}`,
+			"", "11 19\n",
+		},
+		{
+			"pointer of composite literal",
+			`package main
+type P struct { x, y byte }
+func main() {
+	p := &P{x: 1, y: 2}
+	println(p.x, p.y)
+	p.x = 10
+	println(p.x)
+}`,
+			"", "1 2\n10\n",
+		},
+		{
 			"pointer deref decrement",
 			`package main
 func main() {
@@ -6593,6 +7911,30 @@ func main() {
 	println()
 }`,
 			"", "1 4 9 16 25 \n",
+		},
+		{
+			"pointer comparison",
+			`package main
+func main() {
+	x, y := byte(0), byte(1)
+	p, q := &x, &y
+	if p == p { print("Y") } else { print("N") }
+	if p == q { print("Y") } else { print("N") }
+	if q == q { print("Y") } else { print("N") }
+}`,
+			"", "YNY",
+		},
+		{
+			"pointer nil comparison",
+			`package main
+func main() {
+	var p *byte
+	if p == nil { print("Y") } else { print("N") }
+	x := byte(42)
+	p = &x
+	if p != nil { print("Y") } else { print("N") }
+}`,
+			"", "YY",
 		},
 	}
 	for _, tt := range tests {
@@ -6877,10 +8219,28 @@ func main() { x := unknown() }`,
 			"unsupported function",
 		},
 		{
-			"clear wrong args",
+			"clear wrong arg count",
 			`package main
-func main() { clear(1, 2) }`,
-			"unsupported",
+func main() { clear() }`,
+			"clear expects 1 argument",
+		},
+		{
+			"clear non-slice args",
+			`package main
+func main() { x := byte(1); clear(x) }`,
+			"clear expects a slice argument",
+		},
+		{
+			"copy wrong arg count",
+			`package main
+func main() { copy() }`,
+			"copy expects 2 arguments",
+		},
+		{
+			"copy non-slice args",
+			`package main
+func main() { x := byte(1); y := byte(2); copy(x, y) }`,
+			"copy expects slice arguments",
 		},
 		{
 			"struct field assign to non-struct",
@@ -7167,6 +8527,46 @@ func main() { print(f(1)) }`,
 			"unsupported defer call in recursive function",
 		},
 		{
+			"slices in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	s := make([]byte, 1)
+	s[0] = n
+	r := f(n - 1)
+	return s[0] + r
+}
+func main() { print(f(1)) }`,
+			"slices in recursive functions are not supported",
+		},
+		{
+			"slice nesting too deep",
+			`package main
+func main() {
+	var s [][][]byte
+	_ = s
+}`,
+			"slice nesting deeper than 2 levels is not supported",
+		},
+		{
+			"slice nesting too deep make",
+			`package main
+func main() {
+	s := make([][][]byte, 1)
+	_ = s
+}`,
+			"slice nesting deeper than 2 levels is not supported",
+		},
+		{
+			"assign non-slice to slice variable",
+			`package main
+func main() {
+	var s []byte
+	s = byte(1)
+}`,
+			"unsupported slice expression",
+		},
+		{
 			"field not an array in struct array field index",
 			`package main
 type S struct { x byte }
@@ -7381,6 +8781,7 @@ func TestTestdata(t *testing.T) {
 		{"testdata/ackermann.go", "1 2 3 4\n2 3 4 5\n3 5 7 9\n5 13 29 61\n"},
 		{"testdata/bubblesort.go", "1 2 3 4 5\n"},
 		{"testdata/quicksort.go", "result: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15\n"},
+		{"testdata/sieve.go", "2 3 5 7 11 13 17 19 23 29 31 37 41 43 47\n"},
 	}
 	for _, tt := range tests {
 		t.Run(filepath.Base(tt.file), func(t *testing.T) {

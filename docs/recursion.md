@@ -310,3 +310,4 @@ recursive functions. Key differences from regular lowering:
 
 - Recursive calls inside `for` loops are not supported.
 - Pointers are not supported in recursive functions.
+- Slices are not supported in recursive functions.

@@ -47,9 +47,11 @@ Converts the AST into a structured IR (see [`ir.md`](ir.md)).
   offsets (`p.x` becomes a direct cell access)
 - Handles arrays and pointers through unified `indexInto`/`writeInto`
   functions that dispatch on `exprResult` metadata (`elemSize`,
-  `elemCount`, `isPtr`, `flatBase`)
-- Lowers composite types (arrays, structs) passed to/from functions
-  by cell-by-cell copying via composite-aware `emitCopyOrMove`
+  `elemCount`, `isPointer`, `flatBase`)
+- Lowers slices via 3-cell headers (ptr, len, cap) with a bump
+  allocator for backing arrays (see [`lowering.md`](lowering.md))
+- Lowers composite types (arrays, structs, slices) passed to/from
+  functions by cell-by-cell copying via composite-aware `emitCopyOrMove`
 - Lowers `defer` by capturing arguments into cells and emitting deferred
   blocks before each return
 - **Skip guard elimination**: the first statement in each block skips
