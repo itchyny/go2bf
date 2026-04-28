@@ -50,6 +50,12 @@ Converts the AST into a structured IR (see [`ir.md`](ir.md)).
   `elemCount`, `isPointer`, `flatBase`)
 - Lowers slices via 3-cell headers (ptr, len, cap) with a bump
   allocator for backing arrays (see [`lowering.md`](lowering.md))
+- Decomposes multi-byte integers (`uint16`/`uint32`/`uint64`)
+  into N contiguous little-endian byte cells. All N-byte
+  arithmetic, comparison, shift, multiply, and divide are
+  expanded into byte-level IR at lowering time (carry/borrow
+  chains, schoolbook byte-pair multiply, bit-by-bit schoolbook
+  long division), so the codegen needs no multi-byte awareness.
 - Lowers composite types (arrays, structs, slices) passed to/from
   functions by cell-by-cell copying via composite-aware `emitCopyOrMove`
 - Lowers `defer` by capturing arguments into cells and emitting deferred

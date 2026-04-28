@@ -31,49 +31,16 @@ produce different IR (the optimizer sees different contexts).
 
 Each Go variable maps to one or more abstract cells:
 
-- `byte` variable: 1 cell
+- `byte` (`uint8`) variable: 1 cell
 - `[N]byte` array: N contiguous cells
-- Struct: contiguous cells (one per `byte` field)
-- Slice: 3 cells (`ptr`, `len`, `cap`)
+- Struct: contiguous cells (per field size)
+- Slice: 3 cells (`ptr`, `len`, `cap`); backing array on the heap
 - Pointer: 1 cell (stack slot index)
+- `uint16`/`uint32`/`uint64` variable: 2/4/8 contiguous cells
+- `[N]uint16`/`uint32`/`uint64` array: `N * width` contiguous cells
 
 Temporaries for intermediate expression results are allocated and freed
 as needed. The allocator reuses freed cell IDs.
-
-## Expression Results
-
-`exprResult` is the return type of `lowerExpr` and related functions.
-It carries the cell, ownership, and composite/indexing metadata:
-
-| Field | Description |
-| ----- | ------- |
-| `cell` | cell ID (or pointer slot for `isPointer` results) |
-| `temp` | if true, caller must free via `freeCell` |
-| `size` | total cells; 0 means scalar (1 cell) |
-| `elemSize` | element size for indexable results; 0 = not indexable |
-| `elemCount` | number of elements for indexable results |
-| `elemType` | struct type name for composite array elements |
-| `elemSlice` | true if elements are slices (`[][]byte`) |
-| `elemPtrType` | struct type for pointer elements (`[]*Point`) |
-| `innerElemSize` | for nested arrays: cells per inner element (0 if flat) |
-| `typeName` | struct type name of this result (for field resolution) |
-| `isPointer` | cell is a pointer (stack slot index) for indirect access |
-| `flatBase` | for flat-offset results: base of the original array |
-| `lenCell` | runtime length cell for slices (0 if compile-time) |
-| `capCell` | runtime capacity cell for slices (0 if not applicable) |
-
-`lowerExpr` returns composite results for arrays (`elemSize`/`elemCount`
-set), structs (`size`/`typeName` set), pointer-to-array variables
-(`isPointer`/`elemType` set), and pointer-to-struct variables
-(`isPointer`/`typeName` set). Function calls returning arrays or structs
-also return composite results with proper metadata.
-
-`typeName` enables field resolution without re-inspecting the AST:
-`lowerSelectorExpr` and `lowerFieldAssign` use `base.typeName` to
-look up the `StructDef` directly. `elemType` propagates through
-`indexInto` so that `a[i].x` resolves the struct type from the
-indexed result. This allows chained access on any expression
-(e.g., `f().x`, `f()[i].x`, `f().data[i]`).
 
 ### Variable Initialization
 
@@ -371,69 +338,198 @@ registers in the scope's `ptrType`/`ptrArray` maps during inlining.
 the array length at compile time via the `ptrArray` map, matching Go's
 semantics where these operations work on both arrays and array pointers.
 
-## Defer
+## Multi-byte Integers
 
-`defer` captures the function call arguments at defer-time
-and executes the call at function return. Slice arguments
-are captured as a 3-cell header copy (shared backing array).
+A multi-byte integer variable occupies N contiguous cells
+in little-endian order (low byte at `cell`, high byte at
+`cell+N-1`). `uint16` uses 2 cells, `uint32` uses 4,
+and `uint64` uses 8. All operations are decomposed into
+byte-level IR at lowering time -- no codegen changes needed.
 
-### Non-recursive Functions
+`exprResult.intSize` tracks the integer width (2, 4, or 8).
+`lowerBinary` checks `intSize` and dispatches to
+`lowerBinaryInt` for all multi-byte operations. uint16,
+uint32, and uint64 share the same generalized N-byte code
+paths. Mixed types are a compile error; explicit casts
+required.
 
-Each `defer` allocates cells for the captured arguments:
+### Arithmetic
 
-```go
-func main() {
-    x := byte(1)
-    defer println(x)    // captures x=1
-    x = 2
-    defer println(x)    // captures x=2
-    // At return: prints 2, then 1 (LIFO)
-}
-```
+- **Add/Sub**: N-byte carry/borrow chain via
+  `emitAddInt`/`emitSubInt`
+- **Mul**: `emitMulInt` -- schoolbook byte-pair multiply;
+  for each `(a[i], b[j])`, adds `a[i]` to `r[i+j]`
+  exactly `b[j]` times with single-byte carry
+- **Div/Mod**: `emitDivModInt` -- bit-by-bit schoolbook
+  long division. A combined 2N-byte register starts as
+  `(R=0, Q=a)`. Each of `8*N` iterations shifts the
+  register left by one bit; if the discarded high bit
+  was set or `R >= b`, then `R -= b` and the new low bit
+  of `Q` is set. After the loop, `Q` holds the quotient
+  and `R` the remainder. Runtime is independent of input
+  values, vs. `O(quotient)` for repeated subtraction.
+- **Shift**: `emitShiftInt` (left or right via a flag) --
+  splits the count into whole-byte and sub-byte parts via
+  divmod by 8, runs the cheap whole-byte shift loop first,
+  then a bit-by-bit loop with inter-byte carry propagation
+  for the remainder. `uint64 << 56` takes 7 byte-shifts
+  instead of 56 bit-shifts.
 
-Lowered as:
+### Comparison and print
 
-```text
-x = 1
-defer_0_arg = x        // capture x=1
-x = 2
-defer_1_arg = x        // capture x=2
-// ... at return:
-println(defer_1_arg)    // LIFO: last defer first
-println(defer_0_arg)
-```
+Comparison (`emitCmpGeqInt`/`emitCmpLtInt`) walks bytes
+high-to-low, sets a runtime `done` flag on the first
+non-equal byte pair, and skips remaining iterations.
+The flat sequential structure (vs. an earlier deeply-
+nested if-else) keeps the codegen's live-cell pressure
+low at uint64 width.
 
-Conditional defers use a flag cell:
+Print uses algebraic digit decomposition
+(`emitPrintInt`) to avoid multi-byte arithmetic
+entirely. The algorithm:
 
-```go
-if cond {
-    defer f(x)          // only deferred if cond was true
-}
-```
+1. Each input byte is decomposed into 3 decimal digits
+   (hundreds, tens, ones) via two single-byte DivMod-by-10
+   operations.
+2. The contributions of each digit to the output decimal
+   positions are computed using precomputed coefficients
+   of `256^k`. Since `256 = 2*100 + 5*10 + 6`, byte k's
+   ones digit contributes `6*o` to the output ones,
+   `5*o` to the output tens, `2*o` to the output hundreds,
+   and so on for each power of 256.
+3. After processing each byte, carries are normalized
+   across accumulator digits via DivMod-by-10. Byte k=0
+   skips normalization (its contributions are o/t/h
+   directly, each already < 10). Subsequent bytes only
+   normalize through `len(decimalDigits(k))+1` -- the
+   highest digit byte k can touch -- since higher
+   accumulators are still zero. The last byte normalizes
+   the full range so the leading digit receives its carry.
+4. Leading zeros are suppressed during output.
 
-Lowered as:
+The output digit count is `numDecDigits(N)`: 5 for
+`uint16`, 10 for `uint32`, 20 for `uint64`. Coefficients
+for each `256^k` come from `decimalDigits(k)`
+(`k = 0..N-1`), computed at compile time and consumed
+when accumulating each input byte.
 
-```text
-// defer_flag is a fresh cell (0 from BF tape initialization)
-if cond {
-    defer_arg = x
-    defer_flag = 1
-}
-// ... at return:
-if defer_flag { f(defer_arg) }
-```
+This is much more efficient than repeated subtraction of
+powers of 10, which requires up to `value/power` iterations
+of multi-byte comparison and subtraction. The algebraic
+approach uses only single-byte operations with bounded
+iteration counts.
 
-The flag cell is allocated with `allocCells(1)` (a fresh cell, not
-recycled). Since non-recursive code uses a single frame pushed once
-at program start, the stack slot starts at 0 from BF tape
-initialization. Non-matching branches never write to the slot, so
-the flag stays 0.
+### Type rules
 
-### Recursive Functions
+Both operands in a binary expression must have the same
+`intSize`. Use `uint16()`, `uint32()`, `uint64()`, or
+`byte()` to convert. Shift counts are always byte.
 
-In recursive functions, deferred calls must be per-frame. Arguments are
-stored in dedicated frame slots. Before each `return` (and frame pop),
-the deferred IR blocks are emitted in LIFO order.
+Integer literals > 255 produce `uint16` results;
+literals > 65535 produce `uint32`; literals > 2^32 - 1
+produce `uint64`. The same magnitude-based promotion
+applies to untyped constants via `classifyIntConst`.
+Assigning a wider integer to a narrower variable is a
+compile error. `byte()`, `uint16()`, and `uint32()` are
+the explicit truncation paths.
+
+Truncation guards emit errors for: assigning wider
+integers to narrower variables, `putchar` with non-byte,
+`return` type mismatch, and wider integers as
+array/slice indices.
+
+### Function parameters and returns
+
+Function parameters and returns of `uint16`/`uint32`/`uint64`
+occupy N cells. `inlineCall` copies all N cells for
+multi-byte params and zero-extends smaller args.
+`info.ReturnSizes` tracks per-return-value cell counts
+for multi-return functions. `info.Returns` equals the
+total cell count across all return values.
+
+Multi-byte integers are not supported in recursive
+functions (tail-call or general recursion) -- the
+phase dispatch and frame push/pop mechanisms only
+handle byte-sized cells. Using uint16/uint32/uint64 in
+recursive functions may crash at runtime.
+
+Typed `*uint16`/`*uint32`/`*uint64` pointer parameters
+are supported. The analyzer records the pointed-to width
+in `ParamInfo.PtrIntSize`, and `inlineCall` registers it
+in the param scope's `ptrIntSize` map so deref reads
+(`*p`), writes (`*p = v`), increment/decrement (`*p++`),
+and compound assignment (`*p += v`) all use the
+multi-byte pointer paths.
+
+### Struct fields
+
+Struct fields of `uint16`/`uint32`/`uint64` occupy N cells
+at their offset within the struct. `FieldIntSizes` in
+`StructDef` tracks which fields are multi-byte.
+Field read (`p.val`), write (`p.val = x`), increment
+(`p.val++`), and compound assignment (`p.val += x`)
+all handle multi-byte fields through both direct and
+pointer-based access paths.
+
+### Arrays and slices of multi-byte integers
+
+`[N]uintN` arrays and `[]uintN` slices are supported.
+The element width is tracked via `arrayInfo.elemIntSize`
+and `sliceInfo.elemIntSize` (set by `arrayElementInfo`
+and `sliceElemInfo`), and propagated into `exprResult`
+when the array/slice is read.
+
+For arrays, indexing reads (`a[i]`) materialize an
+N-byte temp by emitting `IRDynLoad` at sequential
+offsets, and writes (`a[i] = v`) emit `IRDynStore` at
+those same offsets. Constant-index reads are direct
+N-cell views into the underlying flat array.
+Composite literals (`[N]uint16{100, 200, 300}`)
+zero-extend smaller-typed elements as needed.
+
+For slices, the same pattern applies but uses
+`ptrLoad`/`ptrStore` over the slice's backing pointer.
+`append`, `make`, range, and slice-literal init all use
+the `elemSize`-stride that was already in place for
+struct slices; multi-byte int slices are just the
+struct-slice path with `elemIntSize > 0` triggering a
+materialization step at the read boundary so the result
+is typed as a `uintN` rather than a 2/4/8-byte sub-array.
+
+### Nested composites
+
+Three forms of nested multi-byte composites are supported:
+
+- **Nested arrays** `[N][M]uintN`: `arrayInfo` and
+  `exprResult` carry an extra `innerElemIntSize` field
+  populated by `arrayElementInfo`'s recursive case. When
+  `indexInto` resolves the outer index it propagates this
+  as the sub-array's `elemIntSize`, so chained `a[i][j]`
+  reads/writes hit the multi-byte path at the inner level.
+- **Struct fields of multi-byte int arrays**
+  (`type S struct { vals [N]uintN }`): tracked via
+  `StructDef.FieldArrayElemIntSize`. `arrayFieldInfo`
+  computes total cells as `N*elemBytes` so the struct
+  allocates the full size; `lowerSelectorExpr` propagates
+  the element width onto the field-access result.
+- **Range over `[N]Struct{multi-byte fields}`**: the
+  array fallback in `lowerRange` uses `rangeBase.elemSize`
+  (rather than a hardcoded 1) and reads `elemSize` cells
+  per iteration via dynamic loads at sequential offsets.
+  The struct value lives in `valCell..valCell+elemSize-1`,
+  and field access on it goes through the regular struct-
+  field path (which already handles multi-byte fields).
+
+`[][]uintN` (slice-of-slice of multi-byte) and
+`[][N]uintN` (slice of multi-byte array) are **not**
+supported. The outer's `s[i]` returns a sub-slice or
+sub-array view through `indexInto`'s pointer paths,
+which hardcode `elemSize=1` on the materialized result.
+Tracking the element-of-element width through these
+runtime-materialized views would need additional fields
+and is deferred until needed. Workaround: use a 2D fixed
+array `[N][M]uintN` or build the outer slice via `make`
++ per-index assignment instead of literal init.
 
 ## Control Flow
 
@@ -453,6 +549,9 @@ IRLoop{cond, [body; post]}
 ```
 
 `for range n` desugars to `for i := 0; i < n; i++`.
+When `n` is `uint16`/`uint32`/`uint64`, the loop counter
+and limit use multi-byte comparison (`emitCmpLtInt`) and
+increment (`emitIncInt`).
 
 `for i, v := range a` over arrays uses `len(a)` as the
 limit and loads `v = a[i]` at each iteration via
@@ -524,19 +623,69 @@ Implemented via flag cells. `break` sets a break flag that guards each
 subsequent iteration. `continue` sets a continue flag that skips the
 rest of the loop body.
 
-## Move Semantics
+## Defer
 
-`IRCopy` (non-destructive) generates two BF loops: move to `dst+temp`,
-then restore `src` from `temp`. `IRMove` (destructive) generates one
-loop. The lowerer uses `IRMove` instead of `IRCopy` when the source
-value is no longer needed:
+`defer` captures the function call arguments at defer-time
+and executes the call at function return. Slice arguments
+are captured as a 3-cell header copy (shared backing array).
 
-- **Temporary expression results**: `emitCopyOrMove` checks if the
-  source is a temp cell and emits `IRMove` when safe.
-- **Return value cells**: after copying function return values to
-  their destination, the return cells are never reused.
-- **Composite returns**: struct/array locals going out of scope at
-  function return use `IRMove` to transfer to `returnDst`.
+### Non-recursive Functions
+
+Each `defer` allocates cells for the captured arguments:
+
+```go
+func main() {
+    x := byte(1)
+    defer println(x)    // captures x=1
+    x = 2
+    defer println(x)    // captures x=2
+    // At return: prints 2, then 1 (LIFO)
+}
+```
+
+Lowered as:
+
+```text
+x = 1
+defer_0_arg = x        // capture x=1
+x = 2
+defer_1_arg = x        // capture x=2
+// ... at return:
+println(defer_1_arg)    // LIFO: last defer first
+println(defer_0_arg)
+```
+
+Conditional defers use a flag cell:
+
+```go
+if cond {
+    defer f(x)          // only deferred if cond was true
+}
+```
+
+Lowered as:
+
+```text
+// defer_flag is a fresh cell (0 from BF tape initialization)
+if cond {
+    defer_arg = x
+    defer_flag = 1
+}
+// ... at return:
+if defer_flag { f(defer_arg) }
+```
+
+The flag cell is allocated with `allocCells(1)` (a fresh cell, not
+recycled). Since non-recursive code uses a single frame pushed once
+at program start, the stack slot starts at 0 from BF tape
+initialization. Non-matching branches never write to the slot, so
+the flag stays 0.
+
+### Recursive Functions
+
+In recursive functions, deferred calls must be per-frame. Arguments are
+stored in dedicated frame slots. Before each `return` (and frame pop),
+the deferred IR blocks are emitted in LIFO order.
 
 ## Composite Comparisons
 

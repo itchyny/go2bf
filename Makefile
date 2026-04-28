@@ -39,7 +39,7 @@ $(GOBIN)/gocredits:
 
 .PHONY: test
 test: build
-	go test -v -race -timeout 10s ./...
+	go test -v -race -timeout 60s ./...
 
 .PHONY: lint
 lint: $(GOBIN)/staticcheck

@@ -43,9 +43,10 @@ temp[src+ temp-]        restore src from temp
 Copy requires a temp cell and two loops (move + restore), making it
 roughly twice as expensive as a destructive move. The lowerer uses
 `IRMove` instead of `IRCopy` when the source is a temporary that
-will be freed immediately after (see "Move Semantics" in
-[lowering.md](lowering.md)). The register cache minimizes how often
-copies are needed (see [`cache.md`](cache.md)).
+will be freed immediately after (e.g., expression results, return
+value cells, composite returns going out of scope). The register
+cache minimizes how often copies are needed (see
+[`cache.md`](cache.md)).
 
 ## Arithmetic
 

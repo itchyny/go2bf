@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 )
@@ -45,13 +46,16 @@ type Lowerer struct {
 
 // scope holds variable bindings for the current lexical scope.
 type scope struct {
-	vars     map[string]Cell
-	consts   map[string]byte       // compile-time constants
-	arrays   map[string]arrayInfo  // base cell and size
-	structs  map[string]structInfo // base cell and field layout
-	slices   map[string]sliceInfo  // slice header (ptr, len, cap)
-	ptrType  map[string]string     // variable name -> pointed-to struct type name
-	ptrArray map[string]arrayInfo  // variable name -> pointed-to array info
+	vars       map[string]Cell
+	consts     map[string]byte       // compile-time constants
+	intCells   map[string]Cell       // multi-byte int variable name -> base cell
+	intSizes   map[string]int        // multi-byte int variable name -> size (2, 4, or 8)
+	arrays     map[string]arrayInfo  // base cell and size
+	structs    map[string]structInfo // base cell and field layout
+	slices     map[string]sliceInfo  // slice header (ptr, len, cap)
+	ptrType    map[string]string     // variable name -> pointed-to struct type name
+	ptrArray   map[string]arrayInfo  // variable name -> pointed-to array info
+	ptrIntSize map[string]int        // variable name -> pointed-to integer size
 }
 
 // sliceInfo holds the 3-cell header for a slice variable.
@@ -63,15 +67,18 @@ type sliceInfo struct {
 	elemType    string // struct type name (empty for byte)
 	elemSlice   bool   // true if element is a slice ([][]byte)
 	elemPtrType string // struct type for pointer elements ([]*Point)
+	elemIntSize int    // >1 for slices of multi-byte integers (uint16/uint32/uint64)
 }
 
 type arrayInfo struct {
-	base          Cell
-	size          int    // total cells (count * elemSize)
-	count         int    // number of elements
-	elemSize      int    // cells per element (1 for byte, >1 for struct)
-	elemType      string // struct type name (empty for byte)
-	innerElemSize int    // for nested arrays: cells per inner element (0 if flat)
+	base             Cell
+	size             int    // total cells (count * elemSize)
+	count            int    // number of elements
+	elemSize         int    // cells per element (1 for byte, >1 for struct)
+	elemType         string // struct type name (empty for byte)
+	elemIntSize      int    // >1 if elements are multi-byte integers (uint16/uint32/uint64)
+	innerElemSize    int    // for nested arrays: cells per inner element (0 if flat)
+	innerElemIntSize int    // for nested arrays: >1 if inner elements are multi-byte ints
 }
 
 type structInfo struct {
@@ -80,20 +87,24 @@ type structInfo struct {
 }
 
 type exprResult struct {
-	cell          Cell
-	temp          bool   // if true, the caller should free this cell via freeCell
-	size          int    // total number of cells; 0 means 1 (scalar)
-	elemSize      int    // element size for indexable results; 0 means not indexable
-	elemCount     int    // number of elements for indexable results
-	elemType      string // struct type name for composite elements (empty for byte)
-	elemSlice     bool   // true if elements are slices ([][]byte)
-	elemPtrType   string // struct type for pointer elements ([]*Point)
-	innerElemSize int    // for nested arrays: cells per inner element (0 if flat)
-	typeName      string // struct type name of this result (empty for non-struct)
-	isPointer     bool   // if true, cell is a pointer (slot index) for indirect access
-	flatBase      Cell   // for flat-offset results: base of the original array
-	lenCell       Cell   // runtime length cell (0 if compile-time elemCount)
-	capCell       Cell   // runtime capacity cell (0 if not applicable)
+	cell             Cell
+	temp             bool   // if true, the caller should free this cell via freeCell
+	size             int    // total number of cells; 0 means 1 (scalar)
+	intSize          int    // >1 for multi-byte integers (2, 4, or 8)
+	typeName         string // struct type name of this result (empty for non-struct)
+	elemSize         int    // element size for indexable results; 0 means not indexable
+	elemCount        int    // number of elements for indexable results
+	elemType         string // struct type name for composite elements (empty for byte)
+	elemIntSize      int    // >1 if this is an indexable array/slice of multi-byte ints
+	elemSlice        bool   // true if elements are slices ([][]byte)
+	elemPtrType      string // struct type for pointer elements ([]*Point)
+	innerElemSize    int    // for nested arrays: cells per inner element (0 if flat)
+	innerElemIntSize int    // for nested arrays: >1 if inner elements are multi-byte ints
+	isPointer        bool   // if true, cell is a pointer (slot index) for indirect access
+	ptrIntSize       int    // >1 if this pointer targets a multi-byte integer
+	flatBase         Cell   // for flat-offset results: base of the original array
+	lenCell          Cell   // runtime length cell (0 if compile-time elemCount)
+	capCell          Cell   // runtime capacity cell (0 if not applicable)
 }
 
 // cellCount returns the number of cells in this result (1 for scalars).
@@ -201,21 +212,6 @@ func (l *Lowerer) emit(node IRNode) {
 // For composite results (size > 1), copies/moves all cells.
 func (l *Lowerer) emitCopyOrMove(dst Cell, r exprResult) {
 	n := r.cellCount()
-	if n == 1 {
-		if r.cell == dst {
-			if r.temp {
-				l.freeCell(r.cell)
-			}
-			return
-		}
-		if r.temp {
-			l.emit(&IRMove{Dst: dst, Src: r.cell})
-			l.freeCell(r.cell)
-		} else {
-			l.emit(&IRCopy{Dst: dst, Src: r.cell})
-		}
-		return
-	}
 	if r.cell == dst {
 		if r.temp {
 			l.freeCellRange(r.cell, n)
@@ -259,13 +255,16 @@ func (l *Lowerer) ensureTemp(r exprResult) exprResult {
 
 func (l *Lowerer) pushScope() {
 	l.scopes = append(l.scopes, &scope{
-		vars:     make(map[string]Cell),
-		consts:   make(map[string]byte),
-		arrays:   make(map[string]arrayInfo),
-		structs:  make(map[string]structInfo),
-		slices:   make(map[string]sliceInfo),
-		ptrType:  make(map[string]string),
-		ptrArray: make(map[string]arrayInfo),
+		vars:       make(map[string]Cell),
+		consts:     make(map[string]byte),
+		intCells:   make(map[string]Cell),
+		intSizes:   make(map[string]int),
+		arrays:     make(map[string]arrayInfo),
+		structs:    make(map[string]structInfo),
+		slices:     make(map[string]sliceInfo),
+		ptrType:    make(map[string]string),
+		ptrArray:   make(map[string]arrayInfo),
+		ptrIntSize: make(map[string]int),
 	})
 }
 
@@ -353,7 +352,6 @@ func (l *Lowerer) lookupPtrType(name string) (*StructDef, bool) {
 	}
 	return nil, false
 }
-
 func (l *Lowerer) lookupPtrArray(name string) (arrayInfo, bool) {
 	for i := len(l.scopes) - 1; i >= 0; i-- {
 		if ai, ok := l.scopes[i].ptrArray[name]; ok {
@@ -371,17 +369,168 @@ func (l *Lowerer) lookupSlice(name string) (sliceInfo, bool) {
 	}
 	return sliceInfo{}, false
 }
-
-func (l *Lowerer) defineSlice(sc *scope, name string, elemSize int, elemType string, elemSlice bool, elemPtrType ...string) sliceInfo {
+func (l *Lowerer) defineSlice(sc *scope, name string, elemSize int,
+	elemType string, elemSlice bool, elemPtrType string, elemIntSize int) sliceInfo {
 	si := sliceInfo{
 		ptr: l.allocCell(), len: l.allocCell(), cap: l.allocCell(),
 		elemSize: elemSize, elemType: elemType, elemSlice: elemSlice,
-	}
-	if len(elemPtrType) > 0 {
-		si.elemPtrType = elemPtrType[0]
+		elemPtrType: elemPtrType, elemIntSize: elemIntSize,
 	}
 	sc.slices[name] = si
 	return si
+}
+func (l *Lowerer) lookupIntConst(name string) (uint64, int, bool) {
+	v, ok := l.result.IntConsts[name]
+	if !ok {
+		return 0, 0, false
+	}
+	return v, l.result.IntConstSize[name], true
+}
+
+func (l *Lowerer) lookupPtrIntSize(name string) int {
+	for i := len(l.scopes) - 1; i >= 0; i-- {
+		if n, ok := l.scopes[i].ptrIntSize[name]; ok {
+			return n
+		}
+	}
+	return 0
+}
+
+func (l *Lowerer) lookupIntCell(name string) (Cell, bool) {
+	for i := len(l.scopes) - 1; i >= 0; i-- {
+		if cell, ok := l.scopes[i].intCells[name]; ok {
+			return cell, true
+		}
+	}
+	return 0, false
+}
+
+func (l *Lowerer) lookupIntVarSize(name string) int {
+	for i := len(l.scopes) - 1; i >= 0; i-- {
+		if n, ok := l.scopes[i].intSizes[name]; ok {
+			return n
+		}
+	}
+	return 2 // default for intCells without intSizes entry
+}
+
+func (l *Lowerer) defineIntVar(sc *scope, name string, size int) Cell {
+	base := l.allocCells(size)
+	sc.intCells[name] = base
+	sc.intSizes[name] = size
+	return base
+}
+
+// exprInvolvesInt checks if an expression produces a multi-byte integer result.
+func (l *Lowerer) exprInvolvesInt(expr ast.Expr, sc *scope) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if _, ok := l.lookupIntCell(e.Name); ok {
+			return true
+		}
+		if _, ok := l.result.IntConsts[e.Name]; ok {
+			return true
+		}
+	case *ast.CallExpr:
+		if fn, ok := e.Fun.(*ast.Ident); ok {
+			switch fn.Name {
+			case "uint16", "uint32", "uint64":
+				return true
+			}
+			if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IntSize >= 2 {
+				return true
+			}
+		}
+	case *ast.BinaryExpr:
+		return l.exprInvolvesInt(e.X, sc) || l.exprInvolvesInt(e.Y, sc)
+	case *ast.ParenExpr:
+		return l.exprInvolvesInt(e.X, sc)
+	case *ast.UnaryExpr:
+		if e.Op == token.AND {
+			return false // &x produces a pointer, not a multi-byte integer
+		}
+		return l.exprInvolvesInt(e.X, sc)
+	case *ast.SelectorExpr:
+		typeName := l.resolveExprTypeName(e.X)
+		if def, ok := l.result.Structs[typeName]; ok {
+			return def.FieldIntSizes[e.Sel.Name] >= 2
+		}
+	case *ast.StarExpr:
+		// *p where p is a pointer to a multi-byte integer
+		if id, ok := e.X.(*ast.Ident); ok {
+			if _, ok := l.lookupIntCell(id.Name); ok {
+				return true
+			}
+			return l.lookupPtrIntSize(id.Name) >= 2
+		}
+	case *ast.IndexExpr:
+		// a[i] or s[i] where a/s holds multi-byte integer elements.
+		if id, ok := e.X.(*ast.Ident); ok {
+			if ai, ok := l.lookupArray(id.Name); ok && ai.elemIntSize >= 2 {
+				return true
+			}
+			if si, ok := l.lookupSlice(id.Name); ok && si.elemIntSize >= 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// exprIntSize returns the multi-byte integer size of an expression (2, 4, or 8),
+// or 2 as a default for callers that have already confirmed the result is multi-byte.
+func (l *Lowerer) exprIntSize(expr ast.Expr, sc *scope) int {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		if _, ok := l.lookupIntCell(e.Name); ok {
+			return l.lookupIntVarSize(e.Name)
+		}
+		if n, ok := l.result.IntConstSize[e.Name]; ok {
+			return n
+		}
+	case *ast.CallExpr:
+		if fn, ok := e.Fun.(*ast.Ident); ok {
+			if n := intIdentSize(fn.Name); n > 0 {
+				return n
+			}
+			if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IntSize >= 2 {
+				return info.ReturnType.IntSize
+			}
+		}
+	case *ast.BinaryExpr:
+		ls := l.exprIntSize(e.X, sc)
+		rs := l.exprIntSize(e.Y, sc)
+		return max(ls, rs)
+	case *ast.ParenExpr:
+		return l.exprIntSize(e.X, sc)
+	case *ast.UnaryExpr:
+		if e.Op != token.AND {
+			return l.exprIntSize(e.X, sc)
+		}
+	case *ast.SelectorExpr:
+		typeName := l.resolveExprTypeName(e.X)
+		if def, ok := l.result.Structs[typeName]; ok {
+			if n := def.FieldIntSizes[e.Sel.Name]; n >= 2 {
+				return n
+			}
+		}
+	case *ast.StarExpr:
+		if id, ok := e.X.(*ast.Ident); ok {
+			if n := l.lookupPtrIntSize(id.Name); n >= 2 {
+				return n
+			}
+		}
+	case *ast.IndexExpr:
+		if id, ok := e.X.(*ast.Ident); ok {
+			if ai, ok := sc.arrays[id.Name]; ok && ai.elemIntSize >= 2 {
+				return ai.elemIntSize
+			}
+			if si, ok := sc.slices[id.Name]; ok && si.elemIntSize >= 2 {
+				return si.elemIntSize
+			}
+		}
+	}
+	return 2
 }
 
 // isSliceType returns true if the type expression is a slice ([]T).
@@ -390,33 +539,38 @@ func isSliceType(expr ast.Expr) bool {
 	return ok && at.Len == nil
 }
 
-// sliceElemInfo returns (elemSize, elemType, isSliceOfSlice, ptrType) for a slice type.
+// sliceElemInfo returns layout info for a slice type:
+// elemSize, elemType, isSliceOfSlice, ptrType, elemIntSize.
 // ptrType is non-empty for pointer-to-struct elements ([]*Point).
-func (l *Lowerer) sliceElemInfo(expr ast.Expr) (int, string, bool, string) {
+// elemIntSize is set (2/4/8) for slices of multi-byte integers.
+func (l *Lowerer) sliceElemInfo(expr ast.Expr) (int, string, bool, string, int) {
 	at, ok := expr.(*ast.ArrayType)
 	if !ok || at.Len != nil {
-		return 1, "", false, ""
+		return 1, "", false, "", 0
 	}
 	if id, ok := at.Elt.(*ast.Ident); ok {
 		if def, ok := l.result.Structs[id.Name]; ok {
-			return def.Size, id.Name, false, ""
+			return def.Size, id.Name, false, "", 0
+		}
+		if n := intIdentSize(id.Name); n > 0 {
+			return n, "", false, "", n
 		}
 	}
 	if size := arrayTypeSize(at.Elt); size > 0 {
-		return size, "", false, ""
+		return size, "", false, "", 0
 	}
 	if isSliceType(at.Elt) {
-		return 3, "", true, ""
+		return 3, "", true, "", 0
 	}
 	// Pointer-to-struct: []*Point
 	if star, ok := at.Elt.(*ast.StarExpr); ok {
 		if id, ok := star.X.(*ast.Ident); ok {
 			if _, ok := l.result.Structs[id.Name]; ok {
-				return 1, "", false, id.Name
+				return 1, "", false, id.Name, 0
 			}
 		}
 	}
-	return 1, "", false, ""
+	return 1, "", false, "", 0
 }
 
 func (l *Lowerer) allocSliceInfo() sliceInfo {
@@ -486,6 +640,7 @@ func (l *Lowerer) lowerSliceExpr(expr ast.Expr) (sliceInfo, error) {
 	tmp.elemType = r.elemType
 	tmp.elemSlice = r.elemSlice
 	tmp.elemPtrType = r.elemPtrType
+	tmp.elemIntSize = r.elemIntSize
 	l.emit(&IRCopy{Dst: tmp.ptr, Src: r.cell})
 	l.emit(&IRCopy{Dst: tmp.len, Src: r.lenCell})
 	l.emit(&IRCopy{Dst: tmp.cap, Src: r.capCell})
@@ -528,11 +683,12 @@ func (l *Lowerer) evalSliceMake(typeExpr ast.Expr, args []ast.Expr) (sliceInfo, 
 		return sliceInfo{}, fmt.Errorf("slice nesting deeper than 2 levels is not supported")
 	}
 	si := l.allocSliceInfo()
-	es, et, esl, ept := l.sliceElemInfo(typeExpr)
+	es, et, esl, ept, eis := l.sliceElemInfo(typeExpr)
 	si.elemSize = es
 	si.elemType = et
 	si.elemSlice = esl
 	si.elemPtrType = ept
+	si.elemIntSize = eis
 	if err := l.lowerSliceMake(si, args); err != nil {
 		return sliceInfo{}, err
 	}
@@ -597,11 +753,12 @@ func (l *Lowerer) lowerSliceMake(si sliceInfo, args []ast.Expr) error {
 
 func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 	si := l.allocSliceInfo()
-	es, et, esl, ept := l.sliceElemInfo(comp.Type)
+	es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
 	si.elemSize = es
 	si.elemType = et
 	si.elemSlice = esl
 	si.elemPtrType = ept
+	si.elemIntSize = eis
 	n := len(comp.Elts)
 	l.emit(&IRConst{Dst: si.len, Value: byte(n)}) // #nosec G115
 	l.emit(&IRConst{Dst: si.cap, Value: byte(n)}) // #nosec G115
@@ -617,7 +774,58 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 		idx := l.allocCell()
 		l.emit(&IRCopy{Dst: idx, Src: si.ptr})
 		l.emit(&IRAddI{Dst: idx, Value: byte(i * max(es, 1))}) // #nosec G115
-		if es > 1 {
+		if si.elemIntSize >= 2 {
+			r, err := l.lowerExpr(elt)
+			if err != nil {
+				return sliceInfo{}, err
+			}
+			if r.intSize > si.elemIntSize {
+				if r.temp {
+					l.freeCellRange(r.cell, r.cellCount())
+				}
+				return sliceInfo{}, fmt.Errorf(
+					"cannot use uint%d value in []uint%d literal, use explicit conversion",
+					r.intSize*8, si.elemIntSize*8)
+			}
+			srcN := max(r.intSize, 1)
+			for j := range si.elemIntSize {
+				if j < srcN {
+					t := l.allocCell()
+					l.emit(&IRCopy{Dst: t, Src: r.cell + j})
+					l.ptrStore(idx, t)
+					l.freeCell(t)
+				} else {
+					t := l.allocCell()
+					l.emit(&IRZero{Dst: t})
+					l.ptrStore(idx, t)
+					l.freeCell(t)
+				}
+				if j < si.elemIntSize-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			if r.temp {
+				l.freeCellRange(r.cell, r.cellCount())
+			}
+		} else if si.elemSlice {
+			// Slice-of-slice: each element is itself a slice. Evaluate the inner
+			// slice and store its 3-cell header.
+			inner, err := l.lowerSliceExpr(elt)
+			if err != nil {
+				return sliceInfo{}, err
+			}
+			t := l.allocCell()
+			l.emit(&IRCopy{Dst: t, Src: inner.ptr})
+			l.ptrStore(idx, t)
+			l.emit(&IRAddI{Dst: idx, Value: 1})
+			l.emit(&IRCopy{Dst: t, Src: inner.len})
+			l.ptrStore(idx, t)
+			l.emit(&IRAddI{Dst: idx, Value: 1})
+			l.emit(&IRCopy{Dst: t, Src: inner.cap})
+			l.ptrStore(idx, t)
+			l.freeCell(t)
+			l.freeSliceInfo(inner)
+		} else if es > 1 {
 			// Multi-cell element: resolve struct/array literal.
 			base, size, err := l.resolveStructArg(elt)
 			if err != nil {
@@ -658,9 +866,11 @@ func (l *Lowerer) evalSliceExpr(se *ast.SliceExpr) (sliceInfo, error) {
 		si.elemType = src.elemType
 		si.elemSlice = src.elemSlice
 		si.elemPtrType = src.elemPtrType
+		si.elemIntSize = src.elemIntSize
 	} else if ai, ok := l.lookupArray(id.Name); ok {
-		si.elemSize = 1
-		_ = ai
+		si.elemSize = max(ai.elemSize, 1)
+		si.elemType = ai.elemType
+		si.elemIntSize = ai.elemIntSize
 	}
 	if err := l.lowerSliceFromSliceExpr(si, se); err != nil {
 		l.freeSliceInfo(si)
@@ -702,9 +912,10 @@ func (l *Lowerer) lowerSliceFromSliceExpr(si sliceInfo, se *ast.SliceExpr) error
 			}
 			capVal = v - low
 		}
-		l.emit(&IRConst{Dst: si.ptr, Value: byte(baseSlot + low)}) // #nosec G115
-		l.emit(&IRConst{Dst: si.len, Value: byte(high - low)})     // #nosec G115
-		l.emit(&IRConst{Dst: si.cap, Value: byte(capVal)})         // #nosec G115
+		es := max(ai.elemSize, 1)
+		l.emit(&IRConst{Dst: si.ptr, Value: byte(baseSlot + low*es)}) // #nosec G115
+		l.emit(&IRConst{Dst: si.len, Value: byte(high - low)})        // #nosec G115
+		l.emit(&IRConst{Dst: si.cap, Value: byte(capVal)})            // #nosec G115
 		return nil
 	}
 	// Reslice: s = t[low:high]
@@ -1123,10 +1334,52 @@ func (l *Lowerer) structDef(expr ast.Expr) *StructDef {
 // allocating cells for all local variables.
 func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 	sc := l.currentScope()
+	// Identify standalone block statements (direct children of another
+	// BlockStmt's list). These have their own lexical scope and are
+	// pre-scanned when lowered, so we don't descend into them here.
+	// For/range/if/switch bodies are children of the *ast.ForStmt etc.,
+	// not of a BlockStmt list, so they remain part of this scan.
+	standalone := map[*ast.BlockStmt]bool{}
 	ast.Inspect(block, func(n ast.Node) bool {
+		if b, ok := n.(*ast.BlockStmt); ok {
+			for _, stmt := range b.List {
+				if inner, ok := stmt.(*ast.BlockStmt); ok {
+					standalone[inner] = true
+				}
+			}
+		}
+		return true
+	})
+	ast.Inspect(block, func(n ast.Node) bool {
+		if b, ok := n.(*ast.BlockStmt); ok && standalone[b] {
+			return false
+		}
 		switch s := n.(type) {
 		case *ast.AssignStmt:
 			if s.Tok == token.DEFINE {
+				// Multi-return: x, y := f() where f returns multiple values.
+				if len(s.Rhs) == 1 && len(s.Lhs) > 1 {
+					if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
+						if fn, ok := call.Fun.(*ast.Ident); ok {
+							if info, ok := l.result.Funcs[fn.Name]; ok && len(info.ReturnSizes) == len(s.Lhs) {
+								for i, lhs := range s.Lhs {
+									lid, ok := lhs.(*ast.Ident)
+									if !ok || lid.Name == "_" {
+										continue
+									}
+									if i < len(info.ReturnSizes) && info.ReturnSizes[i] >= 2 {
+										if _, exists := sc.intCells[lid.Name]; !exists {
+											l.defineIntVar(sc, lid.Name, info.ReturnSizes[i])
+										}
+									} else if _, exists := sc.vars[lid.Name]; !exists {
+										sc.vars[lid.Name] = l.allocCell()
+									}
+								}
+								return true
+							}
+						}
+					}
+				}
 				for i, lhs := range s.Lhs {
 					id, ok := lhs.(*ast.Ident)
 					if !ok || id.Name == "_" {
@@ -1135,10 +1388,10 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 					// Check for composite literal: a := [N]byte{...} or p := Point{...}
 					if i < len(s.Rhs) {
 						if comp, ok := s.Rhs[i].(*ast.CompositeLit); ok {
-							if count, elemSize, elemType, ies := l.arrayElementInfo(comp.Type); count > 0 {
+							if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(comp.Type); count > 0 {
 								if _, exists := sc.arrays[id.Name]; !exists {
 									if elemSize > 1 {
-										l.defineStructArray(sc, id.Name, count, elemType, elemSize, ies)
+										l.defineStructArray(sc, id.Name, count, elemSize, elemType, eis, ies, ieis)
 									} else {
 										l.defineArray(sc, id.Name, count)
 									}
@@ -1147,8 +1400,8 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 							}
 							if isSliceType(comp.Type) {
 								if _, exists := sc.slices[id.Name]; !exists {
-									es, et, esl, ept := l.sliceElemInfo(comp.Type)
-									l.defineSlice(sc, id.Name, es, et, esl, ept)
+									es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
+									l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
 								}
 								continue
 							}
@@ -1164,10 +1417,16 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 					if i < len(s.Rhs) {
 						if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
 							if fn, ok := call.Fun.(*ast.Ident); ok {
+								if (fn.Name == "uint16" || fn.Name == "uint32" || fn.Name == "uint64") && len(call.Args) == 1 {
+									if _, exists := sc.intCells[id.Name]; !exists {
+										l.defineIntVar(sc, id.Name, intIdentSize(fn.Name))
+									}
+									continue
+								}
 								if fn.Name == "make" && len(call.Args) >= 2 && isSliceType(call.Args[0]) {
 									if _, exists := sc.slices[id.Name]; !exists {
-										es, et, esl, ept := l.sliceElemInfo(call.Args[0])
-										l.defineSlice(sc, id.Name, es, et, esl, ept)
+										es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
+										l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
 									}
 									continue
 								}
@@ -1176,22 +1435,22 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 										// append(s, ...) where s is a known slice.
 										if srcID, ok := call.Args[0].(*ast.Ident); ok {
 											if _, exists := sc.slices[srcID.Name]; exists {
-												es, et, esl, ept := l.sliceElemInfo(call.Args[0])
-												l.defineSlice(sc, id.Name, es, et, esl, ept)
+												es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
+												l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
 												continue
 											}
 										}
 										// append(make(...), ...) or append([]byte{...}, ...).
 										if innerCall, ok := call.Args[0].(*ast.CallExpr); ok {
 											if innerFn, ok := innerCall.Fun.(*ast.Ident); ok && innerFn.Name == "make" && len(innerCall.Args) >= 2 && isSliceType(innerCall.Args[0]) {
-												es, et, esl, ept := l.sliceElemInfo(innerCall.Args[0])
-												l.defineSlice(sc, id.Name, es, et, esl, ept)
+												es, et, esl, ept, eis := l.sliceElemInfo(innerCall.Args[0])
+												l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
 												continue
 											}
 										}
 										if comp, ok := call.Args[0].(*ast.CompositeLit); ok && isSliceType(comp.Type) {
-											es, et, esl, ept := l.sliceElemInfo(comp.Type)
-											l.defineSlice(sc, id.Name, es, et, esl, ept)
+											es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
+											l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
 											continue
 										}
 									}
@@ -1203,25 +1462,33 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 					if i < len(s.Rhs) {
 						if se, ok := s.Rhs[i].(*ast.SliceExpr); ok {
 							if _, exists := sc.slices[id.Name]; !exists {
-								es, et, esl, ept := 1, "", false, ""
+								es, et, esl, ept, eis := 1, "", false, "", 0
 								if srcID, ok := se.X.(*ast.Ident); ok {
 									if src, ok := sc.slices[srcID.Name]; ok {
-										es, et, esl, ept = src.elemSize, src.elemType, src.elemSlice, src.elemPtrType
+										es, et, esl, ept, eis = src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize
+									} else if ai, ok := sc.arrays[srcID.Name]; ok {
+										es, et, eis = max(ai.elemSize, 1), ai.elemType, ai.elemIntSize
 									}
 								}
-								l.defineSlice(sc, id.Name, es, et, esl, ept)
+								l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
 							}
 							continue
 						}
 					}
-					// inner := s[i] where s is [][]byte, []P, [N][M]byte, or [N]P
+					// inner := s[i] where s is [][]byte, []P, [N][M]byte, [N]P, or [N]uintN
 					if i < len(s.Rhs) {
 						if idxExpr, ok := s.Rhs[i].(*ast.IndexExpr); ok {
 							if arrID, ok := idxExpr.X.(*ast.Ident); ok {
 								if si, ok := sc.slices[arrID.Name]; ok {
 									if si.elemSlice {
 										if _, exists := sc.slices[id.Name]; !exists {
-											l.defineSlice(sc, id.Name, 1, "", false)
+											l.defineSlice(sc, id.Name, 1, "", false, "", 0)
+										}
+										continue
+									}
+									if si.elemIntSize >= 2 {
+										if _, exists := sc.intCells[id.Name]; !exists {
+											l.defineIntVar(sc, id.Name, si.elemIntSize)
 										}
 										continue
 									}
@@ -1234,7 +1501,12 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 									}
 								}
 								if ai, ok := sc.arrays[arrID.Name]; ok && ai.elemSize > 1 {
-									if ai.elemType != "" {
+									if ai.elemIntSize >= 2 {
+										// [N]uintN -> uintN
+										if _, exists := sc.intCells[id.Name]; !exists {
+											l.defineIntVar(sc, id.Name, ai.elemIntSize)
+										}
+									} else if ai.elemType != "" {
 										// [N]Point -> Point
 										if _, exists := sc.structs[id.Name]; !exists {
 											def := l.result.Structs[ai.elemType]
@@ -1256,7 +1528,7 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 						if rhsID, ok := s.Rhs[i].(*ast.Ident); ok {
 							if src, ok := sc.slices[rhsID.Name]; ok {
 								if _, exists := sc.slices[id.Name]; !exists {
-									l.defineSlice(sc, id.Name, src.elemSize, src.elemType, src.elemSlice, src.elemPtrType)
+									l.defineSlice(sc, id.Name, src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize)
 								}
 								continue
 							}
@@ -1269,7 +1541,7 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 								if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
 									if _, exists := sc.slices[id.Name]; !exists {
 										es := max(info.ReturnType.SliceElemSize, 1)
-										l.defineSlice(sc, id.Name, es, info.ReturnType.SliceElemType, false)
+										l.defineSlice(sc, id.Name, es, info.ReturnType.SliceElemType, false, "", info.ReturnType.SliceElemIntSize)
 									}
 									continue
 								}
@@ -1291,8 +1563,36 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 							}
 						}
 					}
+					// Track &var for pointer type info.
+					if i < len(s.Rhs) {
+						if unary, ok := s.Rhs[i].(*ast.UnaryExpr); ok && unary.Op == token.AND {
+							if rhsID, ok := unary.X.(*ast.Ident); ok {
+								if _, ok := sc.intCells[rhsID.Name]; ok {
+									sc.ptrIntSize[id.Name] = l.lookupIntVarSize(rhsID.Name)
+								}
+								if si, ok := sc.structs[rhsID.Name]; ok {
+									sc.ptrType[id.Name] = si.def.Name
+								}
+							}
+							if sel, ok := unary.X.(*ast.SelectorExpr); ok {
+								typeName := l.resolveExprTypeName(sel.X)
+								if def, ok := l.result.Structs[typeName]; ok {
+									if n := def.FieldIntSizes[sel.Sel.Name]; n >= 2 {
+										sc.ptrIntSize[id.Name] = n
+									}
+								}
+							}
+						}
+					}
 					if _, exists := sc.vars[id.Name]; !exists {
-						sc.vars[id.Name] = l.allocCell()
+						if _, exists := sc.intCells[id.Name]; !exists {
+							if n := 0; i < len(s.Rhs) && l.exprInvolvesInt(s.Rhs[i], sc) {
+								n = l.exprIntSize(s.Rhs[i], sc)
+								l.defineIntVar(sc, id.Name, n)
+							} else {
+								sc.vars[id.Name] = l.allocCell()
+							}
+						}
 					}
 				}
 			}
@@ -1300,12 +1600,48 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 			if s.Key != nil {
 				if id, ok := s.Key.(*ast.Ident); ok {
 					if _, exists := sc.vars[id.Name]; !exists {
-						sc.vars[id.Name] = l.allocCell()
+						if _, exists := sc.intCells[id.Name]; !exists {
+							if l.exprInvolvesInt(s.X, sc) {
+								n := l.exprIntSize(s.X, sc)
+								l.defineIntVar(sc, id.Name, n)
+							} else {
+								sc.vars[id.Name] = l.allocCell()
+							}
+						}
 					}
 				}
 			}
 			if s.Value != nil {
 				if id, ok := s.Value.(*ast.Ident); ok {
+					// Multi-byte int element: allocate v as an intVar. If the same
+					// name was already defined as an intCell at a smaller width,
+					// reject -- our flat scope can't hold both. Same name reused
+					// for a wider element would silently truncate.
+					var n int
+					if rangeID, ok := s.X.(*ast.Ident); ok {
+						if ai, ok := sc.arrays[rangeID.Name]; ok && ai.elemIntSize >= 2 {
+							n = ai.elemIntSize
+						} else if si, ok := sc.slices[rangeID.Name]; ok && si.elemIntSize >= 2 {
+							n = si.elemIntSize
+						}
+					} else if sel, ok := s.X.(*ast.SelectorExpr); ok {
+						// `for _, v := range s.vals` where s is struct, vals is multi-byte int array.
+						if structID, ok := sel.X.(*ast.Ident); ok {
+							if si, ok := sc.structs[structID.Name]; ok {
+								if eis := si.def.FieldArrayElemIntSize[sel.Sel.Name]; eis >= 2 {
+									n = eis
+								}
+							}
+						}
+					}
+					if n >= 2 {
+						if _, exists := sc.intCells[id.Name]; !exists {
+							if _, exists := sc.vars[id.Name]; !exists {
+								l.defineIntVar(sc, id.Name, n)
+							}
+						}
+						break
+					}
 					if _, exists := sc.vars[id.Name]; !exists {
 						// Struct/pointer slice range: allocate appropriately.
 						var rangeElemType string
@@ -1318,6 +1654,9 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 									sc.ptrType[id.Name] = si.elemPtrType
 									break
 								}
+							}
+							if ai, ok := sc.arrays[rangeID.Name]; ok && ai.elemType != "" {
+								rangeElemType = ai.elemType
 							}
 						}
 						if rangeElemType == "" {
@@ -1354,12 +1693,14 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 			}
 			if gd.Tok == token.CONST {
 				// Register local consts so subsequent declarations can reference them.
-				l.lowerLocalConsts(gd)
+				// Errors are caught again during lowerDecl.
+				_ = l.lowerLocalConsts(gd)
 				return true
 			}
 			if gd.Tok == token.TYPE {
 				// Register local types so subsequent variable declarations can reference them.
-				l.lowerLocalTypes(gd)
+				// Errors are caught again during lowerDecl.
+				_ = l.lowerLocalTypes(gd)
 				return true
 			}
 			for _, spec := range gd.Specs {
@@ -1369,16 +1710,20 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 				}
 				for _, name := range vs.Names {
 					if _, exists := sc.vars[name.Name]; !exists {
-						if count, elemSize, elemType, ies := l.arrayElementInfo(vs.Type); count > 0 {
+						if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(vs.Type); count > 0 {
 							if elemSize > 1 {
-								l.defineStructArray(sc, name.Name, count, elemType, elemSize, ies)
+								l.defineStructArray(sc, name.Name, count, elemSize, elemType, eis, ies, ieis)
 							} else {
 								l.defineArray(sc, name.Name, count)
 							}
+						} else if n := intTypeSize(vs.Type); n >= 2 {
+							if _, exists := sc.intCells[name.Name]; !exists {
+								l.defineIntVar(sc, name.Name, n)
+							}
 						} else if isSliceType(vs.Type) {
 							if _, exists := sc.slices[name.Name]; !exists {
-								es, et, esl, ept := l.sliceElemInfo(vs.Type)
-								l.defineSlice(sc, name.Name, es, et, esl, ept)
+								es, et, esl, ept, eis := l.sliceElemInfo(vs.Type)
+								l.defineSlice(sc, name.Name, es, et, esl, ept, eis)
 							}
 						} else if def := l.structDef(vs.Type); def != nil {
 							if _, exists := sc.structs[name.Name]; !exists {
@@ -1496,6 +1841,27 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 			idx++
 			continue
 		}
+		// Multi-byte int element: write each value (possibly zero-extended) to
+		// the elemIntSize-cell slot. The array was zeroed above, so for narrower
+		// values only the low bytes need to be set.
+		if arr.elemIntSize >= 2 {
+			base := arr.base + idx*arr.elemSize
+			r, err := l.lowerExpr(valExpr)
+			if err != nil {
+				return err
+			}
+			if r.intSize > arr.elemIntSize {
+				if r.temp {
+					l.freeCellRange(r.cell, r.cellCount())
+				}
+				return fmt.Errorf(
+					"cannot use uint%d value in []uint%d literal, use explicit conversion",
+					r.intSize*8, arr.elemIntSize*8)
+			}
+			l.emitCopyOrMove(base, r)
+			idx++
+			continue
+		}
 		// Array-of-arrays: inner composite literal.
 		if arr.elemSize > 1 && arr.elemType == "" {
 			comp, ok := valExpr.(*ast.CompositeLit)
@@ -1533,10 +1899,13 @@ func (l *Lowerer) defineArray(sc *scope, name string, size int) {
 	sc.arrays[name] = arrayInfo{base: base, size: size, count: size, elemSize: 1}
 }
 
-func (l *Lowerer) defineStructArray(sc *scope, name string, count int, elemType string, elemSize, innerElemSize int) {
+func (l *Lowerer) defineStructArray(sc *scope, name string, count, elemSize int,
+	elemType string, elemIntSize, innerElemSize, innerElemIntSize int) {
 	total := count * elemSize
 	base := l.allocCells(total)
-	sc.arrays[name] = arrayInfo{base: base, size: total, count: count, elemSize: elemSize, elemType: elemType, innerElemSize: innerElemSize}
+	sc.arrays[name] = arrayInfo{base: base, size: total, count: count,
+		elemSize: elemSize, elemType: elemType, elemIntSize: elemIntSize,
+		innerElemSize: innerElemSize, innerElemIntSize: innerElemIntSize}
 }
 
 // arrayTypeSize returns N for [N]byte types, 0 for non-array types.
@@ -1553,37 +1922,42 @@ func arrayTypeSize(expr ast.Expr) int {
 }
 
 func (l *Lowerer) arraySize(expr ast.Expr) int {
-	count, elemSize, _, _ := l.arrayElementInfo(expr)
+	count, elemSize, _, _, _, _ := l.arrayElementInfo(expr)
 	return count * elemSize
 }
 
-// arrayElementInfo returns (count, elemSize, elemType) for an array type.
-// For [N]byte: (N, 1, ""). For [N]StructType: (N, structSize, typeName).
-// arrayElementInfo returns (count, elemSize, elemType, innerElemSize) for an array type.
-// For [N]byte: (N, 1, "", 0). For [N]Point: (N, pointSize, "Point", 0).
-// For [N][M]byte: (N, M, "", 0). For [N][M][K]byte: (N, M*K, "", K).
-// For [N][M]Point: (N, M*pointSize, "Point", pointSize).
-func (l *Lowerer) arrayElementInfo(expr ast.Expr) (count, elemSize int, elemType string, innerElemSize int) {
+// arrayElementInfo returns array layout info. For [N]byte: count=N, elemSize=1.
+// For [N]Point: count=N, elemSize=structSize, elemType="Point". For nested
+// arrays the inner element size is reported via innerElemSize. For multi-byte
+// int elements ([N]uint16/uint32/uint64), elemIntSize is set to the byte width.
+// For nested multi-byte int arrays ([N][M]uintN), innerElemIntSize tracks the
+// innermost element width so chained indexing can materialize correctly.
+// Return-value order matches the field order in arrayInfo.
+func (l *Lowerer) arrayElementInfo(expr ast.Expr) (count, elemSize int,
+	elemType string, elemIntSize, innerElemSize, innerElemIntSize int) {
 	at, ok := expr.(*ast.ArrayType)
 	if !ok {
-		return 0, 0, "", 0
+		return 0, 0, "", 0, 0, 0
 	}
 	count = arrayTypeSizePart(at.Len, l.allByteConsts())
 	if count < 0 {
-		return 0, 0, "", 0
+		return 0, 0, "", 0, 0, 0
 	}
 	if id, ok := at.Elt.(*ast.Ident); ok {
 		if def, ok := l.result.Structs[id.Name]; ok {
-			return count, def.Size, id.Name, 0
+			return count, def.Size, id.Name, 0, 0, 0
+		}
+		if n := intIdentSize(id.Name); n > 0 {
+			return count, n, "", n, 0, 0
 		}
 	}
 	if _, ok := at.Elt.(*ast.ArrayType); ok {
-		innerCount, innerES, innerET, _ := l.arrayElementInfo(at.Elt)
+		innerCount, innerES, innerET, innerEIS, _, _ := l.arrayElementInfo(at.Elt)
 		if innerCount > 0 {
-			return count, innerCount * innerES, innerET, innerES
+			return count, innerCount * innerES, innerET, 0, innerES, innerEIS
 		}
 	}
-	return count, 1, "", 0
+	return count, 1, "", 0, 0, 0
 }
 
 func sliceNestingDepth(expr ast.Expr) int {
@@ -1683,6 +2057,9 @@ func (l *Lowerer) wrapNodesInGuard(mark int) {
 func (l *Lowerer) tryLowerDivModAssign(a, b ast.Stmt) (bool, error) {
 	return l.tryLowerDivModAssignWith(a, b, l.lowerExpr,
 		func(id *ast.Ident, tok token.Token) (Cell, error) {
+			if base, ok := l.lookupIntCell(id.Name); ok {
+				return base, nil
+			}
 			return l.lookupOrDefineVar(id, tok)
 		},
 	)
@@ -1745,6 +2122,18 @@ func (l *Lowerer) tryLowerDivModAssignWith(
 	remDst, err := lookupDst(modID, bAssign.Tok)
 	if err != nil {
 		return false, err
+	}
+	// Multi-byte integer divmod: compute both quotient and remainder in one pass.
+	if src1.intSize >= 2 {
+		n := src1.intSize
+		l.emitDivModIntFused(quotDst, remDst, src1.cell, src2.cell, n)
+		if src1.temp {
+			l.freeCellRange(src1.cell, n)
+		}
+		if src2.temp {
+			l.freeCellRange(src2.cell, n)
+		}
+		return true, nil
 	}
 	l.emit(&IRDivMod{QuotDst: quotDst, RemDst: remDst, Src1: src1.cell, Src2: src2.cell})
 	if src1.temp {
@@ -1831,7 +2220,11 @@ func (l *Lowerer) lowerStmt(stmt ast.Stmt) error {
 	case *ast.BranchStmt:
 		return l.lowerBranch(s)
 	case *ast.BlockStmt:
-		return l.lowerStmts(s.List)
+		l.pushScope()
+		l.scanAndAllocLocals(s)
+		err := l.lowerStmts(s.List)
+		l.popScope()
+		return err
 	case *ast.ReturnStmt:
 		return l.lowerReturn(s)
 	case *ast.DeferStmt:
@@ -1963,6 +2356,12 @@ func (l *Lowerer) lowerPutchar(args []ast.Expr, lowerExpr func(ast.Expr) (exprRe
 	if err != nil {
 		return err
 	}
+	if r.intSize >= 2 {
+		if r.temp {
+			l.freeCellRange(r.cell, r.intSize)
+		}
+		return fmt.Errorf("cannot use uint%d as argument to putchar, use byte() to truncate", r.intSize*8)
+	}
 	if r.size > 0 {
 		if r.typeName != "" {
 			return fmt.Errorf("cannot use struct %s as byte value", r.typeName)
@@ -1984,7 +2383,7 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 	if len(args) == 1 {
 		if call, ok := args[0].(*ast.CallExpr); ok {
 			funcName, receiver := l.resolveCall(call)
-			if info, ok := l.result.Funcs[funcName]; ok && info.Returns > 1 {
+			if info, ok := l.result.Funcs[funcName]; ok && len(info.ReturnSizes) > 1 {
 				callArgs := call.Args
 				if receiver != nil {
 					callArgs = append([]ast.Expr{receiver}, callArgs...)
@@ -1993,15 +2392,23 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 				if err != nil {
 					return err
 				}
-				for i, cell := range retCells {
+				off := 0
+				for i, sz := range info.ReturnSizes {
 					if i > 0 && name == "println" {
 						t := l.allocCell()
 						l.emit(&IRConst{Dst: t, Value: ' '})
 						l.emit(&IRPutc{Src: t})
 						l.freeCell(t)
 					}
-					l.emitPrintByte(cell)
-					l.freeCell(cell)
+					if sz >= 2 {
+						l.emitPrintInt(retCells[off], sz)
+					} else {
+						l.emitPrintByte(retCells[off])
+					}
+					for j := range sz {
+						l.freeCell(retCells[off+j])
+					}
+					off += sz
 				}
 				if name == "println" {
 					t := l.allocCell()
@@ -2043,11 +2450,13 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 		}
 		if rawChar {
 			l.emit(&IRPutc{Src: r.cell})
+		} else if r.intSize >= 2 {
+			l.emitPrintInt(r.cell, r.intSize)
 		} else {
 			l.emitPrintByte(r.cell)
 		}
 		if r.temp {
-			l.freeCell(r.cell)
+			l.freeCellRange(r.cell, max(r.intSize, 1))
 		}
 	}
 	if name == "println" {
@@ -2057,6 +2466,17 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 		l.freeCell(t)
 	}
 	return nil
+}
+
+func (l *Lowerer) resolveStringArg(expr ast.Expr) string {
+	if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+		s, _ := strconv.Unquote(lit.Value)
+		return s
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		return l.lookupStringConst(id.Name)
+	}
+	return ""
 }
 
 // emitPrintByte emits IR to print a byte value as a decimal number (0-255).
@@ -2108,15 +2528,144 @@ func (l *Lowerer) emitPrintByte(src Cell) {
 	l.freeCell(r)
 }
 
-func (l *Lowerer) resolveStringArg(expr ast.Expr) string {
-	if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-		s, _ := strconv.Unquote(lit.Value)
-		return s
+// emitPrintInt prints an n-byte unsigned integer using algebraic digit
+// decomposition. Each byte is decomposed into 3 decimal digits (hundreds,
+// tens, ones) via DivMod-by-10. The contributions are combined using the
+// known decimal coefficients of 256^k, then carries are normalized.
+func (l *Lowerer) emitPrintInt(base Cell, n int) {
+	nd := numDecDigits(n)
+	// Allocate accumulator digits. allocCells bumps the cell counter
+	// past nextCell, so it cannot alias base[0..n-1]; bCopy below pulls
+	// from the free list which never contains base's cells while the
+	// caller still holds the input live.
+	acc := l.allocCells(nd)
+	for i := range nd {
+		l.emit(&IRZero{Dst: acc + i})
 	}
-	if id, ok := expr.(*ast.Ident); ok {
-		return l.lookupStringConst(id.Name)
+	ten := l.allocCell()
+	l.emit(&IRConst{Dst: ten, Value: 10})
+
+	for k := range n {
+		// Decompose base[k] into o (ones), t (tens), h (hundreds).
+		bCopy := l.allocCell()
+		l.emit(&IRCopy{Dst: bCopy, Src: base + k})
+		o := l.allocCell()
+		q := l.allocCell()
+		l.emit(&IRDivMod{Src1: bCopy, Src2: ten, QuotDst: q, RemDst: o})
+		l.freeCell(bCopy)
+		t := l.allocCell()
+		h := l.allocCell()
+		l.emit(&IRDivMod{Src1: q, Src2: ten, QuotDst: h, RemDst: t})
+		l.freeCell(q)
+
+		// Get coefficients for 256^k.
+		digits := decimalDigits(k)
+		// Add contributions: for digit_type j (0=o, 1=t, 2=h) at digit_value,
+		// add coeff * digit_value to acc[d] where coeff = digits[d-j].
+		for j, dv := range []Cell{o, t, h} {
+			for d := range nd {
+				ci := d - j
+				if ci < 0 || ci >= len(digits) || digits[ci] == 0 {
+					continue
+				}
+				coeff := digits[ci]
+				if coeff == 1 {
+					l.emit(&IRAdd{Dst: acc + d, Src1: acc + d, Src2: dv})
+				} else {
+					c := l.allocCell()
+					l.emit(&IRConst{Dst: c, Value: byte(coeff)}) // #nosec G115
+					prod := l.allocCell()
+					l.emit(&IRMul{Dst: prod, Src1: dv, Src2: c})
+					l.freeCell(c)
+					l.emit(&IRAdd{Dst: acc + d, Src1: acc + d, Src2: prod})
+					l.freeCell(prod)
+				}
+			}
+		}
+		l.freeCell(o)
+		l.freeCell(t)
+		l.freeCell(h)
+
+		// Normalize carries: divmod each touched digit by 10. Byte k's
+		// contributions reach at most acc[len(digits)+1]; higher digits
+		// are still zero, so normalizing them is wasted. For k=0 the
+		// contributions are u/t/h themselves (each already < 10), so
+		// normalization is a no-op and skipped entirely. The last byte
+		// normalizes through acc[nd-2] so the leading digit receives
+		// its final carry.
+		if k > 0 {
+			limit := len(digits) + 1
+			if k == n-1 || limit > nd-1 {
+				limit = nd - 1
+			}
+			for d := 0; d < limit; d++ {
+				carry := l.allocCell()
+				rem := l.allocCell()
+				l.emit(&IRDivMod{Src1: acc + d, Src2: ten, QuotDst: carry, RemDst: rem})
+				l.emit(&IRMove{Dst: acc + d, Src: rem})
+				l.freeCell(rem)
+				l.emit(&IRAdd{Dst: acc + d + 1, Src1: acc + d + 1, Src2: carry})
+				l.freeCell(carry)
+			}
+		}
 	}
-	return ""
+	l.freeCell(ten)
+
+	// Print digits from most significant to least, suppressing leading zeros.
+	started := l.allocCell()
+	l.emit(&IRZero{Dst: started})
+	for d := nd - 1; d >= 1; d-- {
+		dCond := l.allocCell()
+		l.emit(&IRCopy{Dst: dCond, Src: acc + d})
+		l.emit(&IRIf{Cond: dCond, Then: &IRBlock{Nodes: []IRNode{
+			&IRConst{Dst: started, Value: 1},
+		}}})
+		l.freeCell(dCond)
+		sCond := l.allocCell()
+		l.emit(&IRCopy{Dst: sCond, Src: started})
+		l.emit(&IRIf{Cond: sCond, Then: &IRBlock{Nodes: []IRNode{
+			&IRAddI{Dst: acc + d, Value: '0'},
+			&IRPutc{Src: acc + d},
+		}}})
+		l.freeCell(sCond)
+	}
+	// Ones digit: always print.
+	l.emit(&IRAddI{Dst: acc, Value: '0'})
+	l.emit(&IRPutc{Src: acc})
+	l.freeCell(started)
+	l.freeCellRange(acc, nd)
+}
+
+// numDecDigits returns the number of decimal digits needed for an n-byte unsigned integer.
+func numDecDigits(n int) int {
+	switch n {
+	case 1:
+		return 3
+	case 2:
+		return 5
+	case 4:
+		return 10
+	case 8:
+		return 20
+	}
+	return 3 * n
+}
+
+// decimalDigits returns the decimal digits of 256^k, least significant first.
+func decimalDigits(k int) []int {
+	v := 1
+	for range k {
+		v *= 256
+	}
+	var digits []int
+	for v > 0 {
+		digits = append(digits, v%10)
+		v /= 10
+	}
+	if len(digits) == 0 {
+		digits = []int{0}
+	}
+	return digits
 }
 
 func (l *Lowerer) lowerClear(args []ast.Expr) error {
@@ -2288,11 +2837,17 @@ func (l *Lowerer) lowerLocalConsts(gd *ast.GenDecl) error {
 				if err != nil {
 					return fmt.Errorf("const %s: %w", name.Name, err)
 				}
-				if val < 0 || val > 255 {
-					return fmt.Errorf("const %s: value %d out of byte range (0-255)", name.Name, val)
+				size, err := classifyIntConst(name.Name, val, intTypeSize(vs.Type))
+				if err != nil {
+					return err
 				}
-				sc.consts[name.Name] = byte(val) // #nosec G115
-				allConsts[name.Name] = byte(val) // #nosec G115
+				if size > 1 {
+					l.result.IntConsts[name.Name] = uint64(val) // #nosec G115
+					l.result.IntConstSize[name.Name] = size
+				} else {
+					sc.consts[name.Name] = byte(val) // #nosec G115
+					allConsts[name.Name] = byte(val) // #nosec G115
+				}
 			}
 		}
 		iota++
@@ -2316,6 +2871,7 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 			FieldTypes:      make(map[string]string),
 			FieldArraySizes: make(map[string]int),
 			FieldInnerSizes: make(map[string]int),
+			FieldIntSizes:   make(map[string]int),
 		}
 		offset := 0
 		for _, field := range st.Fields.List {
@@ -2326,6 +2882,8 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 				if nested, ok := l.result.Structs[id.Name]; ok {
 					fieldSize = nested.Size
 					fieldType = id.Name
+				} else if n := intIdentSize(id.Name); n > 0 {
+					fieldSize = n
 				}
 			} else if arrSize, ies := arrayFieldInfo(field.Type); arrSize > 0 {
 				fieldSize = arrSize
@@ -2344,6 +2902,9 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 				}
 				if fieldArraySize > 0 {
 					def.FieldArraySizes[name.Name] = fieldArraySize
+				}
+				if fieldSize >= 2 && fieldType == "" && fieldArraySize == 0 {
+					def.FieldIntSizes[name.Name] = fieldSize
 				}
 				offset += fieldSize
 			}
@@ -2389,6 +2950,9 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 					for j := range si.def.Size {
 						l.emit(&IRZero{Dst: si.base + j})
 					}
+				} else if base, ok := l.lookupIntCell(name.Name); ok {
+					l.emit(&IRZero{Dst: base})
+					l.emit(&IRZero{Dst: base + 1})
 				} else if si, ok := l.lookupSlice(name.Name); ok {
 					l.emit(&IRZero{Dst: si.ptr})
 					l.emit(&IRZero{Dst: si.len})
@@ -2412,6 +2976,39 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 	// Slice assignment: s = make([]byte, n) or s = append(s, v) or s = expr
 	if si, ok := l.lookupSlice(name); ok {
 		return l.lowerSliceAssign(si, rhs)
+	}
+	// Multi-byte integer assignment.
+	if base, ok := l.lookupIntCell(name); ok {
+		n := l.lookupIntVarSize(name)
+		maxVal := uint64(1)<<(n*8) - 1
+		// Handle integer literal directly.
+		if lit, ok := rhs.(*ast.BasicLit); ok && lit.Kind == token.INT {
+			val, err := strconv.ParseUint(lit.Value, 0, 64)
+			if err != nil {
+				return err
+			}
+			if val > maxVal {
+				return fmt.Errorf("integer literal %d out of uint%d range (0-%d)", val, n*8, maxVal)
+			}
+			for j := range n {
+				l.emit(&IRConst{Dst: base + j, Value: byte(val >> (j * 8))}) // #nosec G115
+			}
+			return nil
+		}
+		r, err := l.lowerExpr(rhs)
+		if err != nil {
+			return err
+		}
+		if r.intSize >= 2 {
+			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
+			return nil
+		}
+		// byte -> multi-byte: zero-extend.
+		l.emitCopyOrMove(base, r)
+		for j := 1; j < n; j++ {
+			l.emit(&IRZero{Dst: base + j})
+		}
+		return nil
 	}
 	// Composite literal: a = [N]byte{...} or p = Point{...}
 	if comp, ok := rhs.(*ast.CompositeLit); ok {
@@ -2461,7 +3058,8 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 			delete(sc.vars, name)
 			if _, exists := sc.arrays[name]; !exists {
 				if srcAI.elemSize > 1 || srcAI.elemType != "" {
-					l.defineStructArray(sc, name, srcAI.count, srcAI.elemType, srcAI.elemSize, srcAI.innerElemSize)
+					l.defineStructArray(sc, name, srcAI.count, srcAI.elemSize, srcAI.elemType,
+						srcAI.elemIntSize, srcAI.innerElemSize, srcAI.innerElemIntSize)
 				} else {
 					l.defineArray(sc, name, srcAI.size)
 				}
@@ -2473,6 +3071,9 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 		return err
 	}
 	// Track pointer type from expression result (function returns, etc.).
+	if r.ptrIntSize >= 2 {
+		l.currentScope().ptrIntSize[name] = r.ptrIntSize
+	}
 	if r.isPointer {
 		sc := l.currentScope()
 		if r.typeName != "" {
@@ -2494,6 +3095,13 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 
 // assignResult copies an expression result to a destination.
 func (l *Lowerer) assignResult(dst, r exprResult) error {
+	// Reject assigning wider integer to narrower variable.
+	if r.intSize >= 2 && dst.intSize < 2 && dst.size <= 1 {
+		if r.temp {
+			l.freeCellRange(r.cell, r.intSize)
+		}
+		return fmt.Errorf("cannot assign wider integer to byte variable, use explicit conversion")
+	}
 	if r.cell == dst.cell {
 		if r.temp {
 			l.freeCell(r.cell)
@@ -2567,11 +3175,12 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 					args = append([]ast.Expr{receiver}, args...)
 				}
 				// Multi-return: q, r := divmod(a, b) or a[0], a[1] = divmod(a, b)
-				if info.Returns == len(s.Lhs) && info.Returns > 1 {
+				if len(info.ReturnSizes) == len(s.Lhs) && len(info.ReturnSizes) > 1 {
 					return l.lowerMultiReturnAssign(s, info, args)
 				}
 				// Composite return: p := f() where f returns struct, array, or slice.
-				if len(s.Lhs) == 1 && !info.ReturnType.IsPointer && (info.ReturnType.ArraySize > 0 || info.ReturnType.StructType != "" || info.ReturnType.IsSlice) {
+				if len(s.Lhs) == 1 && !info.ReturnType.IsPointer &&
+					(info.ReturnType.ArraySize > 0 || info.ReturnType.StructType != "" || info.ReturnType.IsSlice) {
 					return l.lowerCompositeReturnAssign(s.Lhs[0], info, args)
 				}
 			}
@@ -2644,32 +3253,48 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 	if err != nil {
 		return err
 	}
+	off := 0
 	for i, lhs := range s.Lhs {
+		n := 1
+		if i < len(info.ReturnSizes) {
+			n = info.ReturnSizes[i]
+		}
 		switch target := lhs.(type) {
 		case *ast.Ident:
-			cell, err := l.lookupVar(target.Name)
-			if err != nil {
-				return err
+			if n >= 2 {
+				if base, ok := l.lookupIntCell(target.Name); ok {
+					for j := range n {
+						l.emit(&IRMove{Dst: base + j, Src: retCells[off+j]})
+					}
+				}
+			} else {
+				cell, err := l.lookupVar(target.Name)
+				if err != nil {
+					return err
+				}
+				l.emit(&IRMove{Dst: cell, Src: retCells[off]})
 			}
-			l.emit(&IRMove{Dst: cell, Src: retCells[i]})
 		case *ast.IndexExpr:
 			base, err := l.lowerExpr(target.X)
 			if err != nil {
 				return err
 			}
-			if err := l.writeInto(base, target.Index, exprResult{cell: retCells[i]}); err != nil {
+			if err := l.writeInto(base, target.Index, exprResult{cell: retCells[off]}); err != nil {
 				return err
 			}
-			l.freeCell(retCells[i])
+			l.freeCell(retCells[off])
 		case *ast.SelectorExpr:
 			r, err := l.lowerSelectorExpr(target)
 			if err != nil {
 				return err
 			}
-			l.emit(&IRMove{Dst: r.cell, Src: retCells[i]})
+			for j := range n {
+				l.emit(&IRMove{Dst: r.cell + j, Src: retCells[off+j]})
+			}
 		default:
 			return fmt.Errorf("unsupported assignment target")
 		}
+		off += n
 	}
 	return nil
 }
@@ -2865,7 +3490,7 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 			l.emit(&IRMove{Dst: si.len, Src: retCells[1]})
 			l.emit(&IRMove{Dst: si.cap, Src: retCells[2]})
 		} else {
-			newSI := l.defineSlice(sc, id.Name, es, et, false)
+			newSI := l.defineSlice(sc, id.Name, es, et, false, "", info.ReturnType.SliceElemIntSize)
 			l.emit(&IRMove{Dst: newSI.ptr, Src: retCells[0]})
 			l.emit(&IRMove{Dst: newSI.len, Src: retCells[1]})
 			l.emit(&IRMove{Dst: newSI.cap, Src: retCells[2]})
@@ -2915,6 +3540,23 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 		if err != nil {
 			return err
 		}
+		if intSize := def.FieldIntSizes[sel.Sel.Name]; intSize >= 2 {
+			for j := range intSize {
+				t := l.allocCell()
+				if val.temp {
+					l.emit(&IRMove{Dst: t, Src: val.cell + j})
+				} else {
+					l.emit(&IRCopy{Dst: t, Src: val.cell + j})
+				}
+				l.ptrStore(slot, t)
+				l.freeCell(t)
+				if j < intSize-1 {
+					l.emit(&IRAddI{Dst: slot, Value: 1})
+				}
+			}
+			l.freeCell(slot)
+			return nil
+		}
 		t := l.allocCell()
 		l.emitCopyOrMove(t, val)
 		l.ptrStore(slot, t)
@@ -2926,6 +3568,56 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	if fieldType := def.FieldTypes[sel.Sel.Name]; fieldType != "" {
 		fieldDef := l.result.Structs[fieldType]
 		return l.lowerStructValueTo(base.cell+offset, fieldDef, rhs)
+	}
+	// Multi-byte int field: copy N cells.
+	if intSize := def.FieldIntSizes[sel.Sel.Name]; intSize >= 2 {
+		val, err := l.lowerExpr(rhs)
+		if err != nil {
+			return err
+		}
+		if base.isPointer {
+			slot := l.ptrOffset(base.cell, offset)
+			for j := range intSize {
+				t := l.allocCell()
+				if val.temp {
+					l.emit(&IRMove{Dst: t, Src: val.cell + j})
+				} else {
+					l.emit(&IRCopy{Dst: t, Src: val.cell + j})
+				}
+				l.ptrStore(slot, t)
+				l.freeCell(t)
+				if j < intSize-1 {
+					l.emit(&IRAddI{Dst: slot, Value: 1})
+				}
+			}
+			l.freeCell(slot)
+			return nil
+		}
+		// Variable-index struct array element: base.cell holds i*elemSize
+		// relative to base.flatBase. Write N cells via dynamic-index store.
+		if base.flatBase != 0 {
+			totalSize := base.elemCount * base.elemSize
+			flatArr := arrayInfo{base: base.flatBase, size: totalSize, count: totalSize, elemSize: 1}
+			for j := range intSize {
+				idxCell := l.allocCell()
+				l.emit(&IRCopy{Dst: idxCell, Src: base.cell})
+				if off := offset + j; off > 0 {
+					l.emit(&IRAddI{Dst: idxCell, Value: byte(off)}) // #nosec G115
+				}
+				l.emitVariableIndexWrite(flatArr, idxCell, val.cell+j)
+				l.freeCell(idxCell)
+			}
+			if val.temp {
+				l.freeCellRange(val.cell, intSize)
+			}
+			if base.temp {
+				l.freeCell(base.cell)
+			}
+			return nil
+		}
+		dst := base.cell + offset
+		l.emitCopyOrMove(dst, exprResult{cell: val.cell, temp: val.temp, size: intSize})
+		return nil
 	}
 	// Direct or flat-offset write via writeInto.
 	val, err := l.lowerExpr(rhs)
@@ -2948,6 +3640,12 @@ func (l *Lowerer) lowerCompositeVarIndex(ai arrayInfo, indexExpr ast.Expr) (expr
 	indexR, err := l.lowerExpr(indexExpr)
 	if err != nil {
 		return exprResult{}, err
+	}
+	if indexR.intSize >= 2 {
+		if indexR.temp {
+			l.freeCellRange(indexR.cell, indexR.intSize)
+		}
+		return exprResult{}, fmt.Errorf("cannot use multi-byte integer as array index, use byte() to truncate")
 	}
 	es := l.allocCell()
 	l.emit(&IRConst{Dst: es, Value: byte(ai.elemSize)}) // #nosec G115
@@ -3016,6 +3714,16 @@ func (l *Lowerer) lowerIncDec(s *ast.IncDecStmt) error {
 	var cell Cell
 	switch x := s.X.(type) {
 	case *ast.Ident:
+		// Multi-byte integer inc/dec.
+		if base, ok := l.lookupIntCell(x.Name); ok {
+			n := l.lookupIntVarSize(x.Name)
+			if s.Tok == token.INC {
+				l.emitIncInt(base, n)
+			} else {
+				l.emitDecInt(base, n)
+			}
+			return nil
+		}
 		c, err := l.lookupVar(x.Name)
 		if err != nil {
 			return err
@@ -3055,11 +3763,91 @@ func (l *Lowerer) lowerIncDec(s *ast.IncDecStmt) error {
 	return nil
 }
 
+// emitIncInt increments an n-byte integer in place with carry chain.
+func (l *Lowerer) emitIncInt(base Cell, n int) {
+	// Increment byte 0. If it wrapped to 0, carry to byte 1, etc.
+	carry := l.allocCell()
+	l.emit(&IRAddI{Dst: base, Value: 1})
+	l.emit(&IRCopy{Dst: carry, Src: base})
+	l.emit(&IRNot{Dst: carry, Src: carry}) // carry = (base[0] == 0)
+	for j := 1; j < n; j++ {
+		cond := l.allocCell()
+		l.emit(&IRCopy{Dst: cond, Src: carry})
+		l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: []IRNode{
+			&IRAddI{Dst: base + j, Value: 1},
+		}}})
+		l.freeCell(cond)
+		if j < n-1 {
+			// carry = carry AND (base[j] == 0)
+			isZero := l.allocCell()
+			l.emit(&IRCopy{Dst: isZero, Src: base + j})
+			l.emit(&IRNot{Dst: isZero, Src: isZero})
+			l.emit(&IRMul{Dst: carry, Src1: carry, Src2: isZero})
+			l.freeCell(isZero)
+		}
+	}
+	l.freeCell(carry)
+}
+
+// emitDecInt decrements an n-byte integer in place with borrow chain.
+func (l *Lowerer) emitDecInt(base Cell, n int) {
+	// Decrement byte 0. If it was 0 (wrapped to 255), borrow from byte 1, etc.
+	borrow := l.allocCell()
+	l.emit(&IRCopy{Dst: borrow, Src: base})
+	l.emit(&IRNot{Dst: borrow, Src: borrow}) // borrow = (base[0] == 0)
+	l.emit(&IRSubI{Dst: base, Value: 1})
+	for j := 1; j < n; j++ {
+		cond := l.allocCell()
+		l.emit(&IRCopy{Dst: cond, Src: borrow})
+		if j < n-1 {
+			// Check if this byte is also 0 before decrement (will chain borrow).
+			isZero := l.allocCell()
+			l.emit(&IRCopy{Dst: isZero, Src: base + j})
+			l.emit(&IRNot{Dst: isZero, Src: isZero})
+			l.emit(&IRMul{Dst: borrow, Src1: borrow, Src2: isZero})
+			l.freeCell(isZero)
+		}
+		l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: []IRNode{
+			&IRSubI{Dst: base + j, Value: 1},
+		}}})
+		l.freeCell(cond)
+	}
+	l.freeCell(borrow)
+}
+
 // lowerDerefIncDec handles *p++ / *p--: load, modify, store via dynamic access.
 func (l *Lowerer) lowerDerefIncDec(ptr ast.Expr, tok token.Token) error {
 	p, err := l.lowerExpr(ptr)
 	if err != nil {
 		return err
+	}
+	if n := p.ptrIntSize; n >= 2 {
+		idx := l.allocCell()
+		l.emit(&IRCopy{Dst: idx, Src: p.cell})
+		tmp := l.allocCells(n)
+		for j := range n {
+			val := l.ptrLoad(idx)
+			l.emit(&IRMove{Dst: tmp + j, Src: val})
+			l.freeCell(val)
+			if j < n-1 {
+				l.emit(&IRAddI{Dst: idx, Value: 1})
+			}
+		}
+		if tok == token.INC {
+			l.emitIncInt(tmp, n)
+		} else {
+			l.emitDecInt(tmp, n)
+		}
+		// Store back (idx still points to last byte).
+		for j := n - 1; j >= 0; j-- {
+			l.ptrStore(idx, tmp+j)
+			if j > 0 {
+				l.emit(&IRSubI{Dst: idx, Value: 1})
+			}
+		}
+		l.freeCellRange(tmp, n)
+		l.freeCell(idx)
+		return nil
 	}
 	t := l.ptrLoad(p.cell)
 	if tok == token.INC {
@@ -3111,6 +3899,34 @@ func (l *Lowerer) lowerFieldIncDec(sel *ast.SelectorExpr, tok token.Token) error
 	if err == nil && base.isPointer && base.typeName != "" {
 		def := l.result.Structs[base.typeName]
 		offset := def.Offsets[sel.Sel.Name]
+		if n := def.FieldIntSizes[sel.Sel.Name]; n >= 2 {
+			idx := l.allocCell()
+			l.emit(&IRCopy{Dst: idx, Src: base.cell})
+			l.emit(&IRAddI{Dst: idx, Value: byte(offset)}) // #nosec G115
+			tmp := l.allocCells(n)
+			for j := range n {
+				val := l.ptrLoad(idx)
+				l.emit(&IRMove{Dst: tmp + j, Src: val})
+				l.freeCell(val)
+				if j < n-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			if tok == token.INC {
+				l.emitIncInt(tmp, n)
+			} else {
+				l.emitDecInt(tmp, n)
+			}
+			for j := n - 1; j >= 0; j-- {
+				l.ptrStore(idx, tmp+j)
+				if j > 0 {
+					l.emit(&IRSubI{Dst: idx, Value: 1})
+				}
+			}
+			l.freeCellRange(tmp, n)
+			l.freeCell(idx)
+			return nil
+		}
 		idx := l.ptrOffset(base.cell, offset)
 		val := l.ptrLoad(idx)
 		if tok == token.INC {
@@ -3126,6 +3942,14 @@ func (l *Lowerer) lowerFieldIncDec(sel *ast.SelectorExpr, tok token.Token) error
 	r, err := l.lowerSelectorExpr(sel)
 	if err != nil {
 		return err
+	}
+	if n := r.intSize; n >= 2 {
+		if tok == token.INC {
+			l.emitIncInt(r.cell, n)
+		} else {
+			l.emitDecInt(r.cell, n)
+		}
+		return nil
 	}
 	if tok == token.INC {
 		l.emit(&IRAddI{Dst: r.cell, Value: 1})
@@ -3190,13 +4014,19 @@ func (l *Lowerer) lowerSwitch(s *ast.SwitchStmt) error {
 	if s.Tag != nil {
 		// Store tag in a temp variable so case comparisons can reference it.
 		tagName = "$switch"
-		tagCell := l.allocCell()
-		l.currentScope().vars[tagName] = tagCell
 		r, err := l.lowerExpr(s.Tag)
 		if err != nil {
 			return err
 		}
-		l.emitCopyOrMove(tagCell, r)
+		if r.intSize >= 2 {
+			sc := l.currentScope()
+			base := l.defineIntVar(sc, tagName, r.intSize)
+			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
+		} else {
+			tagCell := l.allocCell()
+			l.currentScope().vars[tagName] = tagCell
+			l.emitCopyOrMove(tagCell, r)
+		}
 	}
 
 	ifStmt := l.buildSwitchIf(s.Body.List, tagName)
@@ -3408,20 +4238,34 @@ func (l *Lowerer) emitCondTo(dst Cell, expr ast.Expr) error {
 
 func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	var cell Cell
+	var counterIntSize int // 0 for byte, >= 2 for multi-byte integers
 	if s.Key != nil {
 		id, ok := s.Key.(*ast.Ident)
 		if !ok {
 			return fmt.Errorf("unsupported range key: %T", s.Key)
 		}
-		var err error
-		cell, err = l.lookupVar(id.Name)
-		if err != nil {
-			return err
+		if base, ok := l.lookupIntCell(id.Name); ok {
+			cell = base
+			counterIntSize = l.lookupIntVarSize(id.Name)
+		} else {
+			var err error
+			cell, err = l.lookupVar(id.Name)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		// No loop variable: allocate a hidden counter.
-		cell = l.allocCell()
-		defer l.freeCell(cell)
+		// Check if range expression is multi-byte to size the counter.
+		if l.exprInvolvesInt(s.X, l.currentScope()) {
+			n := l.exprIntSize(s.X, l.currentScope())
+			counterIntSize = n
+			cell = l.allocCells(n)
+			defer l.freeCellRange(cell, n)
+		} else {
+			cell = l.allocCell()
+			defer l.freeCell(cell)
+		}
 	}
 
 	// Check if ranging over an array or slice: for i, v := range x
@@ -3439,8 +4283,25 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 			}
 			if si, ok := l.lookupStruct(valID.Name); ok {
 				valCell = si.base
+			} else if base, ok := l.lookupIntCell(valID.Name); ok {
+				valCell = base
 			} else {
 				valCell, _ = l.lookupVar(valID.Name)
+			}
+		}
+	} else if id, ok := s.X.(*ast.Ident); ok {
+		// Plain `for range slice` / `for range array` uses len as the iteration
+		// count. Pre-evaluate the source so the limit logic below picks up
+		// lenCell or elemCount.
+		if _, ok := l.lookupSlice(id.Name); ok {
+			r, err := l.lowerExpr(s.X)
+			if err == nil {
+				rangeBase = r
+			}
+		} else if _, ok := l.lookupArray(id.Name); ok {
+			r, err := l.lowerExpr(s.X)
+			if err == nil {
+				rangeBase = r
 			}
 		}
 	}
@@ -3452,7 +4313,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		t := l.allocCell()
 		l.emit(&IRCopy{Dst: t, Src: rangeBase.lenCell})
 		limit = exprResult{cell: t, temp: true}
-	} else if hasVal {
+	} else if rangeBase.elemCount > 0 && rangeBase.elemCount != 255 {
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: byte(rangeBase.elemCount)}) // #nosec G115
 		limit = exprResult{cell: t, temp: true}
@@ -3463,10 +4324,20 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		}
 	}
 	// i = 0
-	l.emit(&IRZero{Dst: cell})
+	if counterIntSize >= 2 {
+		for j := range counterIntSize {
+			l.emit(&IRZero{Dst: cell + j})
+		}
+	} else {
+		l.emit(&IRZero{Dst: cell})
+	}
 	// Desugar to for loop: condition is i < limit.
 	condCell := l.allocCell()
-	l.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limit.cell})
+	if counterIntSize >= 2 {
+		l.emitCmpLtInt(condCell, cell, limit.cell, counterIntSize)
+	} else {
+		l.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limit.cell})
+	}
 
 	outerSkip := l.loopSkipFlag
 	outerBreak := l.loopBreakFlag
@@ -3503,6 +4374,26 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 				}
 			}
 			l.freeCell(idx)
+		} else if rangeBase.elemSize > 1 {
+			// Multi-cell element (uint16/uint32/uint64, struct, or nested array).
+			// Read elemSize bytes per iteration via flat indexing into the array.
+			es := rangeBase.elemSize
+			ai := arrayInfo{base: rangeBase.cell, size: rangeBase.elemCount * es, count: rangeBase.elemCount * es, elemSize: 1}
+			esCell := l.allocCell()
+			l.emit(&IRConst{Dst: esCell, Value: byte(es)}) // #nosec G115
+			flatIdx := l.allocCell()
+			l.emit(&IRMul{Dst: flatIdx, Src1: cell, Src2: esCell})
+			l.freeCell(esCell)
+			for j := range es {
+				idxCell := l.allocCell()
+				l.emit(&IRCopy{Dst: idxCell, Src: flatIdx})
+				if j > 0 {
+					l.emit(&IRAddI{Dst: idxCell, Value: byte(j)}) // #nosec G115
+				}
+				l.emitVariableIndexRead(ai, idxCell, valCell+j)
+				l.freeCell(idxCell)
+			}
+			l.freeCell(flatIdx)
 		} else {
 			ai := arrayInfo{base: rangeBase.cell, size: rangeBase.elemCount, count: rangeBase.elemCount, elemSize: 1}
 			l.emitVariableIndexRead(ai, cell, valCell)
@@ -3522,8 +4413,13 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.emit(&IRNot{Dst: breakGuard, Src: l.loopBreakFlag})
 	guardedSaved := l.nodes
 	l.nodes = nil
-	l.emit(&IRAddI{Dst: cell, Value: 1})
-	l.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limit.cell})
+	if counterIntSize >= 2 {
+		l.emitIncInt(cell, counterIntSize)
+		l.emitCmpLtInt(condCell, cell, limit.cell, counterIntSize)
+	} else {
+		l.emit(&IRAddI{Dst: cell, Value: 1})
+		l.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limit.cell})
+	}
 	postBlock := &IRBlock{Nodes: l.nodes}
 	l.nodes = guardedSaved
 	l.emit(&IRIf{Cond: breakGuard, Then: postBlock})
@@ -3552,7 +4448,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.loopBreakFlag = outerBreak
 	l.freeCell(condCell)
 	if limit.temp {
-		l.freeCell(limit.cell)
+		l.freeCellRange(limit.cell, max(limit.intSize, 1))
 	}
 	return nil
 }
@@ -3630,6 +4526,9 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 			l.emitCopyOrMove(l.returnDst[2], exprResult{cell: r.capCell})
 			return l.returnFinish()
 		}
+		if r.intSize >= 2 && len(l.returnDst) < 2 {
+			return fmt.Errorf("cannot return wider integer from byte-returning function, use byte() to truncate")
+		}
 		l.emitCopyOrMove(l.returnDst[0], r)
 		return l.returnFinish()
 	}
@@ -3641,12 +4540,19 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 			return l.returnFinish()
 		}
 	}
+	off := 0
 	for i, expr := range s.Results {
 		r, err := l.lowerExpr(expr)
 		if err != nil {
 			return err
 		}
-		l.emitCopyOrMove(l.returnDst[i], r)
+		l.emitCopyOrMove(l.returnDst[off], r)
+		n := 1
+		if r.intSize >= 2 {
+			n = r.intSize
+		}
+		_ = i
+		off += n
 	}
 	return l.returnFinish()
 }
@@ -3765,7 +4671,16 @@ func (l *Lowerer) tryReturnDivMod(results []ast.Expr) (bool, error) {
 		return false, err
 	}
 	src2 = l.ensureTemp(src2)
-	l.emit(&IRDivMod{QuotDst: l.returnDst[quotIdx], RemDst: l.returnDst[remIdx], Src1: src1.cell, Src2: src2.cell})
+	if src1.intSize >= 2 {
+		// Multi-byte: compute offsets into returnDst by return sizes.
+		quotOff, remOff := 0, src1.intSize
+		if quotIdx > remIdx {
+			quotOff, remOff = src1.intSize, 0
+		}
+		l.emitDivModIntFused(l.returnDst[quotOff], l.returnDst[remOff], src1.cell, src2.cell, src1.intSize)
+	} else {
+		l.emit(&IRDivMod{QuotDst: l.returnDst[quotIdx], RemDst: l.returnDst[remIdx], Src1: src1.cell, Src2: src2.cell})
+	}
 	if src1.temp {
 		l.freeCell(src1.cell)
 	}
@@ -3816,7 +4731,7 @@ func (l *Lowerer) lowerDefer(s *ast.DeferStmt) error {
 			if si, ok := l.lookupSlice(id.Name); ok {
 				name := fmt.Sprintf("$defer_%d_%d", len(l.deferredCalls), i)
 				sc := l.currentScope()
-				capSI := l.defineSlice(sc, name, si.elemSize, si.elemType, si.elemSlice, si.elemPtrType)
+				capSI := l.defineSlice(sc, name, si.elemSize, si.elemType, si.elemSlice, si.elemPtrType, si.elemIntSize)
 				l.emit(&IRCopy{Dst: capSI.ptr, Src: si.ptr})
 				l.emit(&IRCopy{Dst: capSI.len, Src: si.len})
 				l.emit(&IRCopy{Dst: capSI.cap, Src: si.cap})
@@ -3828,11 +4743,19 @@ func (l *Lowerer) lowerDefer(s *ast.DeferStmt) error {
 		if err != nil {
 			return err
 		}
-		cell := l.allocCell()
-		l.emitCopyOrMove(cell, r)
 		name := fmt.Sprintf("$defer_%d_%d", len(l.deferredCalls), i)
-		l.defineVar(name)
-		l.currentScope().vars[name] = cell
+		if r.intSize >= 2 {
+			base := l.allocCells(r.intSize)
+			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
+			sc := l.currentScope()
+			l.defineIntVar(sc, name, r.intSize)
+			sc.intCells[name] = base
+		} else {
+			cell := l.allocCell()
+			l.emitCopyOrMove(cell, r)
+			l.defineVar(name)
+			l.currentScope().vars[name] = cell
+		}
 		capturedArgs[i] = ast.NewIdent(name)
 	}
 	// Build the deferred call wrapped in an IRIf guard on the flag.
@@ -3914,6 +4837,16 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	if len(argExprs) != len(info.Params) {
 		return nil, fmt.Errorf("function %s expects %d arguments, got %d", info.Name, len(info.Params), len(argExprs))
 	}
+	if info.IsRecursive || info.IsTailRec {
+		for _, pt := range info.ParamTypes {
+			if pt.IntSize >= 2 {
+				return nil, fmt.Errorf("multi-byte integer parameters are not supported in recursive function %s", info.Name)
+			}
+		}
+		if info.ReturnType.IntSize >= 2 {
+			return nil, fmt.Errorf("multi-byte integer return values are not supported in recursive function %s", info.Name)
+		}
+	}
 	if info.IsRecursive && !info.IsTailRec {
 		return l.lowerGeneralRecursion(info, argExprs)
 	}
@@ -3948,8 +4881,9 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 			if size > 0 {
 				base := l.allocCells(size)
 				arr := arrayInfo{base: base, size: size, count: size, elemSize: 1}
-				if count, elemSize, elemType, _ := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
-					arr = arrayInfo{base: base, size: size, count: count, elemSize: elemSize, elemType: elemType}
+				if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
+					arr = arrayInfo{base: base, size: size, count: count, elemSize: elemSize,
+						elemType: elemType, elemIntSize: eis, innerElemSize: ies, innerElemIntSize: ieis}
 				}
 				if err := l.lowerCompositeLitInto(arr, comp); err != nil {
 					return nil, err
@@ -4002,10 +4936,28 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	for i, paramName := range info.Params {
 		if i < len(info.ParamTypes) {
 			pt := info.ParamTypes[i]
+			if pt.IntSize >= 2 {
+				n := pt.IntSize
+				sc := l.currentScope()
+				base := l.defineIntVar(sc, paramName, n)
+				if args[i].intSize >= 2 {
+					for j := range n {
+						l.emit(&IRCopy{Dst: base + j, Src: args[i].cell + j})
+					}
+				} else {
+					l.emitCopyOrMove(base, args[i])
+					args[i].temp = false // already freed by emitCopyOrMove
+					for j := 1; j < n; j++ {
+						l.emit(&IRZero{Dst: base + j})
+					}
+				}
+				continue
+			}
 			if pt.IsSlice {
 				if inner, ok := sliceArgs[i]; ok {
 					sc := l.currentScope()
-					paramSI := l.defineSlice(sc, paramName, inner.elemSize, inner.elemType, inner.elemSlice, inner.elemPtrType)
+					paramSI := l.defineSlice(sc, paramName, inner.elemSize, inner.elemType,
+						inner.elemSlice, inner.elemPtrType, inner.elemIntSize)
 					l.emit(&IRMove{Dst: paramSI.ptr, Src: inner.ptr})
 					l.emit(&IRMove{Dst: paramSI.len, Src: inner.len})
 					l.emit(&IRMove{Dst: paramSI.cap, Src: inner.cap})
@@ -4019,7 +4971,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				if pt.ArraySize > 0 {
 					sc := l.currentScope()
 					if pt.ArrayElemSize > 1 {
-						l.defineStructArray(sc, paramName, pt.ArrayCount, pt.ArrayElemType, pt.ArrayElemSize, 0)
+						l.defineStructArray(sc, paramName, pt.ArrayCount, pt.ArrayElemSize, pt.ArrayElemType, pt.ArrayElemIntSize, 0, 0)
 					} else {
 						l.defineArray(sc, paramName, pt.ArraySize)
 					}
@@ -4055,6 +5007,9 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				if pt.PtrStructType != "" {
 					sc.ptrType[paramName] = pt.PtrStructType
 				}
+				if pt.PtrIntSize >= 2 {
+					sc.ptrIntSize[paramName] = pt.PtrIntSize
+				}
 				continue
 			}
 		}
@@ -4075,13 +5030,15 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	retSize := info.Returns
 	if info.ReturnType.IsSlice {
 		retSize = 3 // ptr, len, cap
+	} else if info.ReturnType.IntSize >= 2 {
+		retSize = info.ReturnType.IntSize
 	} else if info.ReturnType.ArraySize > 0 && !info.ReturnType.IsPointer {
 		retSize = info.ReturnType.ArraySize
-	} else if info.ReturnType.StructType != "" {
+	} else if info.ReturnType.StructType != "" && !info.ReturnType.IsPointer {
 		retSize = l.result.Structs[info.ReturnType.StructType].Size
 	}
 	retCells := make([]Cell, retSize)
-	if retSize > 1 && info.Returns == 1 {
+	if retSize > 1 {
 		base := l.allocCells(retSize)
 		for i := range retCells {
 			retCells[i] = base + i
@@ -4097,9 +5054,14 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	// Register named return variables as aliases for the return cells.
 	if len(info.ReturnNames) > 0 {
 		sc := l.currentScope()
-		for i, name := range info.ReturnNames {
-			if i < len(retCells) {
-				sc.vars[name] = retCells[i]
+		if info.ReturnType.IntSize >= 2 && len(info.ReturnNames) == 1 {
+			sc.intCells[info.ReturnNames[0]] = retCells[0]
+			sc.intSizes[info.ReturnNames[0]] = info.ReturnType.IntSize
+		} else {
+			for i, name := range info.ReturnNames {
+				if i < len(retCells) {
+					sc.vars[name] = retCells[i]
+				}
 			}
 		}
 	}
@@ -4201,7 +5163,10 @@ func (l *Lowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 		if err != nil {
 			return exprResult{}, err
 		}
-		return exprResult{cell: si.ptr, temp: true, elemSize: si.elemSize, elemCount: 255, elemType: si.elemType, elemSlice: si.elemSlice, elemPtrType: si.elemPtrType, isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+		return exprResult{cell: si.ptr, temp: true, elemSize: si.elemSize,
+			elemCount: 255, elemType: si.elemType, elemIntSize: si.elemIntSize,
+			elemSlice: si.elemSlice, elemPtrType: si.elemPtrType,
+			isPointer: true, lenCell: si.len, capCell: si.cap}, nil
 	default:
 		return exprResult{}, fmt.Errorf("unsupported expression: %T", expr)
 	}
@@ -4210,16 +5175,29 @@ func (l *Lowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 func (l *Lowerer) lowerLiteral(e *ast.BasicLit) (exprResult, error) {
 	switch e.Kind {
 	case token.INT:
-		val, err := strconv.ParseInt(e.Value, 0, 64)
+		val, err := strconv.ParseUint(e.Value, 0, 64)
 		if err != nil {
 			return exprResult{}, err
 		}
-		if val < 0 || val > 255 {
-			return exprResult{}, fmt.Errorf("integer literal %d out of byte range (0-255)", val)
+		n := 1
+		switch {
+		case val > math.MaxUint32:
+			n = 8
+		case val > math.MaxUint16:
+			n = 4
+		case val > math.MaxUint8:
+			n = 2
 		}
-		t := l.allocCell()
-		l.emit(&IRConst{Dst: t, Value: byte(val)})
-		return exprResult{cell: t, temp: true}, nil
+		if n == 1 {
+			t := l.allocCell()
+			l.emit(&IRConst{Dst: t, Value: byte(val)}) // #nosec G115
+			return exprResult{cell: t, temp: true}, nil
+		}
+		base := l.allocCells(n)
+		for j := range n {
+			l.emit(&IRConst{Dst: base + j, Value: byte(val >> (j * 8))}) // #nosec G115
+		}
+		return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
 	case token.CHAR:
 		s, err := strconv.Unquote(e.Value)
 		if err != nil {
@@ -4245,6 +5223,13 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		l.emit(&IRConst{Dst: t, Value: val})
 		return exprResult{cell: t, temp: true}, nil
 	}
+	if val, intSize, ok := l.lookupIntConst(e.Name); ok {
+		base := l.allocCells(intSize)
+		for j := range intSize {
+			l.emit(&IRConst{Dst: base + j, Value: byte(val >> (j * 8))}) // #nosec G115
+		}
+		return exprResult{cell: base, temp: true, size: intSize, intSize: intSize}, nil
+	}
 	if e.Name == "nil" {
 		t := l.allocCell()
 		l.emit(&IRZero{Dst: t})
@@ -4253,24 +5238,39 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 	cell, err := lookupVar(e.Name)
 	if err != nil {
 		// Fall back to composite types.
+		if base, ok := l.lookupIntCell(e.Name); ok {
+			n := l.lookupIntVarSize(e.Name)
+			return exprResult{cell: base, size: n, intSize: n}, nil
+		}
 		if si, ok := l.lookupStruct(e.Name); ok {
-			return exprResult{cell: si.base, size: si.def.Size, elemSize: 1, elemCount: si.def.Size, typeName: si.def.Name}, nil
+			return exprResult{cell: si.base, size: si.def.Size, elemSize: 1,
+				elemCount: si.def.Size, typeName: si.def.Name}, nil
 		}
 		if ai, ok := l.lookupArray(e.Name); ok {
-			return exprResult{cell: ai.base, size: ai.size, elemSize: ai.elemSize, elemCount: ai.count, elemType: ai.elemType, innerElemSize: ai.innerElemSize}, nil
+			return exprResult{cell: ai.base, size: ai.size, elemSize: ai.elemSize,
+				elemCount: ai.count, elemType: ai.elemType, elemIntSize: ai.elemIntSize,
+				innerElemSize: ai.innerElemSize, innerElemIntSize: ai.innerElemIntSize}, nil
 		}
 		if si, ok := l.lookupSlice(e.Name); ok {
-			return exprResult{cell: si.ptr, elemSize: si.elemSize, elemCount: 255, elemType: si.elemType, elemSlice: si.elemSlice, elemPtrType: si.elemPtrType, isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+			return exprResult{cell: si.ptr, elemSize: si.elemSize,
+				elemCount: 255, elemType: si.elemType, elemIntSize: si.elemIntSize,
+				elemSlice: si.elemSlice, elemPtrType: si.elemPtrType,
+				isPointer: true, lenCell: si.len, capCell: si.cap}, nil
 		}
 		return exprResult{}, err
 	}
 	// Pointer-to-array: return as indexable pointer.
 	if ptrAI, ok := l.lookupPtrArray(e.Name); ok {
-		return exprResult{cell: cell, elemSize: ptrAI.elemSize, elemCount: ptrAI.count, elemType: ptrAI.elemType, isPointer: true}, nil
+		return exprResult{cell: cell, elemSize: ptrAI.elemSize,
+			elemCount: ptrAI.count, elemType: ptrAI.elemType, isPointer: true}, nil
 	}
 	// Pointer-to-struct: return as indexable pointer (fields as byte offsets).
 	if ptrDef, ok := l.lookupPtrType(e.Name); ok {
-		return exprResult{cell: cell, size: ptrDef.Size, elemSize: 1, elemCount: ptrDef.Size, typeName: ptrDef.Name, isPointer: true}, nil
+		return exprResult{cell: cell, size: ptrDef.Size, elemSize: 1,
+			elemCount: ptrDef.Size, typeName: ptrDef.Name, isPointer: true}, nil
+	}
+	if n := l.lookupPtrIntSize(e.Name); n >= 2 {
+		return exprResult{cell: cell, ptrIntSize: n}, nil
 	}
 	return exprResult{cell: cell}, nil
 }
@@ -4285,6 +5285,10 @@ func (l *Lowerer) lowerDerefAssign(ptr, rhs ast.Expr) error {
 	if err != nil {
 		return err
 	}
+	if n := p.ptrIntSize; n >= 2 && r.intSize >= 2 {
+		l.lowerDerefAssignInt(p.cell, n, r)
+		return nil
+	}
 	t := l.allocCell()
 	l.emitCopyOrMove(t, r)
 	l.ptrStore(p.cell, t)
@@ -4293,6 +5297,26 @@ func (l *Lowerer) lowerDerefAssign(ptr, rhs ast.Expr) error {
 		l.freeCell(p.cell)
 	}
 	return nil
+}
+
+// lowerDerefAssignInt handles *p = val for multi-byte integer pointers.
+func (l *Lowerer) lowerDerefAssignInt(pCell Cell, ptrIntSize int, r exprResult) {
+	idx := l.allocCell()
+	l.emit(&IRCopy{Dst: idx, Src: pCell})
+	for j := range ptrIntSize {
+		t := l.allocCell()
+		if r.temp {
+			l.emit(&IRMove{Dst: t, Src: r.cell + j})
+		} else {
+			l.emit(&IRCopy{Dst: t, Src: r.cell + j})
+		}
+		l.ptrStore(idx, t)
+		l.freeCell(t)
+		if j < ptrIntSize-1 {
+			l.emit(&IRAddI{Dst: idx, Value: 1})
+		}
+	}
+	l.freeCell(idx)
 }
 
 // ptrLoad reads a byte from the stack slot whose index is in idx.
@@ -4334,6 +5358,12 @@ func (l *Lowerer) ptrDynIndex(ptr Cell, indexExpr ast.Expr, elemSize int) (Cell,
 	if err != nil {
 		return 0, err
 	}
+	if idxR.intSize >= 2 {
+		if idxR.temp {
+			l.freeCellRange(idxR.cell, idxR.intSize)
+		}
+		return 0, fmt.Errorf("cannot use multi-byte integer as array index, use byte() to truncate")
+	}
 	l.emitCopyOrMove(idx, idxR)
 	if elemSize > 1 {
 		es := l.allocCell()
@@ -4365,6 +5395,11 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 			l.emit(&IRConst{Dst: t, Value: byte(slotOf(ai.base))}) // #nosec G115
 			return exprResult{cell: t, temp: true}, nil
 		}
+		if base, ok := l.lookupIntCell(e.Name); ok {
+			t := l.allocCell()
+			l.emit(&IRConst{Dst: t, Value: byte(slotOf(base))}) // #nosec G115
+			return exprResult{cell: t, temp: true, ptrIntSize: l.lookupIntVarSize(e.Name)}, nil
+		}
 		cell, err := l.lookupVar(e.Name)
 		if err != nil {
 			return exprResult{}, err
@@ -4387,6 +5422,9 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 			if si.elemType != "" {
 				r.isPointer = true
 				r.typeName = si.elemType
+			}
+			if si.elemIntSize >= 2 {
+				r.ptrIntSize = si.elemIntSize
 			}
 			return r, nil
 		}
@@ -4422,6 +5460,9 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 			r.isPointer = true
 			r.typeName = ai.elemType
 		}
+		if ai.elemIntSize >= 2 {
+			r.ptrIntSize = ai.elemIntSize
+		}
 		return r, nil
 	case *ast.SelectorExpr:
 		// &p.x -- base slot + field offset
@@ -4431,7 +5472,11 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		}
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: byte(slotOf(r.cell))}) // #nosec G115
-		return exprResult{cell: t, temp: true}, nil
+		res := exprResult{cell: t, temp: true}
+		if r.intSize >= 2 {
+			res.ptrIntSize = r.intSize
+		}
+		return res, nil
 	case *ast.CompositeLit:
 		// &Point{x: 1, y: 2} -- lower into cells, return pointer.
 		if def := l.structDef(e.Type); def != nil {
@@ -4468,6 +5513,21 @@ func (l *Lowerer) lowerDeref(expr ast.Expr) (exprResult, error) {
 	if err != nil {
 		return exprResult{}, err
 	}
+	if n := r.ptrIntSize; n >= 2 {
+		base := l.allocCells(n)
+		idx := l.allocCell()
+		l.emit(&IRCopy{Dst: idx, Src: r.cell})
+		for j := range n {
+			val := l.ptrLoad(idx)
+			l.emit(&IRMove{Dst: base + j, Src: val})
+			l.freeCell(val)
+			if j < n-1 {
+				l.emit(&IRAddI{Dst: idx, Value: 1})
+			}
+		}
+		l.freeCell(idx)
+		return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
+	}
 	result := l.ptrLoad(r.cell)
 	if r.temp {
 		l.freeCell(r.cell)
@@ -4480,6 +5540,10 @@ func (l *Lowerer) lowerUnary(e *ast.UnaryExpr, lowerExpr func(ast.Expr) (exprRes
 	if err != nil {
 		return exprResult{}, err
 	}
+	// Multi-byte integer unary operations.
+	if operand.intSize >= 2 {
+		return l.lowerUnaryInt(e.Op, operand)
+	}
 	t := l.allocCell()
 	switch e.Op {
 	case token.NOT:
@@ -4491,10 +5555,10 @@ func (l *Lowerer) lowerUnary(e *ast.UnaryExpr, lowerExpr func(ast.Expr) (exprRes
 		l.freeCell(zero)
 	case token.XOR:
 		// ^x = 255 - x (bitwise complement for byte)
-		max := l.allocCell()
-		l.emit(&IRConst{Dst: max, Value: 255})
-		l.emit(&IRSub{Dst: t, Src1: max, Src2: operand.cell})
-		l.freeCell(max)
+		byteMax := l.allocCell()
+		l.emit(&IRConst{Dst: byteMax, Value: 255})
+		l.emit(&IRSub{Dst: t, Src1: byteMax, Src2: operand.cell})
+		l.freeCell(byteMax)
 	default:
 		l.freeCell(t)
 		return exprResult{}, fmt.Errorf("unsupported unary operator: %s", e.Op)
@@ -4503,6 +5567,185 @@ func (l *Lowerer) lowerUnary(e *ast.UnaryExpr, lowerExpr func(ast.Expr) (exprRes
 		l.freeCell(operand.cell)
 	}
 	return exprResult{cell: t, temp: true}, nil
+}
+
+// lowerUnaryInt handles unary operations on multi-byte integers.
+func (l *Lowerer) lowerUnaryInt(op token.Token, operand exprResult) (exprResult, error) {
+	n := operand.intSize
+	r := l.allocCells(n)
+	switch op {
+	case token.SUB:
+		byteMax := l.allocCell()
+		l.emit(&IRConst{Dst: byteMax, Value: 255})
+		for j := range n {
+			l.emit(&IRSub{Dst: r + j, Src1: byteMax, Src2: operand.cell + j})
+		}
+		l.freeCell(byteMax)
+		l.emitIncInt(r, n)
+	case token.XOR:
+		byteMax := l.allocCell()
+		l.emit(&IRConst{Dst: byteMax, Value: 255})
+		for j := range n {
+			l.emit(&IRSub{Dst: r + j, Src1: byteMax, Src2: operand.cell + j})
+		}
+		l.freeCell(byteMax)
+	default:
+		l.freeCellRange(r, n)
+		return exprResult{}, fmt.Errorf("unsupported unary operator for uint%d: %s", n*8, op)
+	}
+	if operand.temp {
+		l.freeCellRange(operand.cell, n)
+	}
+	return exprResult{cell: r, temp: true, size: n, intSize: n}, nil
+}
+
+func (l *Lowerer) lowerBinary(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprResult, error)) (exprResult, error) {
+	if e.Op == token.LAND || e.Op == token.LOR {
+		return l.lowerLogical(e, lowerExpr)
+	}
+
+	// Handle array/struct equality comparison.
+	if e.Op == token.EQL || e.Op == token.NEQ {
+		if r, ok, err := l.lowerCompositeCompare(e); ok {
+			return r, err
+		}
+	}
+
+	left, err := lowerExpr(e.X)
+	if err != nil {
+		return exprResult{}, err
+	}
+	right, err := lowerExpr(e.Y)
+	if err != nil {
+		return exprResult{}, err
+	}
+	// Multi-byte integer binary operations.
+	if left.intSize >= 2 || right.intSize >= 2 {
+		if e.Op != token.SHL && e.Op != token.SHR {
+			if left.intSize != right.intSize {
+				return exprResult{}, fmt.Errorf("mismatched integer sizes in %s, use explicit conversion", e.Op)
+			}
+		}
+		return l.lowerBinaryInt(e.Op, left, right)
+	}
+	t := l.allocCell()
+	switch e.Op {
+	case token.ADD:
+		l.emit(&IRAdd{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.SUB:
+		l.emit(&IRSub{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.MUL:
+		l.emit(&IRMul{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.QUO:
+		l.emit(&IRDiv{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.REM:
+		l.emit(&IRMod{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.AND:
+		l.emit(&IRAnd{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.OR:
+		l.emit(&IROr{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.XOR:
+		l.emit(&IRXor{Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.AND_NOT:
+		// a &^ b = a & (^b) = a & (255 - b)
+		comp := l.allocCell()
+		byteMax := l.allocCell()
+		l.emit(&IRConst{Dst: byteMax, Value: 255})
+		l.emit(&IRSub{Dst: comp, Src1: byteMax, Src2: right.cell})
+		l.freeCell(byteMax)
+		l.emit(&IRAnd{Dst: t, Src1: left.cell, Src2: comp})
+		l.freeCell(comp)
+	case token.SHL:
+		// x << n = x * (2^n)
+		pow := l.allocCell()
+		l.emit(&IRConst{Dst: pow, Value: 1})
+		cnt := l.allocCell()
+		l.emitCopyOrMove(cnt, right)
+		right.temp = false // consumed by emitCopyOrMove
+		l.emit(&IRLoop{Cond: cnt, Body: &IRBlock{Nodes: []IRNode{
+			&IRAdd{Dst: pow, Src1: pow, Src2: pow},
+			&IRSubI{Dst: cnt, Value: 1},
+		}}})
+		l.emit(&IRMul{Dst: t, Src1: left.cell, Src2: pow})
+		l.freeCell(pow)
+		l.freeCell(cnt)
+	case token.SHR:
+		// x >> n = x / (2^n)
+		pow := l.allocCell()
+		l.emit(&IRConst{Dst: pow, Value: 1})
+		cnt := l.allocCell()
+		l.emitCopyOrMove(cnt, right)
+		right.temp = false // consumed by emitCopyOrMove
+		l.emit(&IRLoop{Cond: cnt, Body: &IRBlock{Nodes: []IRNode{
+			&IRAdd{Dst: pow, Src1: pow, Src2: pow},
+			&IRSubI{Dst: cnt, Value: 1},
+		}}})
+		l.emit(&IRDiv{Dst: t, Src1: left.cell, Src2: pow})
+		l.freeCell(pow)
+		l.freeCell(cnt)
+	case token.EQL:
+		l.emit(&IRCmp{Op: CmpEq, Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.NEQ:
+		l.emit(&IRCmp{Op: CmpNeq, Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.LSS:
+		l.emit(&IRCmp{Op: CmpLt, Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.GTR:
+		l.emit(&IRCmp{Op: CmpGt, Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.LEQ:
+		l.emit(&IRCmp{Op: CmpLeq, Dst: t, Src1: left.cell, Src2: right.cell})
+	case token.GEQ:
+		l.emit(&IRCmp{Op: CmpGeq, Dst: t, Src1: left.cell, Src2: right.cell})
+	default:
+		l.freeCell(t)
+		return exprResult{}, fmt.Errorf("unsupported binary operator: %s", e.Op)
+	}
+	if left.temp {
+		l.freeCell(left.cell)
+	}
+	if right.temp {
+		l.freeCell(right.cell)
+	}
+	return exprResult{cell: t, temp: true}, nil
+}
+
+func (l *Lowerer) lowerLogical(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprResult, error)) (exprResult, error) {
+	left, err := lowerExpr(e.X)
+	if err != nil {
+		return exprResult{}, err
+	}
+	result := l.allocCell()
+	saved := l.nodes
+
+	// Block that evaluates the right operand into result.
+	l.nodes = nil
+	right, err := lowerExpr(e.Y)
+	if err != nil {
+		return exprResult{}, err
+	}
+	l.emitCopyOrMove(result, right)
+	rightBlock := &IRBlock{Nodes: l.nodes}
+
+	// Block that sets the short-circuit value (0 for LAND, 1 for LOR).
+	var shortVal byte
+	if e.Op == token.LOR {
+		shortVal = 1
+	}
+	l.nodes = nil
+	l.emit(&IRConst{Dst: result, Value: shortVal})
+	shortBlock := &IRBlock{Nodes: l.nodes}
+
+	// LAND: if left then right else 0. LOR: if left then 1 else right.
+	l.nodes = saved
+	thenBlock, elseBlock := rightBlock, shortBlock
+	if e.Op == token.LOR {
+		thenBlock, elseBlock = shortBlock, rightBlock
+	}
+	l.emit(&IRIf{Cond: left.cell, Then: thenBlock, Else: elseBlock})
+
+	if left.temp {
+		l.freeCell(left.cell)
+	}
+	return exprResult{cell: result, temp: true}, nil
 }
 
 // lowerCompositeCompare handles == and != for arrays and structs.
@@ -4582,152 +5825,564 @@ func (l *Lowerer) resolveCompositeOperand(expr ast.Expr) (Cell, int, int) {
 	return 0, -1, 0
 }
 
-func (l *Lowerer) lowerBinary(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprResult, error)) (exprResult, error) {
-	if e.Op == token.LAND || e.Op == token.LOR {
-		return l.lowerLogical(e, lowerExpr)
-	}
+// lowerBinaryInt handles binary operations on multi-byte integer values.
+func (l *Lowerer) lowerBinaryInt(op token.Token, left, right exprResult) (exprResult, error) {
+	n := left.intSize
+	r := l.allocCells(n)
 
-	// Handle array/struct equality comparison.
-	if e.Op == token.EQL || e.Op == token.NEQ {
-		if r, ok, err := l.lowerCompositeCompare(e); ok {
-			return r, err
-		}
-	}
-
-	left, err := lowerExpr(e.X)
-	if err != nil {
-		return exprResult{}, err
-	}
-	right, err := lowerExpr(e.Y)
-	if err != nil {
-		return exprResult{}, err
-	}
-	t := l.allocCell()
-	switch e.Op {
+	switch op {
 	case token.ADD:
-		l.emit(&IRAdd{Dst: t, Src1: left.cell, Src2: right.cell})
+		l.emitAddInt(r, left.cell, right.cell, n)
 	case token.SUB:
-		l.emit(&IRSub{Dst: t, Src1: left.cell, Src2: right.cell})
+		l.emitSubInt(r, left.cell, right.cell, n)
 	case token.MUL:
-		l.emit(&IRMul{Dst: t, Src1: left.cell, Src2: right.cell})
+		l.emitMulInt(r, left.cell, right.cell, n)
 	case token.QUO:
-		l.emit(&IRDiv{Dst: t, Src1: left.cell, Src2: right.cell})
+		l.emitDivModInt(r, left.cell, right.cell, n, false)
 	case token.REM:
-		l.emit(&IRMod{Dst: t, Src1: left.cell, Src2: right.cell})
+		l.emitDivModInt(r, left.cell, right.cell, n, true)
 	case token.AND:
-		l.emit(&IRAnd{Dst: t, Src1: left.cell, Src2: right.cell})
+		for j := range n {
+			l.emit(&IRAnd{Dst: r + j, Src1: left.cell + j, Src2: right.cell + j})
+		}
 	case token.OR:
-		l.emit(&IROr{Dst: t, Src1: left.cell, Src2: right.cell})
+		for j := range n {
+			l.emit(&IROr{Dst: r + j, Src1: left.cell + j, Src2: right.cell + j})
+		}
 	case token.XOR:
-		l.emit(&IRXor{Dst: t, Src1: left.cell, Src2: right.cell})
+		for j := range n {
+			l.emit(&IRXor{Dst: r + j, Src1: left.cell + j, Src2: right.cell + j})
+		}
 	case token.AND_NOT:
-		// a &^ b = a & (^b) = a & (255 - b)
-		comp := l.allocCell()
-		max := l.allocCell()
-		l.emit(&IRConst{Dst: max, Value: 255})
-		l.emit(&IRSub{Dst: comp, Src1: max, Src2: right.cell})
-		l.freeCell(max)
-		l.emit(&IRAnd{Dst: t, Src1: left.cell, Src2: comp})
-		l.freeCell(comp)
+		byteMax := l.allocCell()
+		l.emit(&IRConst{Dst: byteMax, Value: 255})
+		for j := range n {
+			comp := l.allocCell()
+			l.emit(&IRSub{Dst: comp, Src1: byteMax, Src2: right.cell + j})
+			l.emit(&IRAnd{Dst: r + j, Src1: left.cell + j, Src2: comp})
+			l.freeCell(comp)
+		}
+		l.freeCell(byteMax)
 	case token.SHL:
-		// x << n = x * (2^n)
-		pow := l.allocCell()
-		l.emit(&IRConst{Dst: pow, Value: 1})
-		cnt := l.allocCell()
-		l.emitCopyOrMove(cnt, right)
-		right.temp = false // consumed by emitCopyOrMove
-		l.emit(&IRLoop{Cond: cnt, Body: &IRBlock{Nodes: []IRNode{
-			&IRAdd{Dst: pow, Src1: pow, Src2: pow},
-			&IRSubI{Dst: cnt, Value: 1},
-		}}})
-		l.emit(&IRMul{Dst: t, Src1: left.cell, Src2: pow})
-		l.freeCell(pow)
-		l.freeCell(cnt)
+		if right.intSize >= 2 {
+			l.freeCellRange(r, n)
+			return exprResult{}, fmt.Errorf("shift count must be byte, not uint%d", right.intSize*8)
+		}
+		l.emitShiftInt(r, left.cell, right.cell, n, false)
 	case token.SHR:
-		// x >> n = x / (2^n)
-		pow := l.allocCell()
-		l.emit(&IRConst{Dst: pow, Value: 1})
-		cnt := l.allocCell()
-		l.emitCopyOrMove(cnt, right)
-		right.temp = false // consumed by emitCopyOrMove
-		l.emit(&IRLoop{Cond: cnt, Body: &IRBlock{Nodes: []IRNode{
-			&IRAdd{Dst: pow, Src1: pow, Src2: pow},
-			&IRSubI{Dst: cnt, Value: 1},
-		}}})
-		l.emit(&IRDiv{Dst: t, Src1: left.cell, Src2: pow})
-		l.freeCell(pow)
-		l.freeCell(cnt)
-	case token.EQL:
-		l.emit(&IRCmp{Op: CmpEq, Dst: t, Src1: left.cell, Src2: right.cell})
-	case token.NEQ:
-		l.emit(&IRCmp{Op: CmpNeq, Dst: t, Src1: left.cell, Src2: right.cell})
-	case token.LSS:
-		l.emit(&IRCmp{Op: CmpLt, Dst: t, Src1: left.cell, Src2: right.cell})
-	case token.GTR:
-		l.emit(&IRCmp{Op: CmpGt, Dst: t, Src1: left.cell, Src2: right.cell})
-	case token.LEQ:
-		l.emit(&IRCmp{Op: CmpLeq, Dst: t, Src1: left.cell, Src2: right.cell})
-	case token.GEQ:
-		l.emit(&IRCmp{Op: CmpGeq, Dst: t, Src1: left.cell, Src2: right.cell})
+		if right.intSize >= 2 {
+			l.freeCellRange(r, n)
+			return exprResult{}, fmt.Errorf("shift count must be byte, not uint%d", right.intSize*8)
+		}
+		l.emitShiftInt(r, left.cell, right.cell, n, true)
+	case token.EQL, token.NEQ, token.LSS, token.GTR, token.LEQ, token.GEQ:
+		l.freeCellRange(r+1, n-1) // comparisons return 1 cell
+		l.emitCmpInt(r, op, left.cell, right.cell, n)
+		if left.temp {
+			l.freeCellRange(left.cell, n)
+		}
+		if right.temp {
+			l.freeCellRange(right.cell, n)
+		}
+		return exprResult{cell: r, temp: true}, nil
 	default:
-		l.freeCell(t)
-		return exprResult{}, fmt.Errorf("unsupported binary operator: %s", e.Op)
+		l.freeCellRange(r, n)
+		return exprResult{}, fmt.Errorf("unsupported uint%d operator: %s", n*8, op)
 	}
+
 	if left.temp {
-		l.freeCell(left.cell)
+		l.freeCellRange(left.cell, left.cellCount())
 	}
 	if right.temp {
-		l.freeCell(right.cell)
+		l.freeCellRange(right.cell, right.cellCount())
 	}
-	return exprResult{cell: t, temp: true}, nil
+	return exprResult{cell: r, temp: true, size: n, intSize: n}, nil
 }
 
-func (l *Lowerer) lowerLogical(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprResult, error)) (exprResult, error) {
-	left, err := lowerExpr(e.X)
-	if err != nil {
-		return exprResult{}, err
+// emitAddInt computes r = a + b for n-byte integers with carry chain.
+func (l *Lowerer) emitAddInt(r, a, b Cell, n int) {
+	// General N-byte add with chained carry.
+	carry := l.allocCell()
+	l.emit(&IRZero{Dst: carry})
+	for j := range n {
+		// r[j] = a[j] + b[j]
+		l.emit(&IRAdd{Dst: r + j, Src1: a + j, Src2: b + j})
+		// r[j] += carry from previous byte
+		old := l.allocCell()
+		l.emit(&IRCopy{Dst: old, Src: r + j})
+		cond := l.allocCell()
+		l.emit(&IRCopy{Dst: cond, Src: carry})
+		l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: []IRNode{
+			&IRAddI{Dst: r + j, Value: 1},
+		}}})
+		l.freeCell(cond)
+		if j < n-1 {
+			// Compute new carry: (r[j] < a[j]) OR (carry was 1 AND r[j] == old,
+			// meaning the +1 wrapped). Simplified: carry = (r[j] < a[j]) OR
+			// (old carry AND r[j] == 0 after adding carry).
+			// Easier: carry = (a[j] + b[j] overflowed) OR (adding carry overflowed)
+			c1 := l.allocCell()
+			l.emit(&IRCmp{Op: CmpLt, Dst: c1, Src1: old, Src2: a + j}) // a+b overflowed
+			c2 := l.allocCell()
+			l.emit(&IRCopy{Dst: c2, Src: r + j})
+			l.emit(&IRNot{Dst: c2, Src: c2})               // r[j]==0 means carry addition wrapped
+			l.emit(&IRMul{Dst: c2, Src1: c2, Src2: carry}) // only if carry was set
+			// carry = c1 OR c2
+			combined := l.allocCell()
+			l.emit(&IRAdd{Dst: combined, Src1: c1, Src2: c2})
+			prod := l.allocCell()
+			l.emit(&IRMul{Dst: prod, Src1: c1, Src2: c2})
+			l.emit(&IRSub{Dst: carry, Src1: combined, Src2: prod})
+			l.freeCell(prod)
+			l.freeCell(combined)
+			l.freeCell(c2)
+			l.freeCell(c1)
+		}
+		l.freeCell(old)
 	}
-	result := l.allocCell()
+	l.freeCell(carry)
+}
+
+// emitSubInt computes r = a - b for n-byte integers with borrow chain.
+func (l *Lowerer) emitSubInt(r, a, b Cell, n int) {
+	// General N-byte subtraction with chained borrow.
+	borrow := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: borrow, Src1: a, Src2: b})
+	l.emit(&IRSub{Dst: r, Src1: a, Src2: b})
+	for j := 1; j < n; j++ {
+		l.emit(&IRSub{Dst: r + j, Src1: a + j, Src2: b + j})
+		// Apply borrow from previous byte.
+		cond := l.allocCell()
+		l.emit(&IRCopy{Dst: cond, Src: borrow})
+		if j < n-1 {
+			// Before decrementing, check if r[j] is 0 (will wrap on borrow).
+			isZero := l.allocCell()
+			l.emit(&IRCopy{Dst: isZero, Src: r + j})
+			l.emit(&IRNot{Dst: isZero, Src: isZero})
+			// newBorrow = borrow AND (r[j] == 0) -- borrow chains if r[j] wraps.
+			newBorrow := l.allocCell()
+			l.emit(&IRMul{Dst: newBorrow, Src1: borrow, Src2: isZero})
+			l.freeCell(isZero)
+			// Also check if a[j] < b[j] for a fresh borrow (independent of chain).
+			freshBorrow := l.allocCell()
+			l.emit(&IRCmp{Op: CmpLt, Dst: freshBorrow, Src1: a + j, Src2: b + j})
+			// Combined borrow = newBorrow OR freshBorrow.
+			// OR via: a|b = a + b - a*b (for 0/1 values).
+			combined := l.allocCell()
+			l.emit(&IRAdd{Dst: combined, Src1: newBorrow, Src2: freshBorrow})
+			prod := l.allocCell()
+			l.emit(&IRMul{Dst: prod, Src1: newBorrow, Src2: freshBorrow})
+			l.emit(&IRSub{Dst: borrow, Src1: combined, Src2: prod})
+			l.freeCell(prod)
+			l.freeCell(combined)
+			l.freeCell(freshBorrow)
+			l.freeCell(newBorrow)
+		}
+		l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: []IRNode{
+			&IRSubI{Dst: r + j, Value: 1},
+		}}})
+		l.freeCell(cond)
+	}
+	l.freeCell(borrow)
+}
+
+// emitMulInt multiplies two n-byte integers into an n-byte result.
+// For each byte b[k] of the multiplier, add a << (k*8) repeated b[k] times.
+func (l *Lowerer) emitMulInt(r, a, b Cell, n int) {
+	for j := range n {
+		l.emit(&IRZero{Dst: r + j})
+	}
+	// Schoolbook multiplication: for each byte pair (a[i], b[j]),
+	// add a[i] to r[i+j] exactly b[j] times with carry propagation.
+	for j := range n {
+		for i := range n {
+			if i+j >= n {
+				break // overflow beyond result width
+			}
+			cnt := l.allocCell()
+			l.emit(&IRCopy{Dst: cnt, Src: b + j})
+			saved := l.nodes
+			l.nodes = nil
+			// r[i+j] += a[i], with carry to r[i+j+1..].
+			old := l.allocCell()
+			l.emit(&IRCopy{Dst: old, Src: r + i + j})
+			tmp := l.allocCell()
+			l.emit(&IRAdd{Dst: tmp, Src1: r + i + j, Src2: a + i})
+			l.emit(&IRMove{Dst: r + i + j, Src: tmp})
+			l.freeCell(tmp)
+			if i+j < n-1 {
+				carry := l.allocCell()
+				l.emit(&IRCmp{Op: CmpLt, Dst: carry, Src1: r + i + j, Src2: old})
+				// Propagate carry through higher bytes. Inside the IF body
+				// the carry is known to be 1, so the next-higher carry is
+				// just `r[k] == 0` after the increment -- no need to AND
+				// with the old carry. IRIf zeroes its cond, so we pass
+				// carry directly and replace it with newCarry each step.
+				for k := i + j + 1; k < n; k++ {
+					if k < n-1 {
+						newCarry := l.allocCell()
+						l.emit(&IRZero{Dst: newCarry})
+						l.emit(&IRIf{Cond: carry, Then: &IRBlock{Nodes: []IRNode{
+							&IRAddI{Dst: r + k, Value: 1},
+							&IRNot{Dst: newCarry, Src: r + k},
+						}}})
+						l.freeCell(carry)
+						carry = newCarry
+					} else {
+						l.emit(&IRIf{Cond: carry, Then: &IRBlock{Nodes: []IRNode{
+							&IRAddI{Dst: r + k, Value: 1},
+						}}})
+					}
+				}
+				l.freeCell(carry)
+			}
+			l.freeCell(old)
+			l.emit(&IRSubI{Dst: cnt, Value: 1})
+			body := &IRBlock{Nodes: l.nodes}
+			l.nodes = saved
+			l.emit(&IRLoop{Cond: cnt, Body: body})
+			l.freeCell(cnt)
+		}
+	}
+}
+
+// emitDivModInt computes a / b (or a % b) for n-byte integers by delegating
+// to emitDivModIntFused and discarding the unused output.
+func (l *Lowerer) emitDivModInt(r, a, b Cell, n int, isMod bool) {
+	discard := l.allocCells(n)
+	if isMod {
+		l.emitDivModIntFused(discard, r, a, b, n)
+	} else {
+		l.emitDivModIntFused(r, discard, a, b, n)
+	}
+	l.freeCellRange(discard, n)
+}
+
+// emitDivModIntFused computes both a / b and a % b for n-byte integers using
+// bit-by-bit schoolbook long division. The quotient and remainder are computed
+// in a single pass over 8*n iterations regardless of the input values, which
+// is much faster than repeated subtraction when the quotient is large.
+//
+// Algorithm: a 2n-byte combined register RQ starts as (R=0, Q=a). Each
+// iteration shifts RQ left by one bit. The bit shifted out of R is held as
+// `over`. After the shift, if over is set or R >= b, then R -= b (mod 2^(8n))
+// and the new low bit of Q is set to 1. After 8*n iterations, R holds the
+// remainder and Q holds the quotient.
+func (l *Lowerer) emitDivModIntFused(quotDst, remDst, a, b Cell, n int) {
+	// Allocate Q and R contiguously as a single 2n-byte buffer (Q low, R high)
+	// so the combined left-shift can walk the cells in a single pass.
+	combined := l.allocCells(2 * n)
+	quot := combined
+	rem := combined + n
+	for j := range n {
+		l.emit(&IRCopy{Dst: quot + j, Src: a + j})
+		l.emit(&IRZero{Dst: rem + j})
+	}
+	counter := l.allocCell()
+	l.emit(&IRConst{Dst: counter, Value: byte(8 * n)}) // #nosec G115
 	saved := l.nodes
-
-	switch e.Op {
-	case token.LAND:
-		l.nodes = nil
-		right, err := lowerExpr(e.Y)
-		if err != nil {
-			return exprResult{}, err
-		}
-		l.emitCopyOrMove(result, right)
-		thenBlock := &IRBlock{Nodes: l.nodes}
-
-		l.nodes = nil
-		l.emit(&IRConst{Dst: result, Value: 0})
-		elseBlock := &IRBlock{Nodes: l.nodes}
-
-		l.nodes = saved
-		l.emit(&IRIf{Cond: left.cell, Then: thenBlock, Else: elseBlock})
-
-	case token.LOR:
-		l.nodes = nil
-		l.emit(&IRConst{Dst: result, Value: 1})
-		thenBlock := &IRBlock{Nodes: l.nodes}
-
-		l.nodes = nil
-		right, err := lowerExpr(e.Y)
-		if err != nil {
-			return exprResult{}, err
-		}
-		l.emitCopyOrMove(result, right)
-		elseBlock := &IRBlock{Nodes: l.nodes}
-
-		l.nodes = saved
-		l.emit(&IRIf{Cond: left.cell, Then: thenBlock, Else: elseBlock})
+	l.nodes = nil
+	// Save high bit of R[n-1] before the shift discards it.
+	over := l.allocCell()
+	c128 := l.allocCell()
+	l.emit(&IRConst{Dst: c128, Value: 128})
+	l.emit(&IRCmp{Op: CmpGeq, Dst: over, Src1: rem + n - 1, Src2: c128})
+	l.freeCell(c128)
+	// Shift the combined 2n-byte RQ register left by one bit.
+	l.emitShiftLeftIntByOne(combined, 2*n)
+	// should = over OR (R >= b). If true, R -= b and Q[0] |= 1.
+	cmp := l.allocCell()
+	l.emitCmpGeqInt(cmp, rem, b, n)
+	sum := l.allocCell()
+	prod := l.allocCell()
+	l.emit(&IRAdd{Dst: sum, Src1: over, Src2: cmp})
+	l.emit(&IRMul{Dst: prod, Src1: over, Src2: cmp})
+	should := l.allocCell()
+	l.emit(&IRSub{Dst: should, Src1: sum, Src2: prod})
+	l.freeCell(prod)
+	l.freeCell(sum)
+	l.freeCell(cmp)
+	l.freeCell(over)
+	thenSaved := l.nodes
+	l.nodes = nil
+	l.emitSubIntInPlace(rem, b, n)
+	l.emit(&IRAddI{Dst: quot, Value: 1})
+	thenBlock := &IRBlock{Nodes: l.nodes}
+	l.nodes = thenSaved
+	l.emit(&IRIf{Cond: should, Then: thenBlock})
+	l.freeCell(should)
+	l.emit(&IRSubI{Dst: counter, Value: 1})
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+	l.emit(&IRLoop{Cond: counter, Body: body})
+	l.freeCell(counter)
+	for j := range n {
+		l.emit(&IRMove{Dst: quotDst + j, Src: quot + j})
+		l.emit(&IRMove{Dst: remDst + j, Src: rem + j})
 	}
+	l.freeCellRange(combined, 2*n)
+}
 
-	if left.temp {
-		l.freeCell(left.cell)
+// emitSubIntInPlace subtracts b from a in place for n-byte integers.
+func (l *Lowerer) emitSubIntInPlace(a, b Cell, n int) {
+	// General N-byte in-place subtraction with chained borrow.
+	borrow := l.allocCell()
+	l.emit(&IRCmp{Op: CmpLt, Dst: borrow, Src1: a, Src2: b})
+	newVal := l.allocCell()
+	l.emit(&IRSub{Dst: newVal, Src1: a, Src2: b})
+	l.emit(&IRMove{Dst: a, Src: newVal})
+	l.freeCell(newVal)
+	for j := 1; j < n; j++ {
+		// Save a[j] before modification for borrow detection.
+		old := l.allocCell()
+		l.emit(&IRCopy{Dst: old, Src: a + j})
+		// a[j] -= b[j]
+		nv := l.allocCell()
+		l.emit(&IRSub{Dst: nv, Src1: a + j, Src2: b + j})
+		l.emit(&IRMove{Dst: a + j, Src: nv})
+		l.freeCell(nv)
+		// Apply borrow from previous byte.
+		cond := l.allocCell()
+		l.emit(&IRCopy{Dst: cond, Src: borrow})
+		l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: []IRNode{
+			&IRSubI{Dst: a + j, Value: 1},
+		}}})
+		l.freeCell(cond)
+		if j < n-1 {
+			// Compute new borrow: (old < b[j]) OR (borrow AND a[j] wrapped to 255).
+			freshBorrow := l.allocCell()
+			l.emit(&IRCmp{Op: CmpLt, Dst: freshBorrow, Src1: old, Src2: b + j})
+			// Check if borrow-subtract wrapped (a[j]==255 and borrow was set).
+			c255 := l.allocCell()
+			l.emit(&IRConst{Dst: c255, Value: 255})
+			wrapped := l.allocCell()
+			l.emit(&IRCmp{Op: CmpEq, Dst: wrapped, Src1: a + j, Src2: c255})
+			l.freeCell(c255)
+			l.emit(&IRMul{Dst: wrapped, Src1: wrapped, Src2: borrow})
+			// borrow = freshBorrow OR wrapped
+			combined := l.allocCell()
+			l.emit(&IRAdd{Dst: combined, Src1: freshBorrow, Src2: wrapped})
+			prod := l.allocCell()
+			l.emit(&IRMul{Dst: prod, Src1: freshBorrow, Src2: wrapped})
+			l.emit(&IRSub{Dst: borrow, Src1: combined, Src2: prod})
+			l.freeCell(prod)
+			l.freeCell(combined)
+			l.freeCell(wrapped)
+			l.freeCell(freshBorrow)
+		}
+		l.freeCell(old)
 	}
-	return exprResult{cell: result, temp: true}, nil
+	l.freeCell(borrow)
+}
+
+// emitShiftInt shifts an n-byte integer left (right=false) or right (right=true)
+// by cnt bits (cnt is a byte cell). Splits cnt into a whole-byte shift and a
+// sub-byte bit shift via divmod by 8, running the cheap whole-byte loop first
+// and the bit-by-bit loop only for the remainder. This is much faster than 8*N
+// single-bit shifts when cnt is large (e.g., uint64 << 56 takes 7 byte-shifts
+// instead of 56 bit-shifts).
+func (l *Lowerer) emitShiftInt(r, a, cnt Cell, n int, right bool) {
+	for j := range n {
+		l.emit(&IRCopy{Dst: r + j, Src: a + j})
+	}
+	byteCount := l.allocCell()
+	bitCount := l.allocCell()
+	eight := l.allocCell()
+	l.emit(&IRConst{Dst: eight, Value: 8})
+	l.emit(&IRDivMod{Src1: cnt, Src2: eight, QuotDst: byteCount, RemDst: bitCount})
+	l.freeCell(eight)
+
+	main := l.nodes
+	l.nodes = nil
+	if right {
+		l.emitShiftRightIntByByte(r, n)
+	} else {
+		l.emitShiftLeftIntByByte(r, n)
+	}
+	l.emit(&IRSubI{Dst: byteCount, Value: 1})
+	byteBody := &IRBlock{Nodes: l.nodes}
+	l.nodes = main
+	l.emit(&IRLoop{Cond: byteCount, Body: byteBody})
+	l.freeCell(byteCount)
+
+	main = l.nodes
+	l.nodes = nil
+	if right {
+		l.emitShiftRightIntByOne(r, n)
+	} else {
+		l.emitShiftLeftIntByOne(r, n)
+	}
+	l.emit(&IRSubI{Dst: bitCount, Value: 1})
+	bitBody := &IRBlock{Nodes: l.nodes}
+	l.nodes = main
+	l.emit(&IRLoop{Cond: bitCount, Body: bitBody})
+	l.freeCell(bitCount)
+}
+
+// emitShiftLeftIntByByte shifts an n-byte little-endian integer left by 8 bits
+// (one whole byte) in place. The high byte is discarded; the low byte becomes 0.
+func (l *Lowerer) emitShiftLeftIntByByte(a Cell, n int) {
+	// Walk high to low so each byte is read before being overwritten by the
+	// next-lower one.
+	for j := n - 1; j > 0; j-- {
+		l.emit(&IRMove{Dst: a + j, Src: a + j - 1})
+	}
+	l.emit(&IRZero{Dst: a})
+}
+
+// emitShiftLeftIntByOne shifts an n-byte little-endian integer left by one bit
+// in place. The bit shifted out of the high byte is discarded.
+func (l *Lowerer) emitShiftLeftIntByOne(a Cell, n int) {
+	// Walk from high byte to low so each byte is read for its outgoing carry
+	// before being doubled.
+	for j := n - 1; j >= 0; j-- {
+		if j > 0 {
+			carry := l.allocCell()
+			c128 := l.allocCell()
+			l.emit(&IRConst{Dst: c128, Value: 128})
+			l.emit(&IRCmp{Op: CmpGeq, Dst: carry, Src1: a + j - 1, Src2: c128})
+			l.freeCell(c128)
+			newVal := l.allocCell()
+			l.emit(&IRAdd{Dst: newVal, Src1: a + j, Src2: a + j})
+			l.emit(&IRMove{Dst: a + j, Src: newVal})
+			l.freeCell(newVal)
+			l.emit(&IRIf{Cond: carry, Then: &IRBlock{Nodes: []IRNode{
+				&IRAddI{Dst: a + j, Value: 1},
+			}}})
+			l.freeCell(carry)
+		} else {
+			newVal := l.allocCell()
+			l.emit(&IRAdd{Dst: newVal, Src1: a, Src2: a})
+			l.emit(&IRMove{Dst: a, Src: newVal})
+			l.freeCell(newVal)
+		}
+	}
+}
+
+// emitShiftRightIntByByte shifts an n-byte little-endian integer right by 8 bits
+// (one whole byte) in place. The low byte is discarded; the high byte becomes 0.
+func (l *Lowerer) emitShiftRightIntByByte(a Cell, n int) {
+	// Walk low to high so each byte is read before being overwritten by the
+	// next-higher one.
+	for j := 0; j < n-1; j++ {
+		l.emit(&IRMove{Dst: a + j, Src: a + j + 1})
+	}
+	l.emit(&IRZero{Dst: a + n - 1})
+}
+
+// emitShiftRightIntByOne shifts an n-byte little-endian integer right by one bit
+// in place. The bit shifted out of the low byte is discarded.
+func (l *Lowerer) emitShiftRightIntByOne(r Cell, n int) {
+	for j := range n {
+		if j < n-1 {
+			// carry = low bit of r[j+1] (will become high bit of r[j] after shift)
+			carry := l.allocCell()
+			one := l.allocCell()
+			l.emit(&IRConst{Dst: one, Value: 1})
+			l.emit(&IRAnd{Dst: carry, Src1: r + j + 1, Src2: one})
+			l.freeCell(one)
+			newVal := l.allocCell()
+			two := l.allocCell()
+			l.emit(&IRConst{Dst: two, Value: 2})
+			l.emit(&IRDivMod{Src1: r + j, Src2: two, QuotDst: newVal, RemDst: two})
+			l.emit(&IRMove{Dst: r + j, Src: newVal})
+			l.freeCell(newVal)
+			l.freeCell(two)
+			l.emit(&IRIf{Cond: carry, Then: &IRBlock{Nodes: []IRNode{
+				&IRAddI{Dst: r + j, Value: 128},
+			}}})
+			l.freeCell(carry)
+		} else {
+			newVal := l.allocCell()
+			two := l.allocCell()
+			l.emit(&IRConst{Dst: two, Value: 2})
+			l.emit(&IRDivMod{Src1: r + j, Src2: two, QuotDst: newVal, RemDst: two})
+			l.emit(&IRMove{Dst: r + j, Src: newVal})
+			l.freeCell(newVal)
+			l.freeCell(two)
+		}
+	}
+}
+
+// emitCmpInt compares two n-byte integers. Writes 0 or 1 to dst.
+func (l *Lowerer) emitCmpInt(dst Cell, op token.Token, a, b Cell, n int) {
+	switch op {
+	case token.EQL:
+		l.emit(&IRConst{Dst: dst, Value: 1})
+		for j := range n {
+			eq := l.allocCell()
+			l.emit(&IRCmp{Op: CmpEq, Dst: eq, Src1: a + j, Src2: b + j})
+			l.emit(&IRMul{Dst: dst, Src1: dst, Src2: eq})
+			l.freeCell(eq)
+		}
+	case token.NEQ:
+		l.emit(&IRConst{Dst: dst, Value: 1})
+		for j := range n {
+			eq := l.allocCell()
+			l.emit(&IRCmp{Op: CmpEq, Dst: eq, Src1: a + j, Src2: b + j})
+			l.emit(&IRMul{Dst: dst, Src1: dst, Src2: eq})
+			l.freeCell(eq)
+		}
+		l.emit(&IRNot{Dst: dst, Src: dst})
+	case token.LSS:
+		l.emitCmpLtInt(dst, a, b, n)
+	case token.GTR:
+		l.emitCmpLtInt(dst, b, a, n)
+	case token.LEQ:
+		l.emitCmpGeqInt(dst, b, a, n) // a <= b iff b >= a
+	case token.GEQ:
+		l.emitCmpGeqInt(dst, a, b, n)
+	}
+}
+
+// emitCmpLtInt: dst = (a < b) for n-byte integers.
+func (l *Lowerer) emitCmpLtInt(dst, a, b Cell, n int) {
+	l.emitCmpOrderInt(dst, a, b, n, CmpLt, 0)
+}
+
+// emitCmpGeqInt: dst = (a >= b) for n-byte integers.
+func (l *Lowerer) emitCmpGeqInt(dst, a, b Cell, n int) {
+	l.emitCmpOrderInt(dst, a, b, n, CmpGeq, 1)
+}
+
+// emitCmpOrderInt computes dst = (a `op` b) for n-byte integers, where op is
+// CmpLt or CmpGeq. Walks bytes high to low; once the first non-equal pair is
+// found, sets dst to that pair's comparison and skips the rest via a runtime
+// `done` flag. Sequential per-byte IRIfs (rather than recursive nesting) keep
+// the codegen's live-cell pressure low for wider widths like uint64.
+//
+// initVal is the value of dst when all bytes are equal: 1 for CmpGeq, 0 for CmpLt.
+func (l *Lowerer) emitCmpOrderInt(dst, a, b Cell, n int, op CmpOp, initVal byte) {
+	if n == 1 {
+		l.emit(&IRCmp{Op: op, Dst: dst, Src1: a, Src2: b})
+		return
+	}
+	l.emit(&IRConst{Dst: dst, Value: initVal})
+	done := l.allocCell()
+	l.emit(&IRZero{Dst: done})
+	for j := n - 1; j >= 0; j-- {
+		// cond = !done AND a[j] != b[j]
+		notDone := l.allocCell()
+		l.emit(&IRCopy{Dst: notDone, Src: done})
+		l.emit(&IRNot{Dst: notDone, Src: notDone})
+		eq := l.allocCell()
+		l.emit(&IRCmp{Op: CmpEq, Dst: eq, Src1: a + j, Src2: b + j})
+		l.emit(&IRNot{Dst: eq, Src: eq})
+		cond := l.allocCell()
+		l.emit(&IRMul{Dst: cond, Src1: notDone, Src2: eq})
+		l.freeCell(eq)
+		l.freeCell(notDone)
+
+		saved := l.nodes
+		l.nodes = nil
+		l.emit(&IRCmp{Op: op, Dst: dst, Src1: a + j, Src2: b + j})
+		l.emit(&IRConst{Dst: done, Value: 1})
+		body := &IRBlock{Nodes: l.nodes}
+		l.nodes = saved
+		l.emit(&IRIf{Cond: cond, Then: body})
+		l.freeCell(cond)
+	}
+	l.freeCell(done)
 }
 
 func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
@@ -4773,12 +6428,19 @@ func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
 		def := l.result.Structs[info.ReturnType.StructType]
 		return exprResult{cell: retCells[0], temp: true, size: def.Size, typeName: info.ReturnType.StructType}, nil
 	}
+	if n := info.ReturnType.IntSize; n >= 2 {
+		return exprResult{cell: retCells[0], temp: true, size: n, intSize: n}, nil
+	}
 	if info.ReturnType.IsSlice {
 		return exprResult{
-			cell: retCells[0], temp: true, isPointer: true,
-			elemSize:  max(info.ReturnType.SliceElemSize, 1),
-			elemCount: 255, elemType: info.ReturnType.SliceElemType,
-			lenCell: retCells[1], capCell: retCells[2],
+			cell: retCells[0], temp: true,
+			elemSize:    max(info.ReturnType.SliceElemSize, 1),
+			elemCount:   255,
+			elemType:    info.ReturnType.SliceElemType,
+			elemIntSize: info.ReturnType.SliceElemIntSize,
+			isPointer:   true,
+			lenCell:     retCells[1],
+			capCell:     retCells[2],
 		}, nil
 	}
 	// Scalar return.
@@ -4794,12 +6456,77 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		return exprResult{}, false, nil
 	}
 	switch fn.Name {
-	case "byte":
+	case "byte", "uint8":
 		if len(call.Args) != 1 {
-			return exprResult{}, true, fmt.Errorf("byte() expects 1 argument")
+			return exprResult{}, true, fmt.Errorf("%s() expects 1 argument", fn.Name)
 		}
 		r, err := lowerExpr(call.Args[0])
+		if err != nil {
+			return exprResult{}, true, err
+		}
+		// Multi-byte int -> byte: truncate to low byte.
+		if r.intSize > 1 {
+			if r.temp {
+				for j := 1; j < r.intSize; j++ {
+					l.freeCell(r.cell + j)
+				}
+			}
+			return exprResult{cell: r.cell, temp: r.temp}, true, nil
+		}
 		return r, true, err
+	case "uint16", "uint32", "uint64":
+		n := intIdentSize(fn.Name)
+		if len(call.Args) != 1 {
+			return exprResult{}, true, fmt.Errorf("%s() expects 1 argument", fn.Name)
+		}
+		// Handle integer literal directly.
+		if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.INT {
+			val, err := strconv.ParseUint(lit.Value, 0, 64)
+			if err != nil {
+				return exprResult{}, true, err
+			}
+			maxVal := uint64(1)<<(n*8) - 1
+			if val > maxVal {
+				return exprResult{}, true, fmt.Errorf("integer literal %d out of %s range (0-%d)", val, fn.Name, maxVal)
+			}
+			base := l.allocCells(n)
+			for j := range n {
+				l.emit(&IRConst{Dst: base + j, Value: byte(val >> (j * 8))}) // #nosec G115
+			}
+			return exprResult{cell: base, temp: true, size: n, intSize: n}, true, nil
+		}
+		r, err := lowerExpr(call.Args[0])
+		if err != nil {
+			return exprResult{}, true, err
+		}
+		// Truncate wider integer.
+		if r.intSize >= n {
+			if r.intSize > n && r.temp {
+				for j := n; j < r.intSize; j++ {
+					l.freeCell(r.cell + j)
+				}
+			}
+			return exprResult{cell: r.cell, temp: r.temp, size: n, intSize: n}, true, nil
+		}
+		// Zero-extend smaller integer.
+		base := l.allocCells(n)
+		srcSize := max(r.intSize, 1)
+		for j := range srcSize {
+			if r.temp {
+				l.emit(&IRMove{Dst: base + j, Src: r.cell + j})
+			} else {
+				l.emit(&IRCopy{Dst: base + j, Src: r.cell + j})
+			}
+		}
+		for j := srcSize; j < n; j++ {
+			l.emit(&IRZero{Dst: base + j})
+		}
+		if r.temp {
+			// IRMove already zeroed source cells; free them.
+			// For byte (intSize 0), free 1 cell. For wider, free all.
+			l.freeCellRange(r.cell, srcSize)
+		}
+		return exprResult{cell: base, temp: true, size: n, intSize: n}, true, nil
 	case "len", "cap":
 		if len(call.Args) != 1 {
 			return exprResult{}, true, fmt.Errorf("%s() expects 1 argument", fn.Name)
@@ -4856,6 +6583,41 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		r, err := lowerExpr(call.Args[0])
 		if err != nil {
 			return exprResult{}, true, err
+		}
+		// Multi-byte path: keep an N-cell running result and use N-byte compare.
+		if r.intSize >= 2 {
+			n := r.intSize
+			t := l.allocCells(n)
+			l.emitCopyOrMove(t, r)
+			for _, arg := range call.Args[1:] {
+				r, err := lowerExpr(arg)
+				if err != nil {
+					return exprResult{}, true, err
+				}
+				if r.intSize != n {
+					if r.temp {
+						l.freeCellRange(r.cell, r.cellCount())
+					}
+					l.freeCellRange(t, n)
+					return exprResult{}, true, fmt.Errorf("%s: mismatched integer sizes", fn.Name)
+				}
+				cond := l.allocCell()
+				if cmpOp == CmpLeq {
+					l.emitCmpGeqInt(cond, t, r.cell, n) // r <= t iff t >= r
+				} else {
+					l.emitCmpLtInt(cond, t, r.cell, n) // r >= t iff t < r
+				}
+				body := []IRNode{}
+				for j := range n {
+					body = append(body, &IRCopy{Dst: t + j, Src: r.cell + j})
+				}
+				l.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: body}})
+				l.freeCell(cond)
+				if r.temp {
+					l.freeCellRange(r.cell, n)
+				}
+			}
+			return exprResult{cell: t, temp: true, size: n, intSize: n}, true, nil
 		}
 		t := l.allocCell()
 		l.emitCopyOrMove(t, r)
@@ -4946,10 +6708,27 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 			l.emit(&IRMove{Dst: inner.cap, Src: tmpCap})
 			l.freeCell(tmpCap)
 			l.freeCell(idx)
-			return exprResult{cell: inner.ptr, temp: true, elemSize: 1, elemCount: 255, isPointer: true, lenCell: inner.len, capCell: inner.cap}, nil
+			return exprResult{cell: inner.ptr, temp: true, elemSize: 1,
+				elemCount: 255, isPointer: true, lenCell: inner.len, capCell: inner.cap}, nil
 		}
-		// Multi-byte element: return pointer to sub-array.
-		return exprResult{cell: idx, temp: true, size: base.elemSize, elemSize: 1, elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, isPointer: true}, nil
+		// Multi-byte int element: materialize into a temp by loading N bytes.
+		if base.elemIntSize >= 2 {
+			n := base.elemIntSize
+			dst := l.allocCells(n)
+			for j := range n {
+				val := l.ptrLoad(idx)
+				l.emit(&IRMove{Dst: dst + j, Src: val})
+				l.freeCell(val)
+				if j < n-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			l.freeCell(idx)
+			return exprResult{cell: dst, temp: true, size: n, intSize: n}, nil
+		}
+		// Multi-byte struct element: return pointer to sub-array.
+		return exprResult{cell: idx, temp: true, size: base.elemSize, elemSize: 1,
+			elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, isPointer: true}, nil
 	}
 
 	// Flat-offset result: cell holds i*elemSize relative to flatBase.
@@ -4970,7 +6749,9 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 			}
 			l.emit(&IRAdd{Dst: base.cell, Src1: base.cell, Src2: t})
 			l.freeCell(t)
-			return exprResult{cell: base.cell, temp: true, elemSize: 1, elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, flatBase: base.flatBase}, nil
+			return exprResult{cell: base.cell, temp: true, elemSize: 1,
+				elemCount: base.elemSize, elemType: base.elemType,
+				typeName: base.elemType, flatBase: base.flatBase}, nil
 		}
 		// Scalar access on flat array.
 		totalSize := base.elemCount * base.elemSize
@@ -4991,6 +6772,10 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 			return exprResult{}, fmt.Errorf("array index %d out of bounds [0:%d]", constIdx, base.elemCount)
 		}
 		cell := base.cell + constIdx*base.elemSize
+		// Multi-byte int element: return a non-temp uint16/uint32/uint64 view.
+		if base.elemIntSize >= 2 {
+			return exprResult{cell: cell, size: base.elemIntSize, intSize: base.elemIntSize}, nil
+		}
 		r := exprResult{cell: cell, typeName: base.elemType}
 		if base.elemSize > 1 {
 			r.size = base.elemSize
@@ -4998,8 +6783,10 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 				// Nested array: preserve inner structure.
 				r.elemSize = base.innerElemSize
 				r.elemCount = base.elemSize / base.innerElemSize
-
 				r.elemType = base.elemType
+				if base.innerElemIntSize >= 2 {
+					r.elemIntSize = base.innerElemIntSize
+				}
 			} else {
 				r.elemSize = 1
 				r.elemCount = base.elemSize
@@ -5013,6 +6800,27 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 	ai := arrayInfo{
 		base: base.cell, size: base.elemCount * base.elemSize,
 		count: base.elemCount, elemSize: base.elemSize,
+	}
+	// Multi-byte int element with variable index: materialize into a temp
+	// uint16/uint32/uint64 by reading N consecutive bytes from the flat array.
+	if base.elemIntSize >= 2 {
+		flatIdx, err := l.lowerCompositeVarIndex(ai, indexExpr)
+		if err != nil {
+			return exprResult{}, err
+		}
+		flatArr := arrayInfo{base: base.cell, size: ai.size, count: ai.size, elemSize: 1}
+		dst := l.allocCells(base.elemIntSize)
+		for j := range base.elemIntSize {
+			idxCell := l.allocCell()
+			l.emit(&IRCopy{Dst: idxCell, Src: flatIdx.cell})
+			if j > 0 {
+				l.emit(&IRAddI{Dst: idxCell, Value: byte(j)}) // #nosec G115
+			}
+			l.emitVariableIndexRead(flatArr, idxCell, dst+j)
+			l.freeCell(idxCell)
+		}
+		l.freeCell(flatIdx.cell)
+		return exprResult{cell: dst, temp: true, size: base.elemIntSize, intSize: base.elemIntSize}, nil
 	}
 	if base.elemSize > 1 {
 		r, err := l.lowerCompositeVarIndex(ai, indexExpr)
@@ -5036,6 +6844,12 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 	indexResult, err := l.lowerExpr(indexExpr)
 	if err != nil {
 		return exprResult{}, err
+	}
+	if indexResult.intSize >= 2 {
+		if indexResult.temp {
+			l.freeCellRange(indexResult.cell, indexResult.intSize)
+		}
+		return exprResult{}, fmt.Errorf("cannot use multi-byte integer as array index, use byte() to truncate")
 	}
 	result := l.allocCell()
 	l.emitVariableIndexRead(ai, indexResult.cell, result)
@@ -5110,6 +6924,27 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 		base: base.cell, size: base.elemCount * base.elemSize,
 		count: base.elemCount, elemSize: base.elemSize,
 	}
+	// Multi-byte int element: write N bytes via dynamic stores at sequential offsets.
+	if base.elemIntSize >= 2 {
+		flatIdx, err := l.lowerCompositeVarIndex(ai, indexExpr)
+		if err != nil {
+			return err
+		}
+		for j := range base.elemIntSize {
+			idxCell := l.allocCell()
+			l.emit(&IRCopy{Dst: idxCell, Src: flatIdx.cell})
+			if j > 0 {
+				l.emit(&IRAddI{Dst: idxCell, Value: byte(j)}) // #nosec G115
+			}
+			l.emitVariableIndexWrite(ai, idxCell, val.cell+j)
+			l.freeCell(idxCell)
+		}
+		l.freeCell(flatIdx.cell)
+		if val.temp {
+			l.freeCellRange(val.cell, val.cellCount())
+		}
+		return nil
+	}
 	indexResult, err := l.lowerExpr(indexExpr)
 	if err != nil {
 		return err
@@ -5145,6 +6980,20 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			// Array field: return pointer for indexing.
 			if arrSize := ptrDef.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
 				return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPointer: true}, nil
+			}
+			// Multi-byte int field: load N cells.
+			if n := ptrDef.FieldIntSizes[e.Sel.Name]; n >= 2 {
+				base := l.allocCells(n)
+				for j := range n {
+					val := l.ptrLoad(idx)
+					l.emit(&IRMove{Dst: base + j, Src: val})
+					l.freeCell(val)
+					if j < n-1 {
+						l.emit(&IRAddI{Dst: idx, Value: 1})
+					}
+				}
+				l.freeCell(idx)
+				return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
 			}
 			result := l.ptrLoad(idx)
 			l.freeCell(idx)
@@ -5182,6 +7031,20 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			l.emit(&IRAddI{Dst: inner.cell, Value: byte(offset)}) // #nosec G115
 			totalSize := inner.elemCount * inner.elemSize
 			flatArr := arrayInfo{base: inner.flatBase, size: totalSize, count: totalSize, elemSize: 1}
+			if n := def.FieldIntSizes[e.Sel.Name]; n >= 2 {
+				base := l.allocCells(n)
+				for j := range n {
+					idxCell := l.allocCell()
+					l.emit(&IRCopy{Dst: idxCell, Src: inner.cell})
+					if j > 0 {
+						l.emit(&IRAddI{Dst: idxCell, Value: byte(j)}) // #nosec G115
+					}
+					l.emitVariableIndexRead(flatArr, idxCell, base+j)
+					l.freeCell(idxCell)
+				}
+				l.freeCell(inner.cell)
+				return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
+			}
 			result := l.allocCell()
 			l.emitVariableIndexRead(flatArr, inner.cell, result)
 			l.freeCell(inner.cell)
@@ -5214,7 +7077,22 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		// Nested struct field: return pointer with struct type.
 		if fieldType := def.FieldTypes[e.Sel.Name]; fieldType != "" {
 			fieldDef := l.result.Structs[fieldType]
-			return exprResult{cell: idx, temp: true, size: fieldDef.Size, elemSize: 1, elemCount: fieldDef.Size, typeName: fieldType, isPointer: true}, nil
+			return exprResult{cell: idx, temp: true, size: fieldDef.Size, elemSize: 1,
+				elemCount: fieldDef.Size, typeName: fieldType, isPointer: true}, nil
+		}
+		// Multi-byte int field: load N cells.
+		if n := def.FieldIntSizes[e.Sel.Name]; n >= 2 {
+			base := l.allocCells(n)
+			for j := range n {
+				val := l.ptrLoad(idx)
+				l.emit(&IRMove{Dst: base + j, Src: val})
+				l.freeCell(val)
+				if j < n-1 {
+					l.emit(&IRAddI{Dst: idx, Value: 1})
+				}
+			}
+			l.freeCell(idx)
+			return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
 		}
 		result := l.ptrLoad(idx)
 		l.freeCell(idx)
@@ -5223,7 +7101,11 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	r := exprResult{cell: base + offset}
 	if arrSize := def.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
 		r.size = arrSize
-		if ies := def.FieldInnerSizes[e.Sel.Name]; ies > 0 {
+		if eis := def.FieldArrayElemIntSize[e.Sel.Name]; eis >= 2 {
+			r.elemSize = eis
+			r.elemCount = arrSize / eis
+			r.elemIntSize = eis
+		} else if ies := def.FieldInnerSizes[e.Sel.Name]; ies > 0 {
 			r.elemSize = ies
 			r.elemCount = arrSize / ies
 		} else {
@@ -5236,6 +7118,9 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		r.elemSize = 1
 		r.elemCount = fieldDef.Size
 		r.typeName = fieldType
+	} else if intSize := def.FieldIntSizes[e.Sel.Name]; intSize >= 2 {
+		r.size = intSize
+		r.intSize = intSize
 	}
 	return r, nil
 }

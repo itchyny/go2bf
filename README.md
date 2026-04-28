@@ -232,11 +232,10 @@ The generated Brainfuck uses a CPU-like execution model:
 
 ## Supported Go features
 
-All values are `byte` (unsigned 8-bit, 0-255).
-No `int` or `string` types.
-
 ### Types and operators
 
+- `byte` (`uint8`, 0-255), `uint16` (0-65535),
+  `uint32` (0-4294967295), `uint64` (0-2^64-1)
 - Arithmetic: `+`, `-`, `*`, `/`, `%`, `++`, `--`,
   `+=`, `-=`, `*=`, `/=`, `%=`, unary `-`
 - Bitwise: `&`, `|`, `^`, `&^`, `<<`, `>>`, `^x`,
@@ -244,8 +243,8 @@ No `int` or `string` types.
 - Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
   (including array and struct equality)
 - Logical: `&&`, `||`, `!` (0 is false, nonzero is true)
-- Type conversion: `byte(expr)`, `string(byte)` in
-  `print`/`println` to output a raw character
+- Type conversion: `byte(expr)`, `uintN(expr)`,
+  `string(byte)` in `print`/`println`
 - Constants: `const n = 10`, `const nl = '\n'`,
   `const msg = "hello"`, `const` blocks with `iota`
 
@@ -253,8 +252,8 @@ No `int` or `string` types.
 
 - `if`, `else if`, `else` statements
 - `for` loops with `break` and `continue`
-- `switch` statement on `byte` values (including
-  multiple values per case, `default`, and `fallthrough`)
+- `switch` statement on `byte`, `uintN` values (including
+   multiple values per case, `default`, and `fallthrough`)
 
 ### Functions
 
@@ -268,8 +267,8 @@ No `int` or `string` types.
 
 ### Arrays
 
-- Fixed-size: `[N]byte`, `[N]Point`, `[N][M]byte`,
-  `[N][M][K]byte`, `[N][M]Point`
+- `[N]byte`, `[N]uintN`, `[N]Point`, `[N][M]byte`,
+  `[N][M]uintN`, `[N][M]Point`, `[N][M][K]byte`
 - Constant and variable indexing
 - Composite literals: `[N]byte{...}`, `[N]byte{0: v}`
 - `len(array)`, `cap(array)`, `for i, v := range a`
@@ -279,17 +278,17 @@ No `int` or `string` types.
 ### Structs
 
 - Top-level and function-local type definitions
-- Fields: `byte`, struct, array, or nested array types
+- Fields: `byte`, `uintN`, struct, array, or nested array types
 - Field access, nested field access (`p.a.x`)
 - Composite literals, copy assignment
-- `p.x++`, `p.x += v`, `a[i].x = v`
+- `p.x++`, `p.x += v`, `a[i].x = v`, `s.vals[i] = v`
 - Pass to and return from functions
 - Method receivers and method calls
 
 ### Slices
 
-- `[]byte`, `[]Point`, `[][N]byte`, `[][]byte`,
-  `[]*byte`, `[]*Point` slices
+- `[]byte`, `[]uintN`, `[]Point`, `[][N]byte`, `[][]byte`,
+  `[]*byte`, `[]*Point`
 - Composite literals: `[]byte{1, 2, 3}`,
   `[]Point{Point{1, 2}, Point{3, 4}}`
 - `make([]byte, n)`, `make([]Point, n, cap)`
@@ -308,7 +307,7 @@ No `int` or `string` types.
 
 ### Pointers
 
-- `*byte` pointers: `&x`, `*p`, `*p = v`, `*p++`
+- `*byte`, `*uintN` pointers: `&x`, `*p`, `*p = v`, `*p++`, `*p--`
 - `&myStruct`, `&myArray`, `&Point{x: 1, y: 2}`
 - `&a[i]`, `&s[i]` -- address of array/slice elements
 - `ptr.x` read/write for struct pointers (`ptr := &myStruct`)
@@ -316,13 +315,15 @@ No `int` or `string` types.
 - `ptr[i].x` read/write for array-of-structs pointers
 - `ptr.data[i]` read/write for struct-with-array pointers
 - `len(ptr)`, `len(*ptr)`, `cap(ptr)` for array pointers
-- `p == nil`, `p != nil` comparison
-- Typed pointer parameters: `func f(p *[N]byte)`, `func f(p *Point)`
+- `ptr == nil`, `ptr != nil` comparison
+- Typed pointer parameters: `func f(p *[N]byte)`,
+  `func f(p *Point)`, `func f(p *uintN)`
 - Pass pointers to functions for by-reference semantics
 
 ### Built-in functions
 
-- `print`, `println` -- decimal output, string literals
+- `print`, `println` -- decimal output, string literals,
+  multi-return expansion
 - `len(x)`, `cap(x)` -- arrays, slices, pointers
 - `make([]T, n)`, `make([]T, n, cap)` -- slices of byte,
   struct, or array types
@@ -339,16 +340,20 @@ go2bf extensions:
 
 ## Limitations
 
+- No `int`, `string`, signed integer types,
+  floating-point number types, or complex number types.
 - No import statements.
 - No maps, interfaces, or channels.
-- Array nesting up to `[N][M][K]byte` or `[N][M]Point`.
+- Array nesting up to `[N][M][K]byte`, `[N][M]Point`,
+  or `[N][M]uintN`.
 - Slice nesting up to `[][]byte`
-  (`[][][]byte`, `[][]Point` not supported).
-- Old backing arrays are not freed on reallocation.
+  (`[][][]byte`, `[][]Point`, `[][]uintN`, `[][N]uintN`
+  not supported).
 - No `select`, `go`, or `goto` statements.
 - No closures or function pointers.
 - Recursive functions do not support recursive calls
-  inside `for` loops, mutual recursion, pointers, or slices.
+  inside `for` loops, mutual recursion, multi-byte
+  integers (`uintN`), pointers, or slices.
 - Maximum 255 stack slots (variables + temporaries)
   per program. Slice backing arrays share this space;
   programs that allocate many or large slices at runtime
