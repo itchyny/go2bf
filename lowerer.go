@@ -292,6 +292,16 @@ func (l *Lowerer) lookupConst(name string) (byte, bool) {
 	return 0, false
 }
 
+// allByteConsts returns a merged map of top-level and all scope byte constants.
+func (l *Lowerer) allByteConsts() map[string]byte {
+	m := make(map[string]byte, len(l.result.ByteConsts))
+	maps.Copy(m, l.result.ByteConsts)
+	for i := range l.scopes {
+		maps.Copy(m, l.scopes[i].consts)
+	}
+	return m
+}
+
 func (l *Lowerer) lookupStringConst(name string) string {
 	return l.result.StringConsts[name]
 }
@@ -1204,7 +1214,7 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 							continue
 						}
 					}
-					// inner := s[i] where s is [][]byte or []P
+					// inner := s[i] where s is [][]byte, []P, [N][M]byte, or [N]P
 					if i < len(s.Rhs) {
 						if idxExpr, ok := s.Rhs[i].(*ast.IndexExpr); ok {
 							if arrID, ok := idxExpr.X.(*ast.Ident); ok {
@@ -1222,6 +1232,21 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 										}
 										continue
 									}
+								}
+								if ai, ok := sc.arrays[arrID.Name]; ok && ai.elemSize > 1 {
+									if ai.elemType != "" {
+										// [N]Point -> Point
+										if _, exists := sc.structs[id.Name]; !exists {
+											def := l.result.Structs[ai.elemType]
+											l.defineStruct(sc, id.Name, def)
+										}
+									} else {
+										// [N][M]byte -> [M]byte
+										if _, exists := sc.arrays[id.Name]; !exists {
+											l.defineArray(sc, id.Name, ai.elemSize)
+										}
+									}
+									continue
 								}
 							}
 						}
@@ -1325,6 +1350,16 @@ func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
 		case *ast.DeclStmt:
 			gd, ok := s.Decl.(*ast.GenDecl)
 			if !ok {
+				return true
+			}
+			if gd.Tok == token.CONST {
+				// Register local consts so subsequent declarations can reference them.
+				l.lowerLocalConsts(gd)
+				return true
+			}
+			if gd.Tok == token.TYPE {
+				// Register local types so subsequent variable declarations can reference them.
+				l.lowerLocalTypes(gd)
 				return true
 			}
 			for _, spec := range gd.Specs {
@@ -1533,7 +1568,7 @@ func (l *Lowerer) arrayElementInfo(expr ast.Expr) (count, elemSize int, elemType
 	if !ok {
 		return 0, 0, "", 0
 	}
-	count = arrayTypeSizePart(at.Len, l.result.ByteConsts)
+	count = arrayTypeSizePart(at.Len, l.allByteConsts())
 	if count < 0 {
 		return 0, 0, "", 0
 	}
@@ -1945,6 +1980,39 @@ func (l *Lowerer) lowerPutchar(args []ast.Expr, lowerExpr func(ast.Expr) (exprRe
 }
 
 func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Expr) (exprResult, error)) error {
+	// Expand multi-return function call: println(f()) -> println(r0, r1, ...)
+	if len(args) == 1 {
+		if call, ok := args[0].(*ast.CallExpr); ok {
+			funcName, receiver := l.resolveCall(call)
+			if info, ok := l.result.Funcs[funcName]; ok && info.Returns > 1 {
+				callArgs := call.Args
+				if receiver != nil {
+					callArgs = append([]ast.Expr{receiver}, callArgs...)
+				}
+				retCells, err := l.inlineCall(info, callArgs)
+				if err != nil {
+					return err
+				}
+				for i, cell := range retCells {
+					if i > 0 && name == "println" {
+						t := l.allocCell()
+						l.emit(&IRConst{Dst: t, Value: ' '})
+						l.emit(&IRPutc{Src: t})
+						l.freeCell(t)
+					}
+					l.emitPrintByte(cell)
+					l.freeCell(cell)
+				}
+				if name == "println" {
+					t := l.allocCell()
+					l.emit(&IRConst{Dst: t, Value: '\n'})
+					l.emit(&IRPutc{Src: t})
+					l.freeCell(t)
+				}
+				return nil
+			}
+		}
+	}
 	for i, arg := range args {
 		if i > 0 && name == "println" {
 			t := l.allocCell()
@@ -2089,20 +2157,52 @@ func (l *Lowerer) lowerClear(args []ast.Expr) error {
 	return nil
 }
 
-func (l *Lowerer) lowerCopy(args []ast.Expr) error {
-	if len(args) != 2 {
-		return fmt.Errorf("copy expects 2 arguments")
+// emitCopyLoop emits a loop copying `limit` bytes between two pointer-based
+// addresses. If forward is true, copies i=0..limit-1; otherwise i=limit-1..0.
+func (l *Lowerer) emitCopyLoop(dstPtr, srcPtr, limit Cell, forward bool) {
+	counter := l.allocCell()
+	cond := l.allocCell()
+	if forward {
+		l.emit(&IRZero{Dst: counter})
+		l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
+	} else {
+		l.emit(&IRCopy{Dst: counter, Src: limit})
+		l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit}) // nonzero check
+		// counter > 0 iff limit > 0; rewrite as "counter != 0".
+		l.emit(&IRCopy{Dst: cond, Src: counter})
 	}
-	dst, err := l.lowerExpr(args[0])
-	if err != nil || dst.lenCell == 0 {
-		return fmt.Errorf("copy expects slice arguments")
+	saved := l.nodes
+	l.nodes = nil
+	if !forward {
+		l.emit(&IRSubI{Dst: counter, Value: 1})
 	}
-	src, err := l.lowerExpr(args[1])
-	if err != nil || src.lenCell == 0 {
-		return fmt.Errorf("copy expects slice arguments")
+	srcAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: srcAddr, Src1: srcPtr, Src2: counter})
+	val := l.ptrLoad(srcAddr)
+	l.freeCell(srcAddr)
+	dstAddr := l.allocCell()
+	l.emit(&IRAdd{Dst: dstAddr, Src1: dstPtr, Src2: counter})
+	l.ptrStore(dstAddr, val)
+	l.freeCell(val)
+	l.freeCell(dstAddr)
+	if forward {
+		l.emit(&IRAddI{Dst: counter, Value: 1})
+		l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
+	} else {
+		l.emit(&IRCopy{Dst: cond, Src: counter})
 	}
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+	l.emit(&IRLoop{Cond: cond, Body: body})
+	l.freeCell(counter)
+	l.freeCell(cond)
+}
+
+// emitCopy performs the copy operation and returns the cell holding
+// the number of elements copied (min(len(dst), len(src))).
+func (l *Lowerer) emitCopy(dst, src exprResult) Cell {
 	es := max(dst.elemSize, 1)
-	// n = min(len(dst), len(src)) * elemSize
+	// n = min(len(dst), len(src))
 	n := l.allocCell()
 	cmpCell := l.allocCell()
 	l.emit(&IRCmp{Op: CmpLeq, Dst: cmpCell, Src1: dst.lenCell, Src2: src.lenCell})
@@ -2116,36 +2216,143 @@ func (l *Lowerer) lowerCopy(args []ast.Expr) error {
 	l.nodes = savedCopy
 	l.emit(&IRIf{Cond: cmpCell, Then: &IRBlock{Nodes: thenNodes}, Else: &IRBlock{Nodes: elseNodes}})
 	l.freeCell(cmpCell)
+	// limit = n * elemSize (total bytes to copy)
 	limit := l.allocCell()
 	t := l.allocCell()
 	l.emit(&IRConst{Dst: t, Value: byte(es)}) // #nosec G115
 	l.emit(&IRMul{Dst: limit, Src1: n, Src2: t})
 	l.freeCell(t)
-	l.freeCell(n)
-	// Copy loop: for i := 0; i < limit; i++ { dst[ptr+i] = src[ptr+i] }
-	counter := l.allocCell()
-	l.emit(&IRZero{Dst: counter})
-	cond := l.allocCell()
-	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
-	saved := l.nodes
+	// When slices overlap with dst after src, copy backwards to avoid
+	// overwriting source data. Check dst.ptr >= src.ptr at runtime.
+	overlap := l.allocCell()
+	l.emit(&IRCmp{Op: CmpGeq, Dst: overlap, Src1: dst.cell, Src2: src.cell})
+
+	// Forward copy: for i := 0; i < limit; i++
+	savedFwd := l.nodes
 	l.nodes = nil
-	srcAddr := l.allocCell()
-	l.emit(&IRAdd{Dst: srcAddr, Src1: src.cell, Src2: counter})
-	val := l.ptrLoad(srcAddr)
-	l.freeCell(srcAddr)
-	dstAddr := l.allocCell()
-	l.emit(&IRAdd{Dst: dstAddr, Src1: dst.cell, Src2: counter})
-	l.ptrStore(dstAddr, val)
-	l.freeCell(val)
-	l.freeCell(dstAddr)
-	l.emit(&IRAddI{Dst: counter, Value: 1})
-	l.emit(&IRCmp{Op: CmpLt, Dst: cond, Src1: counter, Src2: limit})
-	body := &IRBlock{Nodes: l.nodes}
-	l.nodes = saved
-	l.emit(&IRLoop{Cond: cond, Body: body})
-	l.freeCell(counter)
+	l.emitCopyLoop(dst.cell, src.cell, limit, true)
+	fwdNodes := l.nodes
+
+	// Backward copy: for i := limit-1; i >= 0; i--
+	l.nodes = nil
+	l.emitCopyLoop(dst.cell, src.cell, limit, false)
+	bwdNodes := l.nodes
+
+	l.nodes = savedFwd
+	l.emit(&IRIf{Cond: overlap, Then: &IRBlock{Nodes: bwdNodes}, Else: &IRBlock{Nodes: fwdNodes}})
 	l.freeCell(limit)
-	l.freeCell(cond)
+	return n
+}
+
+func (l *Lowerer) lowerCopy(args []ast.Expr) error {
+	if len(args) != 2 {
+		return fmt.Errorf("copy expects 2 arguments")
+	}
+	dst, err := l.lowerExpr(args[0])
+	if err != nil || dst.lenCell == 0 {
+		return fmt.Errorf("copy expects slice arguments")
+	}
+	src, err := l.lowerExpr(args[1])
+	if err != nil || src.lenCell == 0 {
+		return fmt.Errorf("copy expects slice arguments")
+	}
+	n := l.emitCopy(dst, src)
+	l.freeCell(n)
+	return nil
+}
+
+func (l *Lowerer) lowerLocalConsts(gd *ast.GenDecl) error {
+	sc := l.currentScope()
+	allConsts := l.allByteConsts()
+	iota := 0
+	var lastExprs []ast.Expr
+	for _, spec := range gd.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		if len(vs.Values) > 0 {
+			lastExprs = vs.Values
+		}
+		for i, name := range vs.Names {
+			if i < len(lastExprs) {
+				if lit, ok := lastExprs[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					s, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						return fmt.Errorf("const %s: %w", name.Name, err)
+					}
+					l.result.StringConsts[name.Name] = s
+					continue
+				}
+				val, err := evalConstExpr(lastExprs[i], iota, allConsts)
+				if err != nil {
+					return fmt.Errorf("const %s: %w", name.Name, err)
+				}
+				if val < 0 || val > 255 {
+					return fmt.Errorf("const %s: value %d out of byte range (0-255)", name.Name, val)
+				}
+				sc.consts[name.Name] = byte(val) // #nosec G115
+				allConsts[name.Name] = byte(val) // #nosec G115
+			}
+		}
+		iota++
+	}
+	return nil
+}
+
+func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
+	for _, spec := range gd.Specs {
+		ts, ok := spec.(*ast.TypeSpec)
+		if !ok {
+			continue
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return fmt.Errorf("unsupported local type: only struct types are supported")
+		}
+		def := &StructDef{
+			Name:            ts.Name.Name,
+			Offsets:         make(map[string]int),
+			FieldTypes:      make(map[string]string),
+			FieldArraySizes: make(map[string]int),
+			FieldInnerSizes: make(map[string]int),
+		}
+		offset := 0
+		for _, field := range st.Fields.List {
+			fieldSize := 1
+			fieldType := ""
+			fieldArraySize := 0
+			if id, ok := field.Type.(*ast.Ident); ok {
+				if nested, ok := l.result.Structs[id.Name]; ok {
+					fieldSize = nested.Size
+					fieldType = id.Name
+				}
+			} else if arrSize, ies := arrayFieldInfo(field.Type); arrSize > 0 {
+				fieldSize = arrSize
+				fieldArraySize = arrSize
+				if ies > 0 {
+					for _, name := range field.Names {
+						def.FieldInnerSizes[name.Name] = ies
+					}
+				}
+			}
+			for _, name := range field.Names {
+				def.Fields = append(def.Fields, name.Name)
+				def.Offsets[name.Name] = offset
+				if fieldType != "" {
+					def.FieldTypes[name.Name] = fieldType
+				}
+				if fieldArraySize > 0 {
+					def.FieldArraySizes[name.Name] = fieldArraySize
+				}
+				offset += fieldSize
+			}
+		}
+		def.Size = offset
+		if _, exists := l.result.Structs[def.Name]; !exists {
+			l.result.Structs[def.Name] = def
+		}
+	}
 	return nil
 }
 
@@ -2153,6 +2360,12 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 	gd, ok := s.Decl.(*ast.GenDecl)
 	if !ok {
 		return fmt.Errorf("unsupported declaration")
+	}
+	if gd.Tok == token.CONST {
+		return l.lowerLocalConsts(gd)
+	}
+	if gd.Tok == token.TYPE {
+		return l.lowerLocalTypes(gd)
 	}
 	for _, spec := range gd.Specs {
 		vs, ok := spec.(*ast.ValueSpec)
@@ -2285,6 +2498,21 @@ func (l *Lowerer) assignResult(dst, r exprResult) error {
 		if r.temp {
 			l.freeCell(r.cell)
 		}
+		return nil
+	}
+	// Flat-offset result: materialize by reading each element from the flat array.
+	if r.flatBase != 0 && dst.size > 1 {
+		totalSize := r.elemCount * r.elemSize
+		flatArr := arrayInfo{base: r.flatBase, size: totalSize, count: totalSize, elemSize: 1}
+		n := min(r.elemCount, dst.size)
+		for j := range n {
+			idxCell := l.allocCell()
+			l.emit(&IRCopy{Dst: idxCell, Src: r.cell})
+			l.emit(&IRAddI{Dst: idxCell, Value: byte(j)}) // #nosec G115
+			l.emitVariableIndexRead(flatArr, idxCell, dst.cell+j)
+			l.freeCell(idxCell)
+		}
+		l.freeCell(r.cell)
 		return nil
 	}
 	// Pointer-based composite: materialize by loading each cell.
@@ -3748,7 +3976,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 			l.freeCell(r.cell)
 			r = exprResult{cell: base, temp: true, size: r.elemCount, typeName: r.typeName}
 		}
-		// Flat-offset results: materialize into contiguous temp cells.
+		// Flat-offset result: materialize into contiguous temp cells.
 		if r.flatBase != 0 {
 			totalSize := r.elemCount * r.elemSize
 			flatArr := arrayInfo{base: r.flatBase, size: totalSize, count: totalSize, elemSize: 1}
@@ -4603,6 +4831,20 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: byte(r.elemCount)}) // #nosec G115
 		return exprResult{cell: t, temp: true}, true, nil
+	case "copy":
+		if len(call.Args) != 2 {
+			return exprResult{}, true, fmt.Errorf("copy() expects 2 arguments")
+		}
+		dst, err := lowerExpr(call.Args[0])
+		if err != nil || dst.lenCell == 0 {
+			return exprResult{}, true, fmt.Errorf("copy expects slice arguments")
+		}
+		src, err := lowerExpr(call.Args[1])
+		if err != nil || src.lenCell == 0 {
+			return exprResult{}, true, fmt.Errorf("copy expects slice arguments")
+		}
+		n := l.emitCopy(dst, src)
+		return exprResult{cell: n, temp: true}, true, nil
 	case "min", "max":
 		if len(call.Args) < 2 {
 			return exprResult{}, true, fmt.Errorf("%s() expects at least 2 arguments", fn.Name)

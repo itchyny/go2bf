@@ -252,8 +252,7 @@ No `int` or `string` types.
 ### Control flow
 
 - `if`, `else if`, `else` statements
-- `for` loops (condition-only, C-style, `range`)
-  with `break` and `continue`
+- `for` loops with `break` and `continue`
 - `switch` statement on `byte` values (including
   multiple values per case, `default`, and `fallthrough`)
 
@@ -279,6 +278,7 @@ No `int` or `string` types.
 
 ### Structs
 
+- Top-level and function-local type definitions
 - Fields: `byte`, struct, array, or nested array types
 - Field access, nested field access (`p.a.x`)
 - Composite literals, copy assignment
@@ -350,7 +350,9 @@ go2bf extensions:
 - Recursive functions do not support recursive calls
   inside `for` loops, mutual recursion, pointers, or slices.
 - Maximum 255 stack slots (variables + temporaries)
-  per program.
+  per program. Slice backing arrays share this space;
+  programs that allocate many or large slices at runtime
+  may silently overflow with no error.
 - The built-in Brainfuck interpreter uses a 30,000-cell
   tape with 8-bit wrapping cells.
 

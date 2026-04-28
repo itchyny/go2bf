@@ -129,6 +129,13 @@ func main() { println(1, 2, 3) }`,
 			"", "1 2 3\n",
 		},
 		{
+			"println multi-return function",
+			`package main
+func divmod(a, b byte) (byte, byte) { return a / b, a % b }
+func main() { println(divmod(72, 10)) }`,
+			"", "7 2\n",
+		},
+		{
 			"println byte value",
 			`package main
 func main() {
@@ -180,13 +187,10 @@ func main() { print(min(byte(7), byte(7))) }`,
 			"min max with variables",
 			`package main
 func main() {
-	a := byte(10)
-	b := byte(3)
-	print(min(a, b))
-	print(" ")
-	print(max(a, b))
+	a, b := byte(10), byte(3)
+	println(min(a, b), max(a, b))
 }`,
-			"", "3 10",
+			"", "3 10\n",
 		},
 		// --- If statement ---
 		{
@@ -360,7 +364,7 @@ func main() {
 			"", "123246369",
 		},
 		{
-			"for range",
+			"for range byte",
 			`package main
 func main() {
 	for i := range 5 {
@@ -1311,11 +1315,9 @@ func main() {
 func main() {
 	a := byte(1) << 4
 	b := byte(16) >> 4
-	print(a)
-	print(" ")
-	print(b)
+	println(a, b)
 }`,
-			"", "16 1",
+			"", "16 1\n",
 		},
 		{
 			"xor swap",
@@ -1323,25 +1325,20 @@ func main() {
 func main() {
 	a := byte(42)
 	b := byte(99)
+	println(a, b)
 	a ^= b
 	b ^= a
 	a ^= b
-	print(a)
-	print(" ")
-	print(b)
+	println(a, b)
 }`,
-			"", "99 42",
+			"", "42 99\n99 42\n",
 		},
 		{
 			"compound bitwise nibble extract",
 			`package main
 func main() {
 	x := byte(0xAB)
-	print(x & 0x0F)
-	print(" ")
-	print((x >> 4) & 0x0F)
-	print(" ")
-	println(^x & 0x0F)
+	println(x & 0x0F, (x >> 4) & 0x0F, ^x & 0x0F)
 }`,
 			"", "11 10 4\n",
 		},
@@ -1404,10 +1401,9 @@ func divmod(a byte, b byte) (byte, byte) {
 }
 func main() {
 	q, r := divmod(72, 10)
-	print(q)
-	print(r)
+	println(q, r)
 }`,
-			"", "72",
+			"", "7 2\n",
 		},
 		{
 			"nested function calls",
@@ -1557,11 +1553,9 @@ func f(a, b byte) (byte, byte) {
 }
 func main() {
 	r, q := f(17, 5)
-	print(q)
-	print(" ")
-	print(r)
+	println(q, r)
 }`,
-			"", "3 2",
+			"", "3 2\n",
 		},
 		{
 			"multi return non-divmod",
@@ -1571,11 +1565,9 @@ func f(a, b byte) (byte, byte) {
 }
 func main() {
 	s, d := f(10, 3)
-	print(s)
-	print(" ")
-	print(d)
+	println(s, d)
 }`,
-			"", "13 7",
+			"", "13 7\n",
 		},
 		{
 			"multi return to array index",
@@ -1619,11 +1611,9 @@ func divmod(a, b byte) (byte, byte) { return a / b, a % b }
 func main() {
 	var a [2]byte
 	a[0], a[1] = divmod(17, 5)
-	print(a[0])
-	print(" ")
-	print(a[1])
+	println(a[0], a[1])
 }`,
-			"", "3 2",
+			"", "3 2\n",
 		},
 		{
 			"multi return to struct field",
@@ -1633,11 +1623,9 @@ func swap(a, b byte) (byte, byte) { return b, a }
 func main() {
 	var p P
 	p.x, p.y = swap(3, 7)
-	print(p.x)
-	print(" ")
-	print(p.y)
+	println(p.x, p.y)
 }`,
-			"", "7 3",
+			"", "7 3\n",
 		},
 		{
 			"multi return to chained array const index",
@@ -1646,11 +1634,9 @@ func f() (byte, byte) { return 10, 20 }
 func main() {
 	var a [2][2]byte
 	a[0][0], a[1][1] = f()
-	print(a[0][0])
-	print(" ")
-	print(a[1][1])
+	println(a[0][0], a[1][1])
 }`,
-			"", "10 20",
+			"", "10 20\n",
 		},
 		{
 			"multi return to array variable index",
@@ -1660,11 +1646,9 @@ func main() {
 	var a [3]byte
 	i := byte(1)
 	a[0], a[i] = f()
-	print(a[0])
-	print(" ")
-	print(a[1])
+	println(a[0], a[1])
 }`,
-			"", "5 15",
+			"", "5 15\n",
 		},
 		{
 			"multi return to chained array variable index",
@@ -1674,11 +1658,9 @@ func main() {
 	var a [2][3]byte
 	j := byte(2)
 	a[0][0], a[1][j] = f()
-	print(a[0][0])
-	print(" ")
-	print(a[1][2])
+	println(a[0][0], a[1][2])
 }`,
-			"", "10 20",
+			"", "10 20\n",
 		},
 		{
 			"multi return to struct field direct",
@@ -1688,11 +1670,9 @@ func f() (byte, byte) { return 3, 7 }
 func main() {
 	var p P
 	p.x, p.y = f()
-	print(p.x)
-	print(" ")
-	print(p.y)
+	println(p.x, p.y)
 }`,
-			"", "3 7",
+			"", "3 7\n",
 		},
 		// --- Var declarations ---
 		{
@@ -3577,11 +3557,9 @@ func f(n byte) P {
 }
 func main() {
 	r := f(3)
-	print(r.x)
-	print(" ")
-	print(r.y)
+	println(r.x, r.y)
 }`,
-			"", "6 12",
+			"", "6 12\n",
 		},
 		{
 			"array literal return in recursive function",
@@ -3593,11 +3571,9 @@ func f(n byte) [2]byte {
 }
 func main() {
 	r := f(3)
-	print(r[0])
-	print(" ")
-	print(r[1])
+	println(r[0], r[1])
 }`,
-			"", "6 3",
+			"", "6 3\n",
 		},
 		{
 			"for with continue in recursive function",
@@ -3751,11 +3727,9 @@ func f(n byte) [2]byte {
 }
 func main() {
 	r := f(3)
-	print(r[0])
-	print(" ")
-	print(r[1])
+	println(r[0], r[1])
 }`,
-			"", "6 3",
+			"", "6 3\n",
 		},
 		{
 			"if with init modulo in recursive function",
@@ -4565,6 +4539,54 @@ func main() {
 }`,
 			"", "42",
 		},
+		{
+			"local const",
+			`package main
+func main() {
+	const x = 42
+	println(x)
+}`,
+			"", "42\n",
+		},
+		{
+			"local const block with iota",
+			`package main
+func main() {
+	const (
+		a = iota
+		b
+		c
+	)
+	println(a, b, c)
+	const (
+		x = iota * 10
+		y
+		z
+	)
+	println(x, y, z)
+}`,
+			"", "0 1 2\n0 10 20\n",
+		},
+		{
+			"local const expression",
+			`package main
+func main() {
+	const x = 10
+	const y = x + 5
+	const z = x * y
+	println(x, y, z)
+}`,
+			"", "10 15 150\n",
+		},
+		{
+			"local const string",
+			`package main
+func main() {
+	const msg = "hi"
+	println(msg)
+}`,
+			"", "hi\n",
+		},
 		// --- Arrays ---
 		{
 			"array composite literal",
@@ -5202,6 +5224,21 @@ func main() {
 			"", "7 8 9\n",
 		},
 		{
+			"2d array variable index row copy",
+			`package main
+func main() {
+	var a [2][3]byte
+	a[0] = [3]byte{1, 2, 3}
+	a[1] = [3]byte{4, 5, 6}
+	for i := range byte(2) {
+		if i > 0 { print(" ") }
+		row := a[i]
+		print(row[0] + row[1] + row[2])
+	}
+}`,
+			"", "6 15",
+		},
+		{
 			"array in struct function",
 			`package main
 func sum(a [3]byte) byte {
@@ -5245,9 +5282,7 @@ func main() {
 func main() {
 	a := [3][2]byte{{1, 2}, {3, 4}, {5, 6}}
 	for i := range 3 {
-		print(a[i][0])
-		print(" ")
-		println(a[i][1])
+		println(a[i][0], a[i][1])
 	}
 }`,
 			"", "1 2\n3 4\n5 6\n",
@@ -5262,9 +5297,7 @@ func main() {
 		a[i][1] = byte(i*2 + 2)
 	}
 	for i := range 3 {
-		print(a[i][0])
-		print(" ")
-		println(a[i][1])
+		println(a[i][0], a[i][1])
 	}
 }`,
 			"", "1 2\n3 4\n5 6\n",
@@ -5371,9 +5404,7 @@ type Point struct { x byte; y byte }
 func main() {
 	a := [3]Point{Point{1, 2}, Point{3, 4}, Point{5, 6}}
 	for i := range len(a) {
-		print(a[i].x)
-		print(" ")
-		println(a[i].y)
+		println(a[i].x, a[i].y)
 	}
 }`,
 			"", "1 2\n3 4\n5 6\n",
@@ -5389,9 +5420,7 @@ func main() {
 		a[i].y = byte(i + 10)
 	}
 	for i := range len(a) {
-		print(a[i].x)
-		print(" ")
-		println(a[i].y)
+		println(a[i].x, a[i].y)
 	}
 }`,
 			"", "1 10\n2 11\n3 12\n",
@@ -5411,6 +5440,20 @@ func main() {
 	println()
 }`,
 			"", "1,2 2,4 3,6 \n",
+		},
+		{
+			"array of structs variable index copy",
+			`package main
+type Point struct { x byte; y byte }
+func main() {
+	a := [3]Point{Point{1, 2}, Point{3, 4}, Point{5, 6}}
+	for i := range len(a) {
+		if i > 0 { print(" ") }
+		p := a[i]
+		print(p.x)
+	}
+}`,
+			"", "1 3 5",
 		},
 		{
 			"array of structs variable index inc dec",
@@ -5460,11 +5503,9 @@ func main() {
 	var a [3]byte
 	i := byte(2)
 	a[i], a[0] = 30, 10
-	print(a[0])
-	print(" ")
-	print(a[2])
+	println(a[0], a[2])
 }`,
-			"", "10 30",
+			"", "10 30\n",
 		},
 		{
 			"chained array variable index assign",
@@ -5511,11 +5552,9 @@ type P struct { x byte; y byte }
 func main() {
 	a := [2]P{{x: 1, y: 2}, {x: 3, y: 4}}
 	p := a[1]
-	print(p.x)
-	print(" ")
-	print(p.y)
+	println(p.x, p.y)
 }`,
-			"", "3 4",
+			"", "3 4\n",
 		},
 		{
 			"3d array constant index",
@@ -6642,6 +6681,45 @@ func main() {
 			"", "1 2 3\n",
 		},
 		{
+			"copy overlapping dst after src",
+			`package main
+func main() {
+	a := []byte{1, 2, 3, 4, 5}
+	copy(a[2:], a)
+	for i, v := range a {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+}`,
+			"", "1 2 1 2 3",
+		},
+		{
+			"copy overlapping dst before src",
+			`package main
+func main() {
+	a := []byte{1, 2, 3, 4, 5}
+	copy(a, a[2:])
+	for i, v := range a {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+}`,
+			"", "3 4 5 4 5",
+		},
+		{
+			"copy return value",
+			`package main
+func main() {
+	src := []byte{1, 2, 3, 4, 5}
+	dst := make([]byte, 3)
+	n := copy(dst, src)
+	println(n)
+	dst2 := make([]byte, 10)
+	println(copy(dst2, src))
+}`,
+			"", "3\n5\n",
+		},
+		{
 			"clear builtin",
 			`package main
 func main() {
@@ -7031,11 +7109,9 @@ type P struct { x byte; y byte }
 func (p P) sum() byte { return p.x + p.y }
 func main() {
 	a := [2]P{{x: 1, y: 2}, {x: 3, y: 4}}
-	print(a[0].sum())
-	print(" ")
-	print(a[1].sum())
+	println(a[0].sum(), a[1].sum())
 }`,
-			"", "3 7",
+			"", "3 7\n",
 		},
 		{
 			"method call on array element variable index",
@@ -7059,11 +7135,9 @@ func (p P) swap() (byte, byte) { return p.y, p.x }
 func main() {
 	p := P{x: 3, y: 7}
 	a, b := p.swap()
-	print(a)
-	print(" ")
-	print(b)
+	println(a, b)
 }`,
-			"", "7 3",
+			"", "7 3\n",
 		},
 		{
 			"struct method returning struct",
@@ -7283,15 +7357,10 @@ type Inner struct { x byte; y byte }
 type Outer struct { a Inner; data [2]byte }
 func main() {
 	o := Outer{a: Inner{x: 1, y: 2}, data: [2]byte{10, 20}}
-	print(o.a.x)
-	print(" ")
-	print(o.a.y)
-	print(" ")
-	print(o.data[0])
-	print(" ")
-	print(o.data[1])
+	println(o.a.x, o.a.y)
+	println(o.data[0], o.data[1])
 }`,
-			"", "1 2 10 20",
+			"", "1 2\n10 20\n",
 		},
 		{
 			"struct variable copy in struct init",
@@ -7301,11 +7370,9 @@ func make() P { return P{x: 3, y: 4} }
 func main() {
 	a := make()
 	b := a
-	print(b.x)
-	print(" ")
-	print(b.y)
+	println(b.x, b.y)
 }`,
-			"", "3 4",
+			"", "3 4\n",
 		},
 		{
 			"array of structs variable index field inc dec",
@@ -7387,6 +7454,27 @@ func main() {
 }`,
 			"", "42",
 		},
+		{
+			"local struct type",
+			`package main
+func main() {
+	type Point struct { x byte; y byte }
+	p := Point{x: 3, y: 7}
+	println(p.x, p.y)
+}`,
+			"", "3 7\n",
+		},
+		{
+			"local struct type with nested struct",
+			`package main
+type Inner struct { v byte }
+func main() {
+	type Wrapper struct { a Inner; b byte }
+	w := Wrapper{a: Inner{v: 10}, b: 20}
+	println(w.a.v, w.b)
+}`,
+			"", "10 20\n",
+		},
 		// --- Pointers ---
 		{
 			"pointer read",
@@ -7434,11 +7522,9 @@ func main() {
 	x := byte(10)
 	y := byte(20)
 	swap(&x, &y)
-	print(x)
-	print(" ")
-	print(y)
+	println(x, y)
 }`,
-			"", "20 10",
+			"", "20 10\n",
 		},
 		{
 			"pointer to array element",
@@ -7460,13 +7546,9 @@ func main() {
 		p := &a[i]
 		*p *= 2
 	}
-	print(a[0])
-	print(" ")
-	print(a[1])
-	print(" ")
-	print(a[2])
+	println(a[0], a[1], a[2])
 }`,
-			"", "20 40 60",
+			"", "20 40 60\n",
 		},
 		{
 			"pointer to struct field",
@@ -7501,13 +7583,9 @@ func main() {
 func main() {
 	a := [5]byte{1, 2, 3, 4, 5}
 	ptr := &a
-	print(len(ptr))
-	print(" ")
-	print(len(*ptr))
-	print(" ")
-	print(cap(ptr))
+	println(len(ptr), len(*ptr), cap(ptr))
 }`,
-			"", "5 5 5",
+			"", "5 5 5\n",
 		},
 		{
 			"pointer array index",
@@ -7529,11 +7607,9 @@ func main() {
 func main() {
 	a := [2][3]byte{{1, 2, 3}, {4, 5, 6}}
 	ptr := &a
-	print(ptr[0][0])
-	print(" ")
-	print(ptr[1][2])
+	println(ptr[0][0], ptr[1][2])
 }`,
-			"", "1 6",
+			"", "1 6\n",
 		},
 		{
 			"pointer 2d array write",
@@ -7546,11 +7622,9 @@ func main() {
 			ptr[i][j] = i*3 + j + 1
 		}
 	}
-	print(a[0][0])
-	print(" ")
-	print(a[1][2])
+	println(a[0][0], a[1][2])
 }`,
-			"", "1 6",
+			"", "1 6\n",
 		},
 		{
 			"pointer array of structs field read",
@@ -7573,11 +7647,9 @@ type S struct { data [3]byte; n byte }
 func main() {
 	s := S{data: [3]byte{10, 20, 30}, n: 3}
 	ptr := &s
-	print(ptr.data[0])
-	print(" ")
-	print(ptr.data[2])
+	println(ptr.data[0], ptr.data[2])
 }`,
-			"", "10 30",
+			"", "10 30\n",
 		},
 		{
 			"pointer array of structs field write",
@@ -7590,11 +7662,9 @@ func main() {
 		ptr[i].x = i + 1
 		ptr[i].y = (i + 1) * 10
 	}
-	print(a[0].x)
-	print(" ")
-	print(a[2].y)
+	println(a[0].x, a[2].y)
 }`,
-			"", "1 30",
+			"", "1 30\n",
 		},
 		{
 			"pointer struct array field write",
@@ -7606,11 +7676,9 @@ func main() {
 	for i := byte(0); i < 4; i++ {
 		ptr.data[i] = (i + 1) * 10
 	}
-	print(s.data[0])
-	print(" ")
-	print(s.data[3])
+	println(s.data[0], s.data[3])
 }`,
-			"", "10 40",
+			"", "10 40\n",
 		},
 		{
 			"pointer array write",
@@ -7660,11 +7728,9 @@ func inc(ptr *P) {
 func main() {
 	p := P{x: 3, y: 7}
 	inc(&p)
-	print(p.x)
-	print(" ")
-	print(p.y)
+	println(p.x, p.y)
 }`,
-			"", "4 8",
+			"", "4 8\n",
 		},
 		{
 			"typed array pointer parameter with len",
@@ -7713,11 +7779,9 @@ func main() {
 	a := [2][3]byte{{10, 20, 30}, {40, 50, 60}}
 	p := &a
 	j := byte(2)
-	print(p[0][j])
-	print(" ")
-	print(p[1][j])
+	println(p[0][j], p[1][j])
 }`,
-			"", "30 60",
+			"", "30 60\n",
 		},
 		{
 			"pointer 2d array write and read variable inner index",
@@ -7799,11 +7863,9 @@ func main() {
 	j := byte(1)
 	p[i][j] = 10
 	p[j][i] = 20
-	print(p[i][j])
-	print(" ")
-	print(p[j][i])
+	println(p[i][j], p[j][i])
 }`,
-			"", "10 20",
+			"", "10 20\n",
 		},
 		{
 			"pointer array write then read same index",

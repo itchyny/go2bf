@@ -82,7 +82,25 @@ declarations share a unified path through `lowerVarInit`, which
 handles composite literals, pointer tracking, and composite variable
 copies. For composite RHS (struct/array variables), `lowerExpr`
 returns a multi-cell result and `emitCopyOrMove` handles the
-cell-by-cell transfer.
+cell-by-cell transfer. For flat-offset results (e.g., `p := a[i]`
+on a struct array), `assignResult` materializes the data by reading
+each element from the flat array via `emitVariableIndexRead`.
+
+### Local Declarations
+
+`lowerDecl` dispatches by declaration kind:
+
+- **`const`**: `lowerLocalConsts` evaluates expressions (including
+  `iota` and references to earlier consts) and registers values in
+  the current scope's `consts` map. These are visible to
+  `arrayTypeSizePart` for use as array sizes.
+- **`type`**: `lowerLocalTypes` parses struct definitions and
+  registers them in `result.Structs`, identical to top-level types.
+- **`var`**: falls through to `lowerVarInit`.
+
+Both `const` and `type` declarations are also processed during
+`scanAndAllocLocals` so that subsequent variable declarations in
+the same scope can reference them.
 
 ### Field Assignment
 
@@ -265,8 +283,11 @@ appends. `append(s, t...)` ensures capacity, then bulk
 copies `len(t) * elemSize` cells from source to destination.
 
 `copy(dst, src)` copies `min(len(dst), len(src)) * elemSize`
-cells via a counted loop. Both arguments can be any slice
-expression (variable, reslice, array slice).
+cells via a counted loop and returns the number of elements
+copied. Both arguments can be any slice expression (variable,
+reslice, array slice). When slices overlap, the copy direction
+is chosen at runtime (`dst.ptr >= src.ptr` copies backwards)
+to preserve correctness.
 
 `clear(s)` zeroes `len(s) * elemSize` cells via a counted
 loop starting at `ptr`.
@@ -296,8 +317,9 @@ Reslicing (`s[i:j]`) propagates `elemSize`, `elemType`,
 and `elemSlice` from the source. The analyzer stores
 `SliceElemSize` and `SliceElemType` in `ReturnInfo` for
 functions returning struct slices. `scanAndAllocLocals`
-detects struct slice range values and `tmp := s[i]`
-patterns to allocate struct-sized variables.
+detects struct slice range values, `tmp := s[i]`
+patterns, and `row := grid[i]` on 2D arrays or struct
+arrays to allocate appropriately-sized variables.
 
 ## Pointers
 
