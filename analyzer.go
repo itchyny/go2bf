@@ -45,6 +45,7 @@ type ParamInfo struct {
 	ArrayElemSize    int        // >0 for arrays: cells per element
 	ArrayElemType    string     // non-empty for arrays of structs
 	ArrayElemIntSize int        // >1 for arrays of multi-byte integers
+	ArrayElemSlice   bool       // true for arrays of slices ([N]string, [N][]byte)
 	StructType       string     // non-empty if the parameter is a struct type
 	IsSlice          bool       // true if []byte or []StructType
 	IsPointer        bool       // true if *byte, *[N]byte, *uintN, or *StructType
@@ -63,6 +64,7 @@ type ReturnInfo struct {
 	SliceElemSize    int    // cells per slice element (1 for byte)
 	SliceElemType    string // struct type name for slice elements
 	SliceElemIntSize int    // >1 for slices of multi-byte integers
+	SliceElemSlice   bool   // true for slice of slices ([]string, [][]byte)
 	IntSize          int    // >1 for multi-byte integer returns (2, 4, or 8)
 }
 
@@ -75,7 +77,9 @@ type StructDef struct {
 	FieldArraySizes       map[string]int    // field name -> array size (0 for non-array)
 	FieldInnerSizes       map[string]int    // field name -> inner element size for nested array fields
 	FieldArrayElemIntSize map[string]int    // field name -> element width for multi-byte int array fields
+	FieldArrayElemType    map[string]string // field name -> struct type name of array elements (for [N]Item)
 	FieldIntSizes         map[string]int    // field name -> integer size (2, 4, or 8)
+	FieldStrings          map[string]bool   // field name -> true if string (3-cell []byte header)
 	Size                  int               // total number of cells
 }
 
@@ -193,12 +197,8 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					}
 					for i, name := range vs.Names {
 						if i < len(lastExprs) {
-							// Handle string constants separately.
-							if lit, ok := lastExprs[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-								s, err := strconv.Unquote(lit.Value)
-								if err != nil {
-									return nil, fmt.Errorf("const %s: %w", name.Name, err)
-								}
+							// String-typed constants (literal, ident reference, or concat).
+							if s, ok := evalStringConstExpr(lastExprs[i], result.StringConsts); ok {
 								result.StringConsts[name.Name] = s
 								continue
 							}
@@ -241,7 +241,9 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 						FieldArraySizes:       make(map[string]int),
 						FieldInnerSizes:       make(map[string]int),
 						FieldArrayElemIntSize: make(map[string]int),
+						FieldArrayElemType:    make(map[string]string),
 						FieldIntSizes:         make(map[string]int),
+						FieldStrings:          make(map[string]bool),
 					}
 					offset := 0
 					for _, field := range st.Fields.List {
@@ -249,12 +251,17 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 						fieldType := ""
 						fieldArraySize := 0
 						fieldArrayElemIntSize := 0
+						fieldArrayElemType := ""
+						fieldIsString := false
 						if id, ok := field.Type.(*ast.Ident); ok {
 							if nested, ok := result.Structs[id.Name]; ok {
 								fieldSize = nested.Size
 								fieldType = id.Name
 							} else if n := intIdentSize(id.Name); n > 0 {
 								fieldSize = n
+							} else if id.Name == "string" {
+								fieldSize = 3 // ptr, len, cap
+								fieldIsString = true
 							}
 						} else if at, ok := field.Type.(*ast.ArrayType); ok && at.Len != nil {
 							arrSize, ies := arrayFieldInfo(field.Type)
@@ -270,6 +277,8 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 								if eltID, ok := at.Elt.(*ast.Ident); ok {
 									if n := intIdentSize(eltID.Name); n > 0 {
 										fieldArrayElemIntSize = n
+									} else if _, ok := result.Structs[eltID.Name]; ok {
+										fieldArrayElemType = eltID.Name
 									}
 								}
 							}
@@ -286,7 +295,12 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							if fieldArrayElemIntSize > 0 {
 								def.FieldArrayElemIntSize[name.Name] = fieldArrayElemIntSize
 							}
-							if fieldSize >= 2 && fieldType == "" && fieldArraySize == 0 {
+							if fieldArrayElemType != "" {
+								def.FieldArrayElemType[name.Name] = fieldArrayElemType
+							}
+							if fieldIsString {
+								def.FieldStrings[name.Name] = true
+							} else if fieldSize >= 2 && fieldType == "" && fieldArraySize == 0 {
 								def.FieldIntSizes[name.Name] = fieldSize
 							}
 							offset += fieldSize
@@ -355,6 +369,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							elemSize := 1
 							elemType := ""
 							elemIntSize := 0
+							elemSlice := false
 							if id, ok := at.Elt.(*ast.Ident); ok {
 								if def, ok := result.Structs[id.Name]; ok {
 									elemSize = def.Size
@@ -362,7 +377,13 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 								} else if n := intIdentSize(id.Name); n > 0 {
 									elemSize = n
 									elemIntSize = n
+								} else if id.Name == "string" {
+									elemSize = 3
+									elemSlice = true
 								}
+							} else if eltAt, ok := at.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
+								elemSize = 3
+								elemSlice = true
 							} else if innerSize := arrayTypeSize(at.Elt); innerSize > 0 {
 								elemSize = innerSize
 							}
@@ -371,12 +392,16 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							pi.ArrayElemSize = elemSize
 							pi.ArrayElemType = elemType
 							pi.ArrayElemIntSize = elemIntSize
+							pi.ArrayElemSlice = elemSlice
 						}
 					} else if id, ok := field.Type.(*ast.Ident); ok {
 						if _, ok := result.Structs[id.Name]; ok {
 							pi.StructType = id.Name
 						} else if n := intIdentSize(id.Name); n > 0 {
 							pi.IntSize = n
+						} else if id.Name == "string" {
+							pi.IsSlice = true
+							pi.ArrayElemSize = 1
 						}
 					} else if star, ok := field.Type.(*ast.StarExpr); ok {
 						pi.IsPointer = true
@@ -424,6 +449,8 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					if id, ok := field.Type.(*ast.Ident); ok {
 						if n := intIdentSize(id.Name); n > 0 {
 							retSize = n
+						} else if id.Name == "string" {
+							retSize = 3
 						}
 					}
 					if len(field.Names) == 0 {
@@ -447,6 +474,10 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							info.ReturnType.StructType = id.Name
 						} else if n := intIdentSize(id.Name); n > 0 {
 							info.ReturnType.IntSize = n
+						} else if id.Name == "string" {
+							info.ReturnType.IsSlice = true
+							info.ReturnType.SliceElemSize = 1
+							info.Returns = 3
 						}
 					} else if star, ok := retType.(*ast.StarExpr); ok {
 						if size := arrayTypeSize(star.X); size > 0 {
@@ -469,7 +500,15 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							} else if n := intIdentSize(id.Name); n > 0 {
 								info.ReturnType.SliceElemSize = n
 								info.ReturnType.SliceElemIntSize = n
+							} else if id.Name == "string" {
+								info.ReturnType.SliceElemSize = 3
+								info.ReturnType.SliceElemSlice = true
 							}
+						}
+						if eltAt, ok := at.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
+							// `[][]byte` or any other `[][]T` slice element
+							info.ReturnType.SliceElemSize = 3
+							info.ReturnType.SliceElemSlice = true
 						}
 						if size := arrayTypeSize(at.Elt); size > 0 {
 							info.ReturnType.SliceElemSize = size
@@ -510,6 +549,32 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 	}
 
 	return result, nil
+}
+
+// evalStringConstExpr folds a string-typed constant expression at compile
+// time. Handles string literals, references to known string constants,
+// and concatenation chains thereof. Returns (value, true) if foldable.
+func evalStringConstExpr(expr ast.Expr, stringConsts map[string]string) (string, bool) {
+	if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+		s, err := strconv.Unquote(lit.Value)
+		return s, err == nil
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		s, ok := stringConsts[id.Name]
+		return s, ok
+	}
+	if bin, ok := expr.(*ast.BinaryExpr); ok && bin.Op == token.ADD {
+		l, ok := evalStringConstExpr(bin.X, stringConsts)
+		if !ok {
+			return "", false
+		}
+		r, ok := evalStringConstExpr(bin.Y, stringConsts)
+		if !ok {
+			return "", false
+		}
+		return l + r, true
+	}
+	return "", false
 }
 
 // evalConstExpr evaluates a constant expression to an integer value.

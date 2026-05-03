@@ -5949,6 +5949,18 @@ func main() {
 			"", "1 2\n3 4\n5 6\n",
 		},
 		{
+			"slice literal of size-1 struct elements",
+			`package main
+type P struct { age byte }
+func main() {
+	ps := []P{{age: 1}, {age: 2}, {age: 3}}
+	for i := 0; i < len(ps); i++ {
+		println(ps[i].age)
+	}
+}`,
+			"", "1\n2\n3\n",
+		},
+		{
 			"array slice composite literal",
 			`package main
 func main() {
@@ -7018,6 +7030,23 @@ func main() {
 	println(p.x, p.y)
 }`,
 			"", "10 5\n",
+		},
+		{
+			"parallel swap of byte fields via pointer and value",
+			`package main
+type T struct { x byte }
+func swapPtr(p *T, q *T) { p.x, q.x = q.x, p.x }
+func main() {
+	a := T{x: 1}
+	b := T{x: 2}
+	swapPtr(&a, &b)
+	println(a.x, b.x)
+	c := T{x: 3}
+	d := T{x: 4}
+	c.x, d.x = d.x, c.x
+	println(c.x, d.x)
+}`,
+			"", "2 1\n4 3\n",
 		},
 		{
 			"struct array element swap",
@@ -8299,6 +8328,842 @@ func main() {
 }`,
 			"", "65535\n0\n100000\n16000000000\n",
 		},
+		// --- Strings ---
+		{
+			"string variable len index range print",
+			`package main
+func main() {
+	s := "hello"
+	print(len(s))
+	print(" ")
+	print(s[0])
+	print(" ")
+	for i, c := range s {
+		if i > 0 { print(",") }
+		print(c)
+	}
+	print(" ")
+	println(s)
+}`,
+			"", "5 104 104,101,108,108,111 hello\n",
+		},
+		{
+			"var string declaration",
+			`package main
+func main() {
+	x := byte(5)
+	var s string
+	if x > 3 {
+		s = "big"
+	} else {
+		s = "small"
+	}
+	println(s)
+	if s+"!" == "big!" { println("yes") }
+}`,
+			"", "big\nyes\n",
+		},
+		{
+			"string equality and inequality",
+			`package main
+func main() {
+	a := "hello"
+	b := "hello"
+	c := "world"
+	if a == b { print("eq ") }
+	if a == c { print("BAD ") }
+	if a != c { print("ne") }
+}`,
+			"", "eq ne",
+		},
+		{
+			"string concatenation",
+			`package main
+func main() {
+	a := "hello"
+	b := " world"
+	c := a + b
+	println(c)
+	println(len(c))
+}`,
+			"", "hello world\n11\n",
+		},
+		{
+			"string concat with literal operand",
+			`package main
+func main() {
+	s := "hi"
+	println(s + "a")
+	println(s + "b")
+}`,
+			"", "hia\nhib\n",
+		},
+		{
+			"string lexicographic ordering",
+			`package main
+func main() {
+	a := "abc"
+	b := "abd"
+	c := "abc"
+	d := "ab"
+	if a < b { print("1 ") }
+	if b < a { print("X ") }
+	if a > d { print("2 ") }
+	if a <= c { print("3 ") }
+	if a >= c { print("4") }
+}`,
+			"", "1 2 3 4",
+		},
+		{
+			"string compound assign",
+			`package main
+func main() {
+	s := "hello"
+	s += " world"
+	println(s)
+	s += "!"
+	println(s)
+}`,
+			"", "hello world\nhello world!\n",
+		},
+		{
+			"string function param and return",
+			`package main
+func greet(name string) string {
+	return "hi " + name
+}
+func main() {
+	println(greet("alice"))
+	s := "bob"
+	println(greet(s))
+}`,
+			"", "hi alice\nhi bob\n",
+		},
+		{
+			"string and byte-slice conversion",
+			`package main
+func main() {
+	s := "hello"
+	b := []byte(s)
+	print(b[0])
+	print(" ")
+	bs := []byte{'h', 'i'}
+	t := string(bs)
+	println(t)
+}`,
+			"", "104 hi\n",
+		},
+		{
+			"string compare with literal operand",
+			`package main
+func main() {
+	a := "abc"
+	if a == "abc" { print("1 ") }
+	if a != "abd" { print("2 ") }
+	if a < "abd" { print("3 ") }
+	if "" < a { print("4 ") }
+	if a > "" { print("5") }
+}`,
+			"", "1 2 3 4 5",
+		},
+		{
+			"empty string operations",
+			`package main
+func main() {
+	a := ""
+	println(len(a))
+	if a == "" { print("eq ") }
+	if a < "x" { print("lt") }
+	println()
+}`,
+			"", "0\neq lt\n",
+		},
+		{
+			"string field in struct",
+			`package main
+type P struct {
+	name string
+	age  byte
+}
+func main() {
+	p := P{name: "alice", age: 30}
+	println(p.name)
+	println(p.age)
+}`,
+			"", "alice\n30\n",
+		},
+		{
+			"string field compare equality",
+			`package main
+type P struct { name string }
+func main() {
+	p := P{name: "abc"}
+	q := P{name: "abc"}
+	r := P{name: "xyz"}
+	if p.name == q.name { println("eq") }
+	if p.name != r.name { println("ne") }
+	if p.name == "abc" { println("lit") }
+}`,
+			"", "eq\nne\nlit\n",
+		},
+		{
+			"string field concat and lex compare",
+			`package main
+type P struct { name string }
+func main() {
+	p := P{name: "foo"}
+	q := P{name: "bar"}
+	println(p.name + q.name)
+	println(p.name + "!")
+	if q.name < p.name { println("q<p") }
+}`,
+			"", "foobar\nfoo!\nq<p\n",
+		},
+		{
+			"declare string variable from struct field",
+			`package main
+type P struct { name string }
+func main() {
+	p := P{name: "hello"}
+	t := p.name
+	println(t)
+	println(len(t))
+}`,
+			"", "hello\n5\n",
+		},
+		{
+			"string field in struct array variable index",
+			`package main
+type P struct { name string }
+func main() {
+	ps := [3]P{{name: "foo"}, {name: "bar"}, {name: "baz"}}
+	for i := 0; i < 3; i++ {
+		println(ps[i].name)
+	}
+}`,
+			"", "foo\nbar\nbaz\n",
+		},
+		{
+			"string field compound assign",
+			`package main
+type P struct { name string }
+func main() {
+	p := P{name: "foo"}
+	p.name += "bar"
+	println(p.name)
+}`,
+			"", "foobar\n",
+		},
+		{
+			"string field via pointer-to-struct",
+			`package main
+type P struct { name string }
+func main() {
+	p := P{name: "old"}
+	pp := &p
+	println(pp.name)
+	pp.name = "new"
+	println(p.name)
+	pp.name += "!"
+	println(p.name)
+}`,
+			"", "old\nnew\nnew!\n",
+		},
+		{
+			"string field in slice of structs",
+			`package main
+type P struct { name string }
+func main() {
+	ps := make([]P, 3)
+	ps[0].name = "a"
+	ps[1].name = "b"
+	ps[2].name = "c"
+	for i := 0; i < len(ps); i++ {
+		println(ps[i].name)
+	}
+}`,
+			"", "a\nb\nc\n",
+		},
+		{
+			"concat with string field via array index",
+			`package main
+type P struct { name string }
+func main() {
+	items := [3]P{{name: "a"}, {name: "b"}, {name: "c"}}
+	for i := 0; i < 3; i++ {
+		println("- " + items[i].name)
+	}
+}`,
+			"", "- a\n- b\n- c\n",
+		},
+		{
+			"concat with string field via chained selector",
+			`package main
+type Inner struct { tag string }
+type Outer struct { inner Inner }
+func main() {
+	o := Outer{inner: Inner{tag: "hello"}}
+	println(">> " + o.inner.tag)
+	if o.inner.tag == "hello" { println("eq") }
+}`,
+			"", ">> hello\neq\n",
+		},
+		{
+			"slice literal of struct literals with string field",
+			`package main
+type P struct { name string }
+func main() {
+	ps := []P{{name: "foo"}, {name: "bar"}}
+	for i := 0; i < len(ps); i++ {
+		println(ps[i].name)
+	}
+}`,
+			"", "foo\nbar\n",
+		},
+		{
+			"slice string field",
+			`package main
+type P struct { name string }
+func main() {
+	p := P{name: "hello world"}
+	println(p.name[0:5])
+	println(p.name[6:])
+	println(p.name[:5])
+}`,
+			"", "hello\nworld\nhello\n",
+		},
+		{
+			"three way string concatenation",
+			`package main
+func main() {
+	a := "foo"
+	b := "bar"
+	c := "baz"
+	println(a + b + c)
+	println(a + "-" + b + "-" + c)
+}`,
+			"", "foobarbaz\nfoo-bar-baz\n",
+		},
+		{
+			"slice expression in string compare",
+			`package main
+func main() {
+	s := "hello"
+	for i := 0; i < len(s); i++ {
+		if s[i:i+1] == "l" {
+			println(i)
+		}
+	}
+}`,
+			"", "2\n3\n",
+		},
+		{
+			"byte to string conversion",
+			`package main
+func main() {
+	t := string(byte('A'))
+	println(t)
+	println(len(t))
+}`,
+			"", "A\n1\n",
+		},
+		{
+			"byte to string accumulator loop",
+			`package main
+func main() {
+	r := ""
+	for i := byte(0); i < 5; i++ {
+		r += string(byte('a') + i)
+	}
+	println(r)
+}`,
+			"", "abcde\n",
+		},
+		{
+			"switch on string tag",
+			`package main
+func main() {
+	s := "hello"
+	switch s {
+	case "world":
+		println("world")
+	case "hello":
+		println("hi")
+	default:
+		println("other")
+	}
+}`,
+			"", "hi\n",
+		},
+		{
+			"string const concatenation",
+			`package main
+const HELLO = "hello"
+const WORLD = "world"
+const GREETING = HELLO + ", " + WORLD
+func main() {
+	println(HELLO)
+	println(GREETING)
+}`,
+			"", "hello\nhello, world\n",
+		},
+		{
+			"parallel swap of string variables",
+			`package main
+func main() {
+	a := "alpha"
+	b := "beta"
+	a, b = b, a
+	println(a, b)
+}`,
+			"", "beta alpha\n",
+		},
+		{
+			"parallel swap of string fields",
+			`package main
+type T struct { name string }
+func swap(p *T, q *T) { p.name, q.name = q.name, p.name }
+func main() {
+	a := T{name: "alice"}
+	b := T{name: "bob"}
+	swap(&a, &b)
+	println(a.name, b.name)
+}`,
+			"", "bob alice\n",
+		},
+		{
+			"parallel swap of string field via value-base struct",
+			`package main
+type T struct { s string }
+func main() {
+	a := T{s: "alpha"}
+	b := T{s: "beta"}
+	a.s, b.s = b.s, a.s
+	println(a.s, b.s)
+}`,
+			"", "beta alpha\n",
+		},
+		{
+			"parallel swap of slice-of-strings elements",
+			`package main
+func main() {
+	a := []string{"alpha", "beta", "gamma"}
+	a[0], a[2] = a[2], a[0]
+	println(a[0], a[1], a[2])
+}`,
+			"", "gamma beta alpha\n",
+		},
+		{
+			"parallel swap of slice-of-strings via variable index",
+			`package main
+func main() {
+	a := []string{"x", "y", "z", "w"}
+	for i := byte(0); i < 2; i++ {
+		j := byte(3) - i
+		a[i], a[j] = a[j], a[i]
+	}
+	println(a[0], a[1], a[2], a[3])
+}`,
+			"", "w z y x\n",
+		},
+		{
+			"parallel swap of array-of-strings elements",
+			`package main
+func main() {
+	a := [3]string{"alpha", "beta", "gamma"}
+	a[0], a[2] = a[2], a[0]
+	for i := byte(0); i < 1; i++ {
+		j := byte(2) - i
+		a[i], a[j] = a[j], a[i]
+	}
+	for i := 0; i < 3; i++ { println(a[i]) }
+}`,
+			"", "alpha\nbeta\ngamma\n",
+		},
+		{
+			"parallel assign with string literal RHS",
+			`package main
+func main() {
+	a := []string{"x", "y"}
+	a[0], a[1] = "first", "second"
+	println(a[0], a[1])
+}`,
+			"", "first second\n",
+		},
+		{
+			"range over slice literal of strings",
+			`package main
+func main() {
+	for _, s := range []string{"foo", "bar", "baz"} {
+		switch s {
+		case "foo", "bar":
+			println(s, "small")
+		case "baz":
+			println(s, "medium")
+		default:
+			println(s, "other")
+		}
+	}
+}`,
+			"", "foo small\nbar small\nbaz medium\n",
+		},
+		{
+			"function multi-return with string and byte",
+			`package main
+func split() (string, byte) { return "head", 42 }
+func main() {
+	s, n := split()
+	println(s)
+	print(n)
+}`,
+			"", "head\n42",
+		},
+		{
+			"function multi-return two strings",
+			`package main
+func pair() (string, string) { return "head", "tail" }
+func main() {
+	a, b := pair()
+	println(a, b)
+	println(a + "-" + b)
+}`,
+			"", "head tail\nhead-tail\n",
+		},
+		{
+			"range over string literal",
+			`package main
+func main() {
+	for i, c := range "abc" {
+		print(byte(i))
+		putchar(':')
+		putchar(c)
+		putchar('\n')
+	}
+}`,
+			"", "0:a\n1:b\n2:c\n",
+		},
+		{
+			"byte var to string in concat",
+			`package main
+func main() {
+	a := "X"
+	x := byte('Y')
+	t := a + string(x)
+	println(t)
+}`,
+			"", "XY\n",
+		},
+		{
+			"string of slice element in concat",
+			`package main
+func main() {
+	s := "abcde"
+	a := string(s[0])
+	b := string(s[2])
+	t := a + b
+	println(t)
+	println(string(s[0]) + string(s[2]) + string(s[4]))
+	r := ""
+	for i := byte(0); i < byte(len(s)); i++ {
+		r += string(s[i])
+	}
+	println(r)
+}`,
+			"", "ac\nace\nabcde\n",
+		},
+		{
+			"struct equality with string field",
+			`package main
+type P struct {
+	name string
+	age  byte
+}
+func main() {
+	a := P{name: "x", age: 1}
+	b := P{name: "x", age: 1}
+	c := P{name: "y", age: 1}
+	d := P{name: "x", age: 2}
+	if a == b { println("ab eq") }
+	if a != c { println("ac ne") }
+	if a != d { println("ad ne") }
+}`,
+			"", "ab eq\nac ne\nad ne\n",
+		},
+		{
+			"slice of strings literal and indexing",
+			`package main
+func main() {
+	s := []string{"alpha", "beta", "gamma"}
+	for i := 0; i < len(s); i++ {
+		println(s[i])
+	}
+}`,
+			"", "alpha\nbeta\ngamma\n",
+		},
+		{
+			"slice of strings make and assign",
+			`package main
+func main() {
+	s := make([]string, 3)
+	s[0] = "first"
+	s[1] = "second"
+	s[2] = "third"
+	for i := 0; i < 3; i++ {
+		println(s[i])
+	}
+}`,
+			"", "first\nsecond\nthird\n",
+		},
+		{
+			"slice of strings range with key value",
+			`package main
+func main() {
+	s := []string{"a", "b", "c"}
+	for i, v := range s {
+		print(i)
+		print(":")
+		println(v)
+	}
+}`,
+			"", "0:a\n1:b\n2:c\n",
+		},
+		{
+			"slice of strings append and modify",
+			`package main
+func main() {
+	s := []string{"foo", "bar"}
+	s = append(s, "baz")
+	s[0] = "FOO"
+	for _, v := range s {
+		println(v)
+	}
+}`,
+			"", "FOO\nbar\nbaz\n",
+		},
+		{
+			"slice of strings compare and concat element",
+			`package main
+func main() {
+	s := []string{"hi", "world"}
+	if s[0] == "hi" { println("eq") }
+	println(s[0] + " " + s[1])
+}`,
+			"", "eq\nhi world\n",
+		},
+		{
+			"slice of strings from function return",
+			`package main
+func makeList() []string {
+	return []string{"x", "y", "z"}
+}
+func main() {
+	for _, v := range makeList() {
+		println(v)
+	}
+}`,
+			"", "x\ny\nz\n",
+		},
+		{
+			"array of strings literal indexing and range",
+			`package main
+func main() {
+	a := [3]string{"alpha", "beta", "gamma"}
+	for i := 0; i < 3; i++ {
+		println(a[i])
+	}
+	for _, v := range a {
+		println(v)
+	}
+}`,
+			"", "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\n",
+		},
+		{
+			"array of strings element assign and compare",
+			`package main
+func main() {
+	a := [3]string{"a", "b", "c"}
+	a[0] = "ALPHA"
+	if a[1] == "b" { println("eq") }
+	println(a[0])
+	println(a[0] + "/" + a[2])
+}`,
+			"", "eq\nALPHA\nALPHA/c\n",
+		},
+		{
+			"array of strings function parameter",
+			`package main
+func printArr(a [3]string) {
+	for i := 0; i < 3; i++ {
+		println(a[i])
+	}
+}
+func main() {
+	a := [3]string{"alpha", "beta", "gamma"}
+	printArr(a)
+}`,
+			"", "alpha\nbeta\ngamma\n",
+		},
+		{
+			"array of byte slices",
+			`package main
+func main() {
+	a := [3][]byte{{'h', 'i'}, {'g', 'o'}, {'b', 'y'}}
+	for i := 0; i < 3; i++ {
+		println(string(a[i]))
+		println(len(a[i]))
+	}
+}`,
+			"", "hi\n2\ngo\n2\nby\n2\n",
+		},
+		{
+			"nested struct equality with string field",
+			`package main
+type Inner struct { name string }
+type Outer struct {
+	a Inner
+	b byte
+}
+func main() {
+	x := Outer{a: Inner{name: "foo"}, b: 1}
+	y := Outer{a: Inner{name: "foo"}, b: 1}
+	z := Outer{a: Inner{name: "bar"}, b: 1}
+	if x == y { println("xy eq") }
+	if x != z { println("xz ne") }
+}`,
+			"", "xy eq\nxz ne\n",
+		},
+		{
+			"string const in len and slice",
+			`package main
+const LONG = "abcdefghijklmnop"
+func main() {
+	println(len(LONG))
+	for i := 0; i < len(LONG); i += 4 {
+		println(LONG[i : i+4])
+	}
+}`,
+			"", "16\nabcd\nefgh\nijkl\nmnop\n",
+		},
+		{
+			"function returning string in concat chain",
+			`package main
+func repeat(s string, n byte) string {
+	r := ""
+	for i := byte(0); i < n; i++ {
+		r += s
+	}
+	return r
+}
+func main() {
+	println(repeat("X", 4) + "-" + repeat("Y", 2))
+}`,
+			"", "XXXX-YY\n",
+		},
+		{
+			"defer with string concat argument",
+			`package main
+func main() {
+	s := "hello"
+	defer println(s + "!")
+	s = "world"
+	println("first")
+}`,
+			"", "first\nhello!\n",
+		},
+		{
+			"named string return with bare return",
+			`package main
+func greet() (msg string) {
+	msg = "hello"
+	msg += " "
+	msg += "world"
+	return
+}
+func main() {
+	println(greet())
+}`,
+			"", "hello world\n",
+		},
+		{
+			"parenthesized string concat",
+			`package main
+func main() {
+	a := "1"
+	b := "2"
+	c := "3"
+	println(a + (b + c))
+	println((a + b) + c)
+	println((a + b) + (b + c))
+}`,
+			"", "123\n123\n1223\n",
+		},
+		{
+			"slice expression on function call result",
+			`package main
+func makeS() string { return "hello world" }
+func main() {
+	println(makeS()[0:5])
+	println(makeS()[6:])
+	println(makeS()[3:8])
+}`,
+			"", "hello\nworld\nlo wo\n",
+		},
+		{
+			"println multiple string arguments",
+			`package main
+func main() {
+	a := "hello"
+	b := "world"
+	println(a, b)
+	println(a, b, "!")
+}`,
+			"", "hello world\nhello world !\n",
+		},
+		{
+			"string slicing assignment via field",
+			`package main
+type T struct { name string }
+func main() {
+	p := T{name: "hello"}
+	for byte(len(p.name)) > 1 {
+		p.name = p.name[1:]
+		println(p.name)
+	}
+}`,
+			"", "ello\nllo\nlo\no\n",
+		},
+		{
+			"empty string slice via len",
+			`package main
+func main() {
+	s := "hello"
+	t := s[len(s):]
+	println(len(t))
+	println("[" + t + "]")
+}`,
+			"", "0\n[]\n",
+		},
+		{
+			"string last char via len-1",
+			`package main
+func main() {
+	s := "hello"
+	println(s[len(s)-1])
+	println(s[len(s)-2])
+}`,
+			"", "111\n108\n",
+		},
+		{
+			"println string of byte slice keeps slice semantics",
+			`package main
+func main() {
+	bs := []byte{'h', 'i'}
+	println(string(bs))
+	bs = append(bs, '!')
+	println(string(bs))
+}`,
+			"", "hi\nhi!\n",
+		},
 		// --- Pointers ---
 		{
 			"pointer read",
@@ -8770,6 +9635,19 @@ func main() {
 			"", "9",
 		},
 		{
+			"parallel swap via deref",
+			`package main
+func main() {
+	var x byte = 1
+	var y byte = 2
+	px := &x
+	py := &y
+	*px, *py = *py, *px
+	println(x, y)
+}`,
+			"", "2 1\n",
+		},
+		{
 			"pointer array index decrement",
 			`package main
 func main() {
@@ -8920,7 +9798,7 @@ func main() {
 	x := "hello"
 	putchar(x)
 }`,
-			"string literals can only be used with print/println",
+			"cannot use slice as argument to putchar",
 		},
 		{
 			"too many locals in recursive function",
@@ -9368,7 +10246,7 @@ func main() {
 	x := "hello"
 	putchar(x)
 }`,
-			"string literals can only be used with print/println",
+			"cannot use slice as argument to putchar",
 		},
 		{
 			"uint64 putchar",

@@ -299,6 +299,245 @@ detects struct slice range values, `tmp := s[i]`
 patterns, and `row := grid[i]` on 2D arrays or struct
 arrays to allocate appropriately-sized variables.
 
+## Strings
+
+Strings are represented as `[]byte` slices, so all the slice
+machinery (heap allocation, dynamic length, indexing, range,
+`append`) is reused. A string literal `"hello"` lowers via
+`evalStringLiteral` to a fresh heap-backed slice with the
+bytes pre-stored.
+
+- `s := "hello"` -- `declareFromAssign` recognizes the literal
+  and registers `s` as a slice; `lowerSliceExpr` dispatches on
+  the literal kind and runs `evalStringLiteral`.
+- `var s string` -- `declareFromDecl` treats `string` as a
+  3-cell slice header so a subsequent `s = "..."` lands in the
+  slice-assign path.
+- `len(s)`, `s[i]`, `for i, c := range s` -- ordinary slice ops.
+- `print(s)` / `println(s)` -- the print path detects a byte-
+  slice argument (or a string-shaped exprResult) and runs
+  `emitPrintBytes`, which loops over `len` writing each byte
+  with `IRPutc`. Multiple args are joined with spaces.
+- `s == t` / `s != t` -- `lowerSliceCompare` initializes
+  `result = (len(a) == len(b))`, then loops byte-by-byte ANDing
+  per-byte equality into `result`. The loop is wrapped in
+  `IRIf{Cond: result}` so unequal-length operands skip it.
+- `s + t` -- `lowerStringConcat` resolves both operands once
+  (literals fold to compile-time lengths, idents/selectors
+  return their existing slice header, callers like
+  `string(byteExpr)` materialize via `evalByteToString`),
+  pre-sizes `cap = sum(lens)`, allocates the destination
+  region, and walks operands a second time emitting either
+  `appendLiteralBytes` (inline `IRConst`+`ptrStore` per byte)
+  or `appendBytesFromSlice` (loop using the resolved
+  `sliceInfo`). Resolving once avoids double heap allocation
+  when an operand is itself a heap-allocating expression.
+  Chained `a + b + c` and parenthesized `a + (b + c)` both
+  dispatch here.
+- `s += t` -- the existing `+=` desugar (`s = s + t`) and
+  the slice-assign path handle this; no new code.
+- `s < t` / `s > t` / `s <= t` / `s >= t` -- `lowerSliceLexCompare`
+  walks bytes from index 0 over `min(len(a), len(b))`. At the
+  first non-equal pair it sets the result via `IRCmp` and
+  flips a `done` flag so subsequent iterations short-circuit.
+  If all bytes match, the result falls through to a length
+  comparison; for `<=`/`>=`, equal lengths set the result to 1.
+- `func f(s string) string` -- the analyzer treats `string`
+  as a slice param/return with `SliceElemSize=1`, reusing all
+  the existing slice param/return plumbing. Single named
+  string returns (`func g() (msg string)`) bind `msg` as a
+  `sliceBinding` whose ptr/len/cap alias the return cells, so
+  bare `return` works.
+- `string(bs)` and `[]byte(s)` -- both lower via
+  `copyStringSlice`: resolve the source once, copy its `len`
+  into the dst cap, push a heap region via `pushHeapRegion`,
+  then `appendBytesFromSlice` to copy the bytes. The new
+  slice has independent storage so mutations to either side
+  don't affect the other.
+- `string(byteExpr)` -- `evalByteToString` allocates a fresh
+  1-byte heap-backed slice and stores the byte value at the
+  pointer cell. Recognized in `declareFromAssign` (`t :=
+  string(byte('A'))`), in `lowerSliceExpr`'s CallExpr branch
+  (so concat operands materialize), and via `isStringExpr`'s
+  CallExpr case so the surrounding `+` chain dispatches
+  correctly.
+- `s[low:high]` on any string-shaped base --
+  `evalSliceExpr` / `lowerSliceFromSliceExpr` accept idents,
+  `p.name` selectors, string-const idents (`LONG[i:i+4]`),
+  and arbitrary string-shaped expressions like
+  `makeS()[0:5]`. Non-Ident bases are routed through
+  `resolveStringSlice` to produce a temporary `sliceInfo`,
+  then `lowerSliceFromSrcSliceInfo` emits the bounds
+  arithmetic.
+- `switch s { case "lit": ... }` -- `lowerSwitch` detects a
+  string-typed tag and stores it as a slice header so the
+  generated `tag == "lit"` chain dispatches to
+  `lowerSliceCompare`. Without this the tag would be forced
+  into a single byte cell and string literals would error.
+- String constants -- `evalStringConstExpr` folds string-
+  typed constant expressions at compile time: literals,
+  references to other string consts, and `+` chains thereof.
+  Both the analyzer's package-level loop and the lowerer's
+  local-const loop call it. Using a string const in a
+  slice/`len`/concat context goes through `lowerIdent`'s
+  string-const branch, which materializes a fresh heap-backed
+  slice on demand. The `putchar` guard preserves the original
+  "string constant X can only be used with print/println"
+  error for byte-only contexts.
+- `defer println(s + "!")` -- `lowerDefer` captures string-
+  shaped argument expressions (those whose lowered result has
+  `lenCell != 0` and byte-slice shape) into a fresh slice
+  binding by copying ptr/len/cap, so the eventual deferred
+  call sees the value at defer time rather than a stale byte
+  cell.
+- String fields in structs -- the analyzer records each
+  string-typed field in `StructDef.FieldStrings` and reserves
+  3 cells (ptr, len, cap) at the field's offset.
+  `lowerStructValueTo` initializes the field by resolving the
+  RHS via `resolveStringSlice` and copying the three header
+  cells. `lowerSelectorExpr` returns an `isPointer` result with
+  `lenCell`/`capCell` pointing into the struct so reads, range,
+  print, and length all reuse the slice machinery.
+  `lowerFieldAssign` mirrors the literal init path for
+  `p.name = expr`. The same path covers pointer access
+  (`pp.name`, `pp.name = expr`, `pp.name += expr`): the
+  pointer-read branch in `lowerSelectorExpr` calls
+  `loadStringHeaderViaPtr`, and the pointer-write branch in
+  `lowerFieldAssign` calls `storeStringHeaderViaPtr`. Both
+  are thin wrappers around the generic
+  `loadConsecutiveViaPtr` / `storeConsecutiveViaPtr` helpers
+  that walk three consecutive heap slots. Variable-index
+  struct-array access (`ps[i].name`) uses the index-based
+  twin `loadConsecutiveViaIndex`, which copies a row index
+  cell per byte and dispatches through `emitVariableIndexRead`.
+  Multi-byte int fields share the same plumbing via
+  `loadMultiByteIntViaPtr` (pointer access) and
+  `storeConsecutiveViaPtr` (pointer write).
+- Struct equality with string fields -- `lowerCompositeCompare`
+  walks fields rather than cells when both operands are the
+  same struct type. `emitStructCompare` dispatches per field:
+  string fields call `emitStringEq` (the inline form of
+  `lowerSliceCompare`), nested struct fields recurse, and
+  every other field compares cell-by-cell under a result
+  guard so an early mismatch short-circuits the rest. Without
+  this, `P{name: "x"} == P{name: "x"}` compared ptr cells and
+  always returned false; nested cases like
+  `Outer{a: Inner{name: "x"}}` would have failed similarly.
+- Slice literals of struct literals -- `evalSliceLiteral`
+  infers types for typeless inner literals
+  (`[]P{{name: "x"}}`) by setting their `Type` field from
+  `comp.Type.(*ast.ArrayType).Elt`. The dispatch routes any
+  struct-typed element (`elemType != ""`) through
+  `resolveStructArg`. Size-1 structs from a slice index are
+  handled in `lowerSelectorExpr`'s `IndexExpr` branch: when
+  the indexed result is a temp byte from a size-1 struct, the
+  only field IS that byte, so we return it directly with
+  `temp` propagated.
+
+`isStringExpr` and `stringLiteralValue` are the predicates
+that classify "string-producing" expressions. `isStringExpr`
+handles: string literals, string-const idents, byte-slice
+idents, string-typed struct field selectors (via
+`isStringSelector`, which covers both direct local structs
+and pointer-to-struct), `BinaryExpr` ADD whose operands are
+both string-shaped (so chains compose), `SliceExpr` whose
+base is string-shaped, `CallExpr` to `string(...)` /
+`[]byte(...)` / a user-defined function returning a byte
+slice, and `ParenExpr` (unwrapped recursively).
+`resolveStringSlice` falls through to `lowerSliceExpr` for
+non-Ident/non-Selector/non-literal string-shaped expressions
+(e.g. the BinaryExpr produced by the `+=` desugar), so all
+paths converge to a `sliceInfo`.
+
+`[]string`, `[N]string`, `[][]byte`, and `[N][]byte` are all
+supported. Each element is a 3-cell `[]byte` slice header.
+`sliceElemInfo` and `arrayElementInfo` recognise both
+`Ident "string"` and `*ast.ArrayType` (without a length) as
+slice-element types and return `elemSlice=true` (a new bool
+on both `sliceInfo` and `arrayInfo`). `lowerCompositeLitInto`'s
+`elemSlice` branch also infers the element type for typeless
+inner literals (`[N][]byte{{'h','i'},...}`) by wrapping each
+element in a synthetic `[]byte{...}` and routing it through
+`evalSliceLiteral`.
+
+For slices, the existing slice-of-slices machinery handles
+`[]string` directly. For arrays, `lowerCompositeLitInto`
+gained an `elemSlice` branch that resolves each element via
+`resolveStringSlice` and copies the three header cells into
+the array slot, and `lowerArrayAssign` handles `a[i] = "x"`
+both for constant index (in-place IRCopy) and variable
+index (storeConsecutiveViaIndex via a flat array).
+`indexInto`'s constant-index path returns a string-shaped
+exprResult pointing at the three cells (no copy needed,
+since they're addressable). Variable-index reads use
+`loadConsecutiveViaIndex` into a fresh `sliceInfo`.
+
+Range over `[]string` / `[N]string` declares the value
+binding as a `sliceBinding` (its three header cells need not
+be contiguous in the cell pool), and `lowerRange` writes the
+loaded ptr/len/cap into the binding's actual cells via the
+`valSliceCells` override. The print path's `string(s[i])`
+shortcut sees the indexed string-shape via the new
+`IndexExpr` branch in `isStringExpr`, so `println(string(s[i]))`
+and `println(s[i])` both go through `emitPrintBytes`.
+
+Range over a string or slice **literal** (`for i, c := range
+"abc"`, `for _, s := range []string{"a","b"}`) takes the
+`lowerSliceExpr` fallback in `lowerRange`: when `lowerExpr`
+on the source fails or returns a non-iterable shape, the
+materialized `sliceInfo` is wrapped into a synthetic pointer-
+shape `exprResult` that mirrors the slice's `elemSize` and
+`elemSlice` flag so the iteration logic dispatches correctly.
+`declareFromRange` picks up the same case for slice-of-strings
+and slice-of-byte-slices composite-literal sources.
+
+## Multi-return tuples with strings
+
+`func f() (string, byte)` and similar shapes thread a
+3-cell slice header through one or more return slots. The
+analyzer's per-field return-type detection recognises `string`
+identifiers and sets `ReturnSizes[i] = 3`, so the call site
+allocates the right total cell count. `lowerReturn`'s multi-
+return loop tries `lowerExpr` first, falls back to
+`lowerSliceExpr` for string/slice literals, and writes 3 cells
+when the result has `lenCell != 0`. `lowerMultiReturnAssign`
+mirrors the pattern on the LHS: when `ReturnSizes[i] == 3`
+the target is taken to be a string variable and its three
+header cells receive the return slot's three cells.
+`declareFromAssign` defines the LHS as a `sliceBinding` for
+the same condition.
+
+## Parallel assignment with strings
+
+`a, b = b, a`, `p.name, q.name = q.name, p.name`, and
+`s[i], s[j] = s[j], s[i]` all go through one path. Each RHS
+is lowered, and if the result has `lenCell != 0` (string or
+slice header), all three cells (ptr, len, cap) are snapshotted
+into fresh temps before any LHS write. Otherwise the
+single-cell snapshot is taken as before. The LHS dispatch
+then routes by node type:
+
+- `*ast.IndexExpr` byte/scalar: `writeInto` (existing path).
+- `*ast.SelectorExpr` byte/scalar: `assignFieldFromCell`,
+  which mirrors `lowerFieldAssign`'s pointer-base and
+  value-base writes for byte fields.
+- `*ast.StarExpr` byte: `lowerDerefAssignFromCell`, a thin
+  helper around `ptrStore`.
+- 3-cell snapshots: `assignStringHeader`, which writes the
+  ptr/len/cap triple either directly (value-base struct field,
+  string variable), via `storeStringHeaderViaPtr` (pointer-base
+  struct field), via three direct `IRCopy`s (constant array
+  index), via inline `ptrStore`s (pointer-based slice element),
+  or via `storeConsecutiveViaIndex` (variable-index array
+  element).
+
+The pre-fix path lowered the LHS via `lowerExpr`, which for
+struct-field selectors *reads* the field into a temp; the
+"write" then went into that temp and was discarded, so the
+swap appeared to do nothing. For string fields the situation
+was worse since only the ptr cell was snapshotted in the
+first place.
+
 ## Pointers
 
 Pointers are byte values holding stack slot indices. `&x` emits

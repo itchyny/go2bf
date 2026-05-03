@@ -305,6 +305,26 @@ The generated Brainfuck uses a CPU-like execution model:
 - Backed by a dynamic allocator with in-place growth
   when possible (old arrays not freed otherwise)
 
+### Strings
+
+- String variables backed by `[]byte` slices: `s := "hello"`,
+  `var s string`, `s = "world"`, `print(s)`, `println(s)`
+- `len(s)`, `s[i]`, `s[i:j]`, `s[i:]`, `s[:j]`
+- Range over string (by byte, not rune): `for i, b := range s`
+- Equality, lexicographic ordering: `s == t`, `s != t`,
+  `s < t`, `s > t`, `s <= t`, `s >= t`
+- Concatenation `s + t` and compound assign `s += t`
+- Conversions: `[]byte(s)`, `string(bs)`, `string(byte('A'))`
+- Function parameters and returns, including named string
+  returns (`func g() (msg string)`) and multi-return tuples
+  containing strings (`func f() (string, byte)`)
+- `defer println(s + "!")`, `switch s { case "test": ... }`
+- String constants and concatenations of them in `const` blocks
+- String fields in structs, struct equality compares string content
+- Slices and arrays of strings or byte slices:
+  `[]string{"a", "b"}`, `[N]string{"a", "b", "c"}`,
+  `[N][]byte{{'h','i'}, {'b','y','e'}}`, `make([]string, n)`
+
 ### Pointers
 
 - `*byte`, `*uintN` pointers: `&x`, `*p`, `*p = v`, `*p++`, `*p--`
@@ -340,8 +360,8 @@ go2bf extensions:
 
 ## Limitations
 
-- No `int`, `string`, signed integer types,
-  floating-point number types, or complex number types.
+- No `int`, signed integer types, floating-point number
+  types, or complex number types.
 - No import statements.
 - No maps, interfaces, or channels.
 - Array nesting up to `[N][M][K]byte`, `[N][M]Point`,

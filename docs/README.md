@@ -20,8 +20,8 @@ from Go to Brainfuck.
 ## Compilation
 
 - [Lowering](lowering.md) - how Go constructs are translated to IR:
-  function inlining, structs, arrays, defer, control flow, and
-  `divmod` fusion
+  function inlining, structs, arrays, slices, strings, multi-byte
+  integers, defer, control flow, and `divmod` fusion
 - [IR](ir.md) - the intermediate representation: node types, cell
   allocation, and peephole optimization
 - [Code Generation](codegen.md) - BF generation for arithmetic,
