@@ -181,12 +181,8 @@ Key rules when modifying multi-byte code:
 - N-byte comparisons walk bytes high-to-low with a
   runtime `done` flag (flat-iterative, not nested
   if-else) to keep codegen-temp pressure low at uint64.
-- `scanAndAllocLocals` must process local consts and types
-  during scanning so subsequent declarations can use them.
 - `emitPrintInt` uses algebraic digit decomposition via
   `decimalDigits(k)` to avoid multi-byte arithmetic.
-  Copy input bytes before allocating accumulators to
-  prevent aliasing.
 
 ## Known Limitations
 

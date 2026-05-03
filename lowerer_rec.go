@@ -1470,7 +1470,8 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 	for j, name := range info.Params {
 		if vals[j].size > 0 {
 			if vals[j].def != nil {
-				sc.structs[name] = structInfo{base: vals[j].base, def: vals[j].def}
+				si := structInfo{base: vals[j].base, def: vals[j].def}
+				sc[name] = &structBinding{info: si}
 			} else {
 				rl.defineArray(sc, name, vals[j].size)
 				paramAI, _ := rl.lookupArray(name)
@@ -1479,14 +1480,13 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 				}
 				continue
 			}
-			sc.vars[name] = vals[j].base
+			sc.defineByte(name, vals[j].base)
 		} else {
 			cell := rl.allocCell()
 			rl.emit(&IRCopy{Dst: cell, Src: vals[j].cell})
-			sc.vars[name] = cell
+			sc.defineByte(name, cell)
 		}
 	}
-	rl.scanAndAllocLocals(info.Body)
 	retCells := make([]Cell, info.Returns)
 	for j := range retCells {
 		retCells[j] = rl.allocCell()

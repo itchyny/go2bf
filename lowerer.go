@@ -17,7 +17,7 @@ type Lowerer struct {
 	nodes     []IRNode
 	nextCell  Cell
 	freeCells []Cell
-	scopes    []*scope
+	scopes    []scope
 
 	// Return context for inlined functions.
 	returnDst  []Cell // cells where return values should be written
@@ -45,29 +45,116 @@ type Lowerer struct {
 }
 
 // scope holds variable bindings for the current lexical scope.
-type scope struct {
-	vars       map[string]Cell
-	consts     map[string]byte       // compile-time constants
-	intCells   map[string]Cell       // multi-byte int variable name -> base cell
-	intSizes   map[string]int        // multi-byte int variable name -> size (2, 4, or 8)
-	arrays     map[string]arrayInfo  // base cell and size
-	structs    map[string]structInfo // base cell and field layout
-	slices     map[string]sliceInfo  // slice header (ptr, len, cap)
-	ptrType    map[string]string     // variable name -> pointed-to struct type name
-	ptrArray   map[string]arrayInfo  // variable name -> pointed-to array info
-	ptrIntSize map[string]int        // variable name -> pointed-to integer size
+type scope map[string]binding
+
+// binding is a tagged-union of what a name in scope can be. byteBinding
+// covers ordinary byte vars and pointer cells (which are bytes holding a
+// slot index, optionally annotated with the pointee's type metadata).
+type binding interface{ isBinding() }
+
+type byteBinding struct {
+	cell       Cell
+	ptrType    string     // non-empty if this var is a pointer-to-struct
+	ptrArray   *arrayInfo // non-nil if this var is a pointer-to-array
+	ptrIntSize int        // non-zero if this var is a pointer-to-uintN
+}
+type intBinding struct {
+	base Cell
+	size int // 2, 4, or 8
+}
+type arrayBinding struct{ info arrayInfo }
+type structBinding struct{ info structInfo }
+type sliceBinding struct{ info sliceInfo }
+type constBinding struct{ value byte }
+type intConstBinding struct {
+	value uint64
+	size  int // 2, 4, or 8
 }
 
-// sliceInfo holds the 3-cell header for a slice variable.
-type sliceInfo struct {
-	ptr         Cell   // cell holding stack slot index of first element
-	len         Cell   // cell holding current length
-	cap         Cell   // cell holding capacity
-	elemSize    int    // cells per element (1 for byte)
-	elemType    string // struct type name (empty for byte)
-	elemSlice   bool   // true if element is a slice ([][]byte)
-	elemPtrType string // struct type for pointer elements ([]*Point)
-	elemIntSize int    // >1 for slices of multi-byte integers (uint16/uint32/uint64)
+func (*byteBinding) isBinding()     {}
+func (*intBinding) isBinding()      {}
+func (*arrayBinding) isBinding()    {}
+func (*structBinding) isBinding()   {}
+func (*sliceBinding) isBinding()    {}
+func (*constBinding) isBinding()    {}
+func (*intConstBinding) isBinding() {}
+
+// byteBindingFor returns the *byteBinding for name. If a non-byte binding
+// already exists (e.g. struct/array/slice), returns nil so callers skip
+// the annotation -- composites can't also be pointers.
+// Otherwise, creates a fresh byteBinding if none exists.
+func (sc scope) byteBindingFor(name string) *byteBinding {
+	if existing, ok := sc[name]; ok {
+		b, ok := existing.(*byteBinding)
+		if !ok {
+			return nil
+		}
+		return b
+	}
+	b := &byteBinding{}
+	sc[name] = b
+	return b
+}
+
+// has reports whether name is bound to any kind in this scope.
+func (sc scope) has(name string) bool {
+	_, ok := sc[name]
+	return ok
+}
+
+func (sc scope) hasArray(name string) bool {
+	_, ok := sc[name].(*arrayBinding)
+	return ok
+}
+
+func (sc scope) hasStruct(name string) bool {
+	_, ok := sc[name].(*structBinding)
+	return ok
+}
+
+func (sc scope) hasSlice(name string) bool {
+	_, ok := sc[name].(*sliceBinding)
+	return ok
+}
+
+func (sc scope) hasIntCell(name string) bool {
+	_, ok := sc[name].(*intBinding)
+	return ok
+}
+
+func (sc scope) hasVar(name string) bool {
+	_, ok := sc[name].(*byteBinding)
+	return ok
+}
+
+// defineByte binds a fresh byte var (or pointer cell) in this scope.
+// If a byteBinding already exists (from a prior annotation), reuse it so
+// pointer metadata is preserved.
+func (sc scope) defineByte(name string, c Cell) {
+	if b := sc.byteBindingFor(name); b != nil {
+		b.cell = c
+	}
+}
+
+// annotatePtrType marks an existing byte var as a pointer-to-struct.
+func (sc scope) annotatePtrType(name, typeName string) {
+	if b := sc.byteBindingFor(name); b != nil {
+		b.ptrType = typeName
+	}
+}
+
+// annotatePtrArray marks an existing byte var as a pointer-to-array.
+func (sc scope) annotatePtrArray(name string, ai arrayInfo) {
+	if b := sc.byteBindingFor(name); b != nil {
+		b.ptrArray = &ai
+	}
+}
+
+// annotatePtrIntSize marks an existing byte var as a pointer-to-uintN.
+func (sc scope) annotatePtrIntSize(name string, n int) {
+	if b := sc.byteBindingFor(name); b != nil {
+		b.ptrIntSize = n
+	}
 }
 
 type arrayInfo struct {
@@ -84,6 +171,17 @@ type arrayInfo struct {
 type structInfo struct {
 	base Cell
 	def  *StructDef // field names, offsets, size
+}
+
+type sliceInfo struct {
+	ptr         Cell   // cell holding stack slot index of first element
+	len         Cell   // cell holding current length
+	cap         Cell   // cell holding capacity
+	elemSize    int    // cells per element (1 for byte)
+	elemType    string // struct type name (empty for byte)
+	elemSlice   bool   // true if element is a slice ([][]byte)
+	elemPtrType string // struct type for pointer elements ([]*Point)
+	elemIntSize int    // >1 for slices of multi-byte integers (uint16/uint32/uint64)
 }
 
 type exprResult struct {
@@ -120,16 +218,22 @@ func Lower(result *AnalysisResult) (*Program, error) {
 		nextCell: numFixed,
 	}
 
-	info := result.Funcs["main"]
 	// Reserve slot 0 for heapPtr so that no user variable occupies slot 0.
 	// This makes pointer value 0 a reliable nil sentinel.
 	l.heapPtr = l.allocCell()
 	l.pushScope()
+
 	// Load top-level constants into scope.
-	maps.Copy(l.currentScope().consts, result.ByteConsts)
-	l.scanAndAllocLocals(info.Body)
+	sc := l.currentScope()
+	for name, v := range result.ByteConsts {
+		sc[name] = &constBinding{value: v}
+	}
+	for name, v := range result.IntConsts {
+		sc[name] = &intConstBinding{value: v, size: result.IntConstSize[name]}
+	}
 
 	// Set up return flag only if the body contains return statements.
+	info := result.Funcs["main"]
 	if hasReturn(info.Body) {
 		l.returnFlag = l.allocCell()
 		l.emit(&IRZero{Dst: l.returnFlag})
@@ -254,39 +358,28 @@ func (l *Lowerer) ensureTemp(r exprResult) exprResult {
 // Scope management.
 
 func (l *Lowerer) pushScope() {
-	l.scopes = append(l.scopes, &scope{
-		vars:       make(map[string]Cell),
-		consts:     make(map[string]byte),
-		intCells:   make(map[string]Cell),
-		intSizes:   make(map[string]int),
-		arrays:     make(map[string]arrayInfo),
-		structs:    make(map[string]structInfo),
-		slices:     make(map[string]sliceInfo),
-		ptrType:    make(map[string]string),
-		ptrArray:   make(map[string]arrayInfo),
-		ptrIntSize: make(map[string]int),
-	})
+	l.scopes = append(l.scopes, make(scope))
 }
 
 func (l *Lowerer) popScope() {
 	l.scopes = l.scopes[:len(l.scopes)-1]
 }
 
-func (l *Lowerer) currentScope() *scope {
+func (l *Lowerer) currentScope() scope {
 	return l.scopes[len(l.scopes)-1]
 }
 
 func (l *Lowerer) defineVar(name string) Cell {
 	c := l.allocCell()
-	l.currentScope().vars[name] = c
+	sc := l.currentScope()
+	sc.defineByte(name, c)
+	sc[name] = &byteBinding{cell: c}
 	return c
 }
 
 func (l *Lowerer) lookupConst(name string) (byte, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if v, ok := l.scopes[i].consts[name]; ok {
-			return v, true
-		}
+	if b, ok := l.lookupBinding(name).(*constBinding); ok {
+		return b.value, true
 	}
 	return 0, false
 }
@@ -295,8 +388,12 @@ func (l *Lowerer) lookupConst(name string) (byte, bool) {
 func (l *Lowerer) allByteConsts() map[string]byte {
 	m := make(map[string]byte, len(l.result.ByteConsts))
 	maps.Copy(m, l.result.ByteConsts)
-	for i := range l.scopes {
-		maps.Copy(m, l.scopes[i].consts)
+	for _, sc := range l.scopes {
+		for name, b := range sc {
+			if c, ok := b.(*constBinding); ok {
+				m[name] = c.value
+			}
+		}
 	}
 	return m
 }
@@ -305,130 +402,123 @@ func (l *Lowerer) lookupStringConst(name string) string {
 	return l.result.StringConsts[name]
 }
 
+// lookupBinding finds the innermost-scope binding for a name, or nil.
+func (l *Lowerer) lookupBinding(name string) binding {
+	for i := len(l.scopes) - 1; i >= 0; i-- {
+		if b, ok := l.scopes[i][name]; ok {
+			return b
+		}
+	}
+	return nil
+}
+
 func (l *Lowerer) lookupVar(name string) (Cell, error) {
 	if name == "_" {
 		// Blank identifier: allocate a disposable cell.
 		return l.allocCell(), nil
 	}
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if c, ok := l.scopes[i].vars[name]; ok {
-			return c, nil
-		}
-	}
-	if _, ok := l.lookupArray(name); ok {
+	switch b := l.lookupBinding(name).(type) {
+	case *byteBinding:
+		return b.cell, nil
+	case *arrayBinding:
 		return 0, fmt.Errorf("cannot use array %s as byte value", name)
-	}
-	if _, ok := l.lookupStruct(name); ok {
+	case *structBinding:
 		return 0, fmt.Errorf("cannot use struct %s as byte value", name)
+	default:
+		return 0, fmt.Errorf("undefined variable: %s", name)
 	}
-	return 0, fmt.Errorf("undefined variable: %s", name)
 }
 
 func (l *Lowerer) lookupArray(name string) (arrayInfo, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if info, ok := l.scopes[i].arrays[name]; ok {
-			return info, true
-		}
+	if b, ok := l.lookupBinding(name).(*arrayBinding); ok {
+		return b.info, true
 	}
 	return arrayInfo{}, false
 }
 
 func (l *Lowerer) lookupStruct(name string) (structInfo, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if info, ok := l.scopes[i].structs[name]; ok {
-			return info, true
-		}
+	if b, ok := l.lookupBinding(name).(*structBinding); ok {
+		return b.info, true
 	}
 	return structInfo{}, false
 }
 
 func (l *Lowerer) lookupPtrType(name string) (*StructDef, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if typeName, ok := l.scopes[i].ptrType[name]; ok {
-			if def, ok := l.result.Structs[typeName]; ok {
-				return def, true
-			}
+	if b, ok := l.lookupBinding(name).(*byteBinding); ok && b.ptrType != "" {
+		if def, ok := l.result.Structs[b.ptrType]; ok {
+			return def, true
 		}
 	}
 	return nil, false
 }
+
 func (l *Lowerer) lookupPtrArray(name string) (arrayInfo, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if ai, ok := l.scopes[i].ptrArray[name]; ok {
-			return ai, true
-		}
+	if b, ok := l.lookupBinding(name).(*byteBinding); ok && b.ptrArray != nil {
+		return *b.ptrArray, true
 	}
 	return arrayInfo{}, false
 }
 
 func (l *Lowerer) lookupSlice(name string) (sliceInfo, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if si, ok := l.scopes[i].slices[name]; ok {
-			return si, true
-		}
+	if b, ok := l.lookupBinding(name).(*sliceBinding); ok {
+		return b.info, true
 	}
 	return sliceInfo{}, false
 }
-func (l *Lowerer) defineSlice(sc *scope, name string, elemSize int,
+
+func (l *Lowerer) defineSlice(sc scope, name string, elemSize int,
 	elemType string, elemSlice bool, elemPtrType string, elemIntSize int) sliceInfo {
 	si := sliceInfo{
 		ptr: l.allocCell(), len: l.allocCell(), cap: l.allocCell(),
 		elemSize: elemSize, elemType: elemType, elemSlice: elemSlice,
 		elemPtrType: elemPtrType, elemIntSize: elemIntSize,
 	}
-	sc.slices[name] = si
+	sc[name] = &sliceBinding{info: si}
 	return si
 }
+
 func (l *Lowerer) lookupIntConst(name string) (uint64, int, bool) {
-	v, ok := l.result.IntConsts[name]
-	if !ok {
-		return 0, 0, false
+	if b, ok := l.lookupBinding(name).(*intConstBinding); ok {
+		return b.value, b.size, true
 	}
-	return v, l.result.IntConstSize[name], true
+	return 0, 0, false
 }
 
 func (l *Lowerer) lookupPtrIntSize(name string) int {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if n, ok := l.scopes[i].ptrIntSize[name]; ok {
-			return n
-		}
+	if b, ok := l.lookupBinding(name).(*byteBinding); ok {
+		return b.ptrIntSize
 	}
 	return 0
 }
 
 func (l *Lowerer) lookupIntCell(name string) (Cell, bool) {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if cell, ok := l.scopes[i].intCells[name]; ok {
-			return cell, true
-		}
+	if b, ok := l.lookupBinding(name).(*intBinding); ok {
+		return b.base, true
 	}
 	return 0, false
 }
 
 func (l *Lowerer) lookupIntVarSize(name string) int {
-	for i := len(l.scopes) - 1; i >= 0; i-- {
-		if n, ok := l.scopes[i].intSizes[name]; ok {
-			return n
-		}
+	if b, ok := l.lookupBinding(name).(*intBinding); ok {
+		return b.size
 	}
-	return 2 // default for intCells without intSizes entry
+	return 2
 }
 
-func (l *Lowerer) defineIntVar(sc *scope, name string, size int) Cell {
+func (l *Lowerer) defineIntVar(sc scope, name string, size int) Cell {
 	base := l.allocCells(size)
-	sc.intCells[name] = base
-	sc.intSizes[name] = size
+	sc[name] = &intBinding{base: base, size: size}
 	return base
 }
 
 // exprInvolvesInt checks if an expression produces a multi-byte integer result.
-func (l *Lowerer) exprInvolvesInt(expr ast.Expr, sc *scope) bool {
+func (l *Lowerer) exprInvolvesInt(expr ast.Expr, sc scope) bool {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		if _, ok := l.lookupIntCell(e.Name); ok {
 			return true
 		}
-		if _, ok := l.result.IntConsts[e.Name]; ok {
+		if _, _, ok := l.lookupIntConst(e.Name); ok {
 			return true
 		}
 	case *ast.CallExpr:
@@ -479,13 +569,13 @@ func (l *Lowerer) exprInvolvesInt(expr ast.Expr, sc *scope) bool {
 
 // exprIntSize returns the multi-byte integer size of an expression (2, 4, or 8),
 // or 2 as a default for callers that have already confirmed the result is multi-byte.
-func (l *Lowerer) exprIntSize(expr ast.Expr, sc *scope) int {
+func (l *Lowerer) exprIntSize(expr ast.Expr, sc scope) int {
 	switch e := expr.(type) {
 	case *ast.Ident:
 		if _, ok := l.lookupIntCell(e.Name); ok {
 			return l.lookupIntVarSize(e.Name)
 		}
-		if n, ok := l.result.IntConstSize[e.Name]; ok {
+		if _, n, ok := l.lookupIntConst(e.Name); ok {
 			return n
 		}
 	case *ast.CallExpr:
@@ -522,10 +612,10 @@ func (l *Lowerer) exprIntSize(expr ast.Expr, sc *scope) int {
 		}
 	case *ast.IndexExpr:
 		if id, ok := e.X.(*ast.Ident); ok {
-			if ai, ok := sc.arrays[id.Name]; ok && ai.elemIntSize >= 2 {
+			if ai, ok := l.lookupArray(id.Name); ok && ai.elemIntSize >= 2 {
 				return ai.elemIntSize
 			}
-			if si, ok := sc.slices[id.Name]; ok && si.elemIntSize >= 2 {
+			if si, ok := l.lookupSlice(id.Name); ok && si.elemIntSize >= 2 {
 				return si.elemIntSize
 			}
 		}
@@ -1330,414 +1420,413 @@ func (l *Lowerer) structDef(expr ast.Expr) *StructDef {
 	return nil
 }
 
-// scanAndAllocLocals pre-scans a block for := declarations and var statements,
-// allocating cells for all local variables.
-func (l *Lowerer) scanAndAllocLocals(block *ast.BlockStmt) {
+// declareFromAssign allocates cells for variables introduced by `:=`.
+func (l *Lowerer) declareFromAssign(s *ast.AssignStmt) {
+	if s.Tok != token.DEFINE {
+		return
+	}
 	sc := l.currentScope()
-	// Identify standalone block statements (direct children of another
-	// BlockStmt's list). These have their own lexical scope and are
-	// pre-scanned when lowered, so we don't descend into them here.
-	// For/range/if/switch bodies are children of the *ast.ForStmt etc.,
-	// not of a BlockStmt list, so they remain part of this scan.
-	standalone := map[*ast.BlockStmt]bool{}
-	ast.Inspect(block, func(n ast.Node) bool {
-		if b, ok := n.(*ast.BlockStmt); ok {
-			for _, stmt := range b.List {
-				if inner, ok := stmt.(*ast.BlockStmt); ok {
-					standalone[inner] = true
+
+	// Multi-return: x, y := f() where f returns multiple values.
+	if len(s.Rhs) == 1 && len(s.Lhs) > 1 {
+		if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
+			if fn, ok := call.Fun.(*ast.Ident); ok {
+				if info, ok := l.result.Funcs[fn.Name]; ok && len(info.ReturnSizes) == len(s.Lhs) {
+					for i, lhs := range s.Lhs {
+						lid, ok := lhs.(*ast.Ident)
+						if !ok || lid.Name == "_" {
+							continue
+						}
+						if i < len(info.ReturnSizes) && info.ReturnSizes[i] >= 2 {
+							if !sc.hasIntCell(lid.Name) {
+								l.defineIntVar(sc, lid.Name, info.ReturnSizes[i])
+							}
+						} else if !sc.hasVar(lid.Name) {
+							sc.defineByte(lid.Name, l.allocCell())
+						}
+					}
+					return
 				}
 			}
 		}
-		return true
-	})
-	ast.Inspect(block, func(n ast.Node) bool {
-		if b, ok := n.(*ast.BlockStmt); ok && standalone[b] {
-			return false
+	}
+	for i, lhs := range s.Lhs {
+		id, ok := lhs.(*ast.Ident)
+		if !ok || id.Name == "_" {
+			continue
 		}
-		switch s := n.(type) {
-		case *ast.AssignStmt:
-			if s.Tok == token.DEFINE {
-				// Multi-return: x, y := f() where f returns multiple values.
-				if len(s.Rhs) == 1 && len(s.Lhs) > 1 {
-					if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
-						if fn, ok := call.Fun.(*ast.Ident); ok {
-							if info, ok := l.result.Funcs[fn.Name]; ok && len(info.ReturnSizes) == len(s.Lhs) {
-								for i, lhs := range s.Lhs {
-									lid, ok := lhs.(*ast.Ident)
-									if !ok || lid.Name == "_" {
-										continue
-									}
-									if i < len(info.ReturnSizes) && info.ReturnSizes[i] >= 2 {
-										if _, exists := sc.intCells[lid.Name]; !exists {
-											l.defineIntVar(sc, lid.Name, info.ReturnSizes[i])
-										}
-									} else if _, exists := sc.vars[lid.Name]; !exists {
-										sc.vars[lid.Name] = l.allocCell()
-									}
+		// Skip if already bound (e.g. parameters in the inlined-call scope).
+		if sc.has(id.Name) {
+			continue
+		}
+		// Check for composite literal: a := [N]byte{...} or p := Point{...}
+		if i < len(s.Rhs) {
+			if comp, ok := s.Rhs[i].(*ast.CompositeLit); ok {
+				if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(comp.Type); count > 0 {
+					if !sc.hasArray(id.Name) {
+						if elemSize > 1 {
+							l.defineStructArray(sc, id.Name, count, elemSize, elemType, eis, ies, ieis)
+						} else {
+							l.defineArray(sc, id.Name, count)
+						}
+					}
+					continue
+				}
+				if isSliceType(comp.Type) {
+					if !sc.hasSlice(id.Name) {
+						es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
+						l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+					}
+					continue
+				}
+				if def := l.structDef(comp.Type); def != nil {
+					if !sc.hasStruct(id.Name) {
+						l.defineStruct(sc, id.Name, def)
+					}
+					continue
+				}
+			}
+		}
+		// s := make([]byte, n) or s := append(...)
+		if i < len(s.Rhs) {
+			if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
+				if fn, ok := call.Fun.(*ast.Ident); ok {
+					if (fn.Name == "uint16" || fn.Name == "uint32" || fn.Name == "uint64") && len(call.Args) == 1 {
+						if !sc.hasIntCell(id.Name) {
+							l.defineIntVar(sc, id.Name, intIdentSize(fn.Name))
+						}
+						continue
+					}
+					if fn.Name == "make" && len(call.Args) >= 2 && isSliceType(call.Args[0]) {
+						if !sc.hasSlice(id.Name) {
+							es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
+							l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+						}
+						continue
+					}
+					if fn.Name == "append" && len(call.Args) >= 2 {
+						if !sc.hasSlice(id.Name) {
+							// append(s, ...) where s is a known slice.
+							if srcID, ok := call.Args[0].(*ast.Ident); ok {
+								if sc.hasSlice(srcID.Name) {
+									es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
+									l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+									continue
 								}
-								return true
+							}
+							// append(make(...), ...) or append([]byte{...}, ...).
+							if innerCall, ok := call.Args[0].(*ast.CallExpr); ok {
+								if innerFn, ok := innerCall.Fun.(*ast.Ident); ok && innerFn.Name == "make" && len(innerCall.Args) >= 2 && isSliceType(innerCall.Args[0]) {
+									es, et, esl, ept, eis := l.sliceElemInfo(innerCall.Args[0])
+									l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+									continue
+								}
+							}
+							if comp, ok := call.Args[0].(*ast.CompositeLit); ok && isSliceType(comp.Type) {
+								es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
+								l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+								continue
 							}
 						}
 					}
 				}
-				for i, lhs := range s.Lhs {
-					id, ok := lhs.(*ast.Ident)
-					if !ok || id.Name == "_" {
-						continue
-					}
-					// Check for composite literal: a := [N]byte{...} or p := Point{...}
-					if i < len(s.Rhs) {
-						if comp, ok := s.Rhs[i].(*ast.CompositeLit); ok {
-							if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(comp.Type); count > 0 {
-								if _, exists := sc.arrays[id.Name]; !exists {
-									if elemSize > 1 {
-										l.defineStructArray(sc, id.Name, count, elemSize, elemType, eis, ies, ieis)
-									} else {
-										l.defineArray(sc, id.Name, count)
-									}
-								}
-								continue
-							}
-							if isSliceType(comp.Type) {
-								if _, exists := sc.slices[id.Name]; !exists {
-									es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
-									l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-								}
-								continue
-							}
-							if def := l.structDef(comp.Type); def != nil {
-								if _, exists := sc.structs[id.Name]; !exists {
-									l.defineStruct(sc, id.Name, def)
-								}
-								continue
-							}
+			}
+		}
+		// s := a[1:3] or s := t[:]
+		if i < len(s.Rhs) {
+			if se, ok := s.Rhs[i].(*ast.SliceExpr); ok {
+				if !sc.hasSlice(id.Name) {
+					es, et, esl, ept, eis := 1, "", false, "", 0
+					if srcID, ok := se.X.(*ast.Ident); ok {
+						if src, ok := l.lookupSlice(srcID.Name); ok {
+							es, et, esl, ept, eis = src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize
+						} else if ai, ok := l.lookupArray(srcID.Name); ok {
+							es, et, eis = max(ai.elemSize, 1), ai.elemType, ai.elemIntSize
 						}
 					}
-					// s := make([]byte, n) or s := append(...)
-					if i < len(s.Rhs) {
-						if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
-							if fn, ok := call.Fun.(*ast.Ident); ok {
-								if (fn.Name == "uint16" || fn.Name == "uint32" || fn.Name == "uint64") && len(call.Args) == 1 {
-									if _, exists := sc.intCells[id.Name]; !exists {
-										l.defineIntVar(sc, id.Name, intIdentSize(fn.Name))
-									}
-									continue
-								}
-								if fn.Name == "make" && len(call.Args) >= 2 && isSliceType(call.Args[0]) {
-									if _, exists := sc.slices[id.Name]; !exists {
-										es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
-										l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-									}
-									continue
-								}
-								if fn.Name == "append" && len(call.Args) >= 2 {
-									if _, exists := sc.slices[id.Name]; !exists {
-										// append(s, ...) where s is a known slice.
-										if srcID, ok := call.Args[0].(*ast.Ident); ok {
-											if _, exists := sc.slices[srcID.Name]; exists {
-												es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
-												l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-												continue
-											}
-										}
-										// append(make(...), ...) or append([]byte{...}, ...).
-										if innerCall, ok := call.Args[0].(*ast.CallExpr); ok {
-											if innerFn, ok := innerCall.Fun.(*ast.Ident); ok && innerFn.Name == "make" && len(innerCall.Args) >= 2 && isSliceType(innerCall.Args[0]) {
-												es, et, esl, ept, eis := l.sliceElemInfo(innerCall.Args[0])
-												l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-												continue
-											}
-										}
-										if comp, ok := call.Args[0].(*ast.CompositeLit); ok && isSliceType(comp.Type) {
-											es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
-											l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-											continue
-										}
-									}
-								}
+					l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+				}
+				continue
+			}
+		}
+		// inner := s[i] where s is [][]byte, []P, [N][M]byte, [N]P, or [N]uintN
+		if i < len(s.Rhs) {
+			if idxExpr, ok := s.Rhs[i].(*ast.IndexExpr); ok {
+				if arrID, ok := idxExpr.X.(*ast.Ident); ok {
+					if si, ok := l.lookupSlice(arrID.Name); ok {
+						if si.elemSlice {
+							if !sc.hasSlice(id.Name) {
+								l.defineSlice(sc, id.Name, 1, "", false, "", 0)
 							}
+							continue
 						}
-					}
-					// s := a[1:3] or s := t[:]
-					if i < len(s.Rhs) {
-						if se, ok := s.Rhs[i].(*ast.SliceExpr); ok {
-							if _, exists := sc.slices[id.Name]; !exists {
-								es, et, esl, ept, eis := 1, "", false, "", 0
-								if srcID, ok := se.X.(*ast.Ident); ok {
-									if src, ok := sc.slices[srcID.Name]; ok {
-										es, et, esl, ept, eis = src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize
-									} else if ai, ok := sc.arrays[srcID.Name]; ok {
-										es, et, eis = max(ai.elemSize, 1), ai.elemType, ai.elemIntSize
-									}
-								}
-								l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
+						if si.elemIntSize >= 2 {
+							if !sc.hasIntCell(id.Name) {
+								l.defineIntVar(sc, id.Name, si.elemIntSize)
+							}
+							continue
+						}
+						if si.elemType != "" {
+							if !sc.hasStruct(id.Name) {
+								def := l.result.Structs[si.elemType]
+								l.defineStruct(sc, id.Name, def)
 							}
 							continue
 						}
 					}
-					// inner := s[i] where s is [][]byte, []P, [N][M]byte, [N]P, or [N]uintN
-					if i < len(s.Rhs) {
-						if idxExpr, ok := s.Rhs[i].(*ast.IndexExpr); ok {
-							if arrID, ok := idxExpr.X.(*ast.Ident); ok {
-								if si, ok := sc.slices[arrID.Name]; ok {
-									if si.elemSlice {
-										if _, exists := sc.slices[id.Name]; !exists {
-											l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-										}
-										continue
-									}
-									if si.elemIntSize >= 2 {
-										if _, exists := sc.intCells[id.Name]; !exists {
-											l.defineIntVar(sc, id.Name, si.elemIntSize)
-										}
-										continue
-									}
-									if si.elemType != "" {
-										if _, exists := sc.structs[id.Name]; !exists {
-											def := l.result.Structs[si.elemType]
-											l.defineStruct(sc, id.Name, def)
-										}
-										continue
-									}
-								}
-								if ai, ok := sc.arrays[arrID.Name]; ok && ai.elemSize > 1 {
-									if ai.elemIntSize >= 2 {
-										// [N]uintN -> uintN
-										if _, exists := sc.intCells[id.Name]; !exists {
-											l.defineIntVar(sc, id.Name, ai.elemIntSize)
-										}
-									} else if ai.elemType != "" {
-										// [N]Point -> Point
-										if _, exists := sc.structs[id.Name]; !exists {
-											def := l.result.Structs[ai.elemType]
-											l.defineStruct(sc, id.Name, def)
-										}
-									} else {
-										// [N][M]byte -> [M]byte
-										if _, exists := sc.arrays[id.Name]; !exists {
-											l.defineArray(sc, id.Name, ai.elemSize)
-										}
-									}
-									continue
-								}
+					if ai, ok := l.lookupArray(arrID.Name); ok && ai.elemSize > 1 {
+						if ai.elemIntSize >= 2 {
+							// [N]uintN -> uintN
+							if !sc.hasIntCell(id.Name) {
+								l.defineIntVar(sc, id.Name, ai.elemIntSize)
 							}
-						}
-					}
-					// s := t where t is a slice
-					if i < len(s.Rhs) {
-						if rhsID, ok := s.Rhs[i].(*ast.Ident); ok {
-							if src, ok := sc.slices[rhsID.Name]; ok {
-								if _, exists := sc.slices[id.Name]; !exists {
-									l.defineSlice(sc, id.Name, src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize)
-								}
-								continue
-							}
-						}
-					}
-					// s := f() where f returns a slice
-					if i < len(s.Rhs) {
-						if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
-							if fn, ok := call.Fun.(*ast.Ident); ok {
-								if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
-									if _, exists := sc.slices[id.Name]; !exists {
-										es := max(info.ReturnType.SliceElemSize, 1)
-										l.defineSlice(sc, id.Name, es, info.ReturnType.SliceElemType, false, "", info.ReturnType.SliceElemIntSize)
-									}
-									continue
-								}
-							}
-						}
-					}
-					// p := a[i] where a is [N]Struct
-					if i < len(s.Rhs) {
-						if idx, ok := s.Rhs[i].(*ast.IndexExpr); ok {
-							if arrID, ok := idx.X.(*ast.Ident); ok {
-								if ai, ok := sc.arrays[arrID.Name]; ok && ai.elemType != "" {
-									if def, ok := l.result.Structs[ai.elemType]; ok {
-										if _, exists := sc.structs[id.Name]; !exists {
-											l.defineStruct(sc, id.Name, def)
-										}
-										continue
-									}
-								}
-							}
-						}
-					}
-					// Track &var for pointer type info.
-					if i < len(s.Rhs) {
-						if unary, ok := s.Rhs[i].(*ast.UnaryExpr); ok && unary.Op == token.AND {
-							if rhsID, ok := unary.X.(*ast.Ident); ok {
-								if _, ok := sc.intCells[rhsID.Name]; ok {
-									sc.ptrIntSize[id.Name] = l.lookupIntVarSize(rhsID.Name)
-								}
-								if si, ok := sc.structs[rhsID.Name]; ok {
-									sc.ptrType[id.Name] = si.def.Name
-								}
-							}
-							if sel, ok := unary.X.(*ast.SelectorExpr); ok {
-								typeName := l.resolveExprTypeName(sel.X)
-								if def, ok := l.result.Structs[typeName]; ok {
-									if n := def.FieldIntSizes[sel.Sel.Name]; n >= 2 {
-										sc.ptrIntSize[id.Name] = n
-									}
-								}
-							}
-						}
-					}
-					if _, exists := sc.vars[id.Name]; !exists {
-						if _, exists := sc.intCells[id.Name]; !exists {
-							if n := 0; i < len(s.Rhs) && l.exprInvolvesInt(s.Rhs[i], sc) {
-								n = l.exprIntSize(s.Rhs[i], sc)
-								l.defineIntVar(sc, id.Name, n)
-							} else {
-								sc.vars[id.Name] = l.allocCell()
-							}
-						}
-					}
-				}
-			}
-		case *ast.RangeStmt:
-			if s.Key != nil {
-				if id, ok := s.Key.(*ast.Ident); ok {
-					if _, exists := sc.vars[id.Name]; !exists {
-						if _, exists := sc.intCells[id.Name]; !exists {
-							if l.exprInvolvesInt(s.X, sc) {
-								n := l.exprIntSize(s.X, sc)
-								l.defineIntVar(sc, id.Name, n)
-							} else {
-								sc.vars[id.Name] = l.allocCell()
-							}
-						}
-					}
-				}
-			}
-			if s.Value != nil {
-				if id, ok := s.Value.(*ast.Ident); ok {
-					// Multi-byte int element: allocate v as an intVar. If the same
-					// name was already defined as an intCell at a smaller width,
-					// reject -- our flat scope can't hold both. Same name reused
-					// for a wider element would silently truncate.
-					var n int
-					if rangeID, ok := s.X.(*ast.Ident); ok {
-						if ai, ok := sc.arrays[rangeID.Name]; ok && ai.elemIntSize >= 2 {
-							n = ai.elemIntSize
-						} else if si, ok := sc.slices[rangeID.Name]; ok && si.elemIntSize >= 2 {
-							n = si.elemIntSize
-						}
-					} else if sel, ok := s.X.(*ast.SelectorExpr); ok {
-						// `for _, v := range s.vals` where s is struct, vals is multi-byte int array.
-						if structID, ok := sel.X.(*ast.Ident); ok {
-							if si, ok := sc.structs[structID.Name]; ok {
-								if eis := si.def.FieldArrayElemIntSize[sel.Sel.Name]; eis >= 2 {
-									n = eis
-								}
-							}
-						}
-					}
-					if n >= 2 {
-						if _, exists := sc.intCells[id.Name]; !exists {
-							if _, exists := sc.vars[id.Name]; !exists {
-								l.defineIntVar(sc, id.Name, n)
-							}
-						}
-						break
-					}
-					if _, exists := sc.vars[id.Name]; !exists {
-						// Struct/pointer slice range: allocate appropriately.
-						var rangeElemType string
-						if rangeID, ok := s.X.(*ast.Ident); ok {
-							if si, ok := sc.slices[rangeID.Name]; ok {
-								if si.elemType != "" {
-									rangeElemType = si.elemType
-								} else if si.elemPtrType != "" {
-									sc.vars[id.Name] = l.allocCell()
-									sc.ptrType[id.Name] = si.elemPtrType
-									break
-								}
-							}
-							if ai, ok := sc.arrays[rangeID.Name]; ok && ai.elemType != "" {
-								rangeElemType = ai.elemType
-							}
-						}
-						if rangeElemType == "" {
-							if call, ok := s.X.(*ast.CallExpr); ok {
-								if fn, ok := call.Fun.(*ast.Ident); ok {
-									if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
-										rangeElemType = info.ReturnType.SliceElemType
-									}
-								}
-							}
-						}
-						if rangeElemType == "" {
-							if se, ok := s.X.(*ast.SliceExpr); ok {
-								if srcID, ok := se.X.(*ast.Ident); ok {
-									if si, ok := sc.slices[srcID.Name]; ok {
-										rangeElemType = si.elemType
-									}
-								}
-							}
-						}
-						if rangeElemType != "" {
-							def := l.result.Structs[rangeElemType]
-							l.defineStruct(sc, id.Name, def)
-							break
-						}
-						sc.vars[id.Name] = l.allocCell()
-					}
-				}
-			}
-		case *ast.DeclStmt:
-			gd, ok := s.Decl.(*ast.GenDecl)
-			if !ok {
-				return true
-			}
-			if gd.Tok == token.CONST {
-				// Register local consts so subsequent declarations can reference them.
-				// Errors are caught again during lowerDecl.
-				_ = l.lowerLocalConsts(gd)
-				return true
-			}
-			if gd.Tok == token.TYPE {
-				// Register local types so subsequent variable declarations can reference them.
-				// Errors are caught again during lowerDecl.
-				_ = l.lowerLocalTypes(gd)
-				return true
-			}
-			for _, spec := range gd.Specs {
-				vs, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				for _, name := range vs.Names {
-					if _, exists := sc.vars[name.Name]; !exists {
-						if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(vs.Type); count > 0 {
-							if elemSize > 1 {
-								l.defineStructArray(sc, name.Name, count, elemSize, elemType, eis, ies, ieis)
-							} else {
-								l.defineArray(sc, name.Name, count)
-							}
-						} else if n := intTypeSize(vs.Type); n >= 2 {
-							if _, exists := sc.intCells[name.Name]; !exists {
-								l.defineIntVar(sc, name.Name, n)
-							}
-						} else if isSliceType(vs.Type) {
-							if _, exists := sc.slices[name.Name]; !exists {
-								es, et, esl, ept, eis := l.sliceElemInfo(vs.Type)
-								l.defineSlice(sc, name.Name, es, et, esl, ept, eis)
-							}
-						} else if def := l.structDef(vs.Type); def != nil {
-							if _, exists := sc.structs[name.Name]; !exists {
-								l.defineStruct(sc, name.Name, def)
+						} else if ai.elemType != "" {
+							// [N]Point -> Point
+							if !sc.hasStruct(id.Name) {
+								def := l.result.Structs[ai.elemType]
+								l.defineStruct(sc, id.Name, def)
 							}
 						} else {
-							sc.vars[name.Name] = l.allocCell()
+							// [N][M]byte -> [M]byte
+							if !sc.hasArray(id.Name) {
+								l.defineArray(sc, id.Name, ai.elemSize)
+							}
+						}
+						continue
+					}
+				}
+			}
+		}
+		// s := t where t is a slice
+		if i < len(s.Rhs) {
+			if rhsID, ok := s.Rhs[i].(*ast.Ident); ok {
+				if src, ok := l.lookupSlice(rhsID.Name); ok {
+					if !sc.hasSlice(id.Name) {
+						l.defineSlice(sc, id.Name, src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize)
+					}
+					continue
+				}
+			}
+		}
+		// s := f() where f returns a slice
+		if i < len(s.Rhs) {
+			if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
+				if fn, ok := call.Fun.(*ast.Ident); ok {
+					if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
+						if !sc.hasSlice(id.Name) {
+							es := max(info.ReturnType.SliceElemSize, 1)
+							l.defineSlice(sc, id.Name, es, info.ReturnType.SliceElemType, false, "", info.ReturnType.SliceElemIntSize)
+						}
+						continue
+					}
+				}
+			}
+		}
+		// p := a[i] where a is [N]Struct
+		if i < len(s.Rhs) {
+			if idx, ok := s.Rhs[i].(*ast.IndexExpr); ok {
+				if arrID, ok := idx.X.(*ast.Ident); ok {
+					if ai, ok := l.lookupArray(arrID.Name); ok && ai.elemType != "" {
+						if def, ok := l.result.Structs[ai.elemType]; ok {
+							if !sc.hasStruct(id.Name) {
+								l.defineStruct(sc, id.Name, def)
+							}
+							continue
 						}
 					}
 				}
 			}
 		}
-		return true
-	})
+		if !sc.hasVar(id.Name) {
+			if !sc.hasIntCell(id.Name) {
+				if n := 0; i < len(s.Rhs) && l.exprInvolvesInt(s.Rhs[i], sc) {
+					n = l.exprIntSize(s.Rhs[i], sc)
+					l.defineIntVar(sc, id.Name, n)
+				} else {
+					sc.defineByte(id.Name, l.allocCell())
+				}
+			}
+		}
+		// Track &var for pointer type info. Annotations come AFTER allocation
+		// so byteBindingFor returns the just-defined binding instead of
+		// creating a stub.
+		if i < len(s.Rhs) {
+			if unary, ok := s.Rhs[i].(*ast.UnaryExpr); ok && unary.Op == token.AND {
+				if rhsID, ok := unary.X.(*ast.Ident); ok {
+					if _, ok := l.lookupIntCell(rhsID.Name); ok {
+						sc.annotatePtrIntSize(id.Name, l.lookupIntVarSize(rhsID.Name))
+					}
+					if si, ok := l.lookupStruct(rhsID.Name); ok {
+						sc.annotatePtrType(id.Name, si.def.Name)
+					}
+				}
+				if sel, ok := unary.X.(*ast.SelectorExpr); ok {
+					typeName := l.resolveExprTypeName(sel.X)
+					if def, ok := l.result.Structs[typeName]; ok {
+						if n := def.FieldIntSizes[sel.Sel.Name]; n >= 2 {
+							sc.annotatePtrIntSize(id.Name, n)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// declareFromRange allocates the Key and Value bindings of a range stmt.
+func (l *Lowerer) declareFromRange(s *ast.RangeStmt) {
+	sc := l.currentScope()
+
+	if s.Key != nil {
+		if id, ok := s.Key.(*ast.Ident); ok {
+			if !sc.hasVar(id.Name) {
+				if !sc.hasIntCell(id.Name) {
+					if l.exprInvolvesInt(s.X, sc) {
+						n := l.exprIntSize(s.X, sc)
+						l.defineIntVar(sc, id.Name, n)
+					} else {
+						sc.defineByte(id.Name, l.allocCell())
+					}
+				}
+			}
+		}
+	}
+	if s.Value != nil {
+		if id, ok := s.Value.(*ast.Ident); ok {
+			if sc.has(id.Name) {
+				return
+			}
+			// Multi-byte int element: allocate v as an intVar. If the same
+			// name was already defined as an intCell at a smaller width,
+			// reject -- our flat scope can't hold both. Same name reused
+			// for a wider element would silently truncate.
+			var n int
+			if rangeID, ok := s.X.(*ast.Ident); ok {
+				if ai, ok := l.lookupArray(rangeID.Name); ok && ai.elemIntSize >= 2 {
+					n = ai.elemIntSize
+				} else if si, ok := l.lookupSlice(rangeID.Name); ok && si.elemIntSize >= 2 {
+					n = si.elemIntSize
+				}
+			} else if sel, ok := s.X.(*ast.SelectorExpr); ok {
+				// `for _, v := range s.vals` where s is struct, vals is multi-byte int array.
+				if structID, ok := sel.X.(*ast.Ident); ok {
+					if si, ok := l.lookupStruct(structID.Name); ok {
+						if eis := si.def.FieldArrayElemIntSize[sel.Sel.Name]; eis >= 2 {
+							n = eis
+						}
+					}
+				}
+			}
+			if n >= 2 {
+				if !sc.hasIntCell(id.Name) {
+					if !sc.hasVar(id.Name) {
+						l.defineIntVar(sc, id.Name, n)
+					}
+				}
+				return
+			}
+			if !sc.hasVar(id.Name) {
+				// Struct/pointer slice range: allocate appropriately.
+				var rangeElemType string
+				if rangeID, ok := s.X.(*ast.Ident); ok {
+					if si, ok := l.lookupSlice(rangeID.Name); ok {
+						if si.elemType != "" {
+							rangeElemType = si.elemType
+						} else if si.elemPtrType != "" {
+							sc.defineByte(id.Name, l.allocCell())
+							sc.annotatePtrType(id.Name, si.elemPtrType)
+							return
+						}
+					}
+					if ai, ok := l.lookupArray(rangeID.Name); ok && ai.elemType != "" {
+						rangeElemType = ai.elemType
+					}
+				}
+				if rangeElemType == "" {
+					if call, ok := s.X.(*ast.CallExpr); ok {
+						if fn, ok := call.Fun.(*ast.Ident); ok {
+							if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
+								rangeElemType = info.ReturnType.SliceElemType
+							}
+						}
+					}
+				}
+				if rangeElemType == "" {
+					if se, ok := s.X.(*ast.SliceExpr); ok {
+						if srcID, ok := se.X.(*ast.Ident); ok {
+							if si, ok := l.lookupSlice(srcID.Name); ok {
+								rangeElemType = si.elemType
+							}
+						}
+					}
+				}
+				if rangeElemType != "" {
+					def := l.result.Structs[rangeElemType]
+					l.defineStruct(sc, id.Name, def)
+					return
+				}
+				sc.defineByte(id.Name, l.allocCell())
+			}
+		}
+	}
+}
+
+// declareFromDecl allocates cells for variables introduced by `var`,
+// and registers local consts and types.
+func (l *Lowerer) declareFromDecl(s *ast.DeclStmt) {
+	sc := l.currentScope()
+
+	gd, ok := s.Decl.(*ast.GenDecl)
+	if !ok {
+		return
+	}
+	if gd.Tok == token.CONST {
+		// Register local consts so subsequent declarations can reference them.
+		// Errors are caught again during lowerDecl.
+		_ = l.lowerLocalConsts(gd)
+		return
+	}
+	if gd.Tok == token.TYPE {
+		// Register local types so subsequent variable declarations can reference them.
+		// Errors are caught again during lowerDecl.
+		_ = l.lowerLocalTypes(gd)
+		return
+	}
+	for _, spec := range gd.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		for _, name := range vs.Names {
+			if sc.has(name.Name) {
+				continue
+			}
+			{
+				if count, elemSize, elemType, eis, ies, ieis := l.arrayElementInfo(vs.Type); count > 0 {
+					if elemSize > 1 {
+						l.defineStructArray(sc, name.Name, count, elemSize, elemType, eis, ies, ieis)
+					} else {
+						l.defineArray(sc, name.Name, count)
+					}
+				} else if n := intTypeSize(vs.Type); n >= 2 {
+					if !sc.hasIntCell(name.Name) {
+						l.defineIntVar(sc, name.Name, n)
+					}
+				} else if isSliceType(vs.Type) {
+					if !sc.hasSlice(name.Name) {
+						es, et, esl, ept, eis := l.sliceElemInfo(vs.Type)
+						l.defineSlice(sc, name.Name, es, et, esl, ept, eis)
+					}
+				} else if def := l.structDef(vs.Type); def != nil {
+					if !sc.hasStruct(name.Name) {
+						l.defineStruct(sc, name.Name, def)
+					}
+				} else {
+					sc.defineByte(name.Name, l.allocCell())
+				}
+			}
+		}
+	}
 }
 
 // lowerStructLit handles p := Point{x: 1, y: 2}.
@@ -1889,23 +1978,26 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 	return nil
 }
 
-func (l *Lowerer) defineStruct(sc *scope, name string, def *StructDef) {
+func (l *Lowerer) defineStruct(sc scope, name string, def *StructDef) {
 	base := l.allocCells(def.Size)
-	sc.structs[name] = structInfo{base: base, def: def}
+	si := structInfo{base: base, def: def}
+	sc[name] = &structBinding{info: si}
 }
 
-func (l *Lowerer) defineArray(sc *scope, name string, size int) {
+func (l *Lowerer) defineArray(sc scope, name string, size int) {
 	base := l.allocCells(size)
-	sc.arrays[name] = arrayInfo{base: base, size: size, count: size, elemSize: 1}
+	ai := arrayInfo{base: base, size: size, count: size, elemSize: 1}
+	sc[name] = &arrayBinding{info: ai}
 }
 
-func (l *Lowerer) defineStructArray(sc *scope, name string, count, elemSize int,
+func (l *Lowerer) defineStructArray(sc scope, name string, count, elemSize int,
 	elemType string, elemIntSize, innerElemSize, innerElemIntSize int) {
 	total := count * elemSize
 	base := l.allocCells(total)
-	sc.arrays[name] = arrayInfo{base: base, size: total, count: count,
+	ai := arrayInfo{base: base, size: total, count: count,
 		elemSize: elemSize, elemType: elemType, elemIntSize: elemIntSize,
 		innerElemSize: innerElemSize, innerElemIntSize: innerElemIntSize}
+	sc[name] = &arrayBinding{info: ai}
 }
 
 // arrayTypeSize returns N for [N]byte types, 0 for non-array types.
@@ -2079,6 +2171,9 @@ func (l *Lowerer) tryLowerDivModAssignWith(
 		len(aAssign.Rhs) != 1 || len(bAssign.Rhs) != 1 {
 		return false, nil
 	}
+	// Pre-allocate LHS cells; tryLowerDivModAssign bypasses lowerAssign.
+	l.declareFromAssign(aAssign)
+	l.declareFromAssign(bAssign)
 	aBin, aIsBin := aAssign.Rhs[0].(*ast.BinaryExpr)
 	bBin, bIsBin := bAssign.Rhs[0].(*ast.BinaryExpr)
 	if !aIsBin || !bIsBin {
@@ -2221,7 +2316,6 @@ func (l *Lowerer) lowerStmt(stmt ast.Stmt) error {
 		return l.lowerBranch(s)
 	case *ast.BlockStmt:
 		l.pushScope()
-		l.scanAndAllocLocals(s)
 		err := l.lowerStmts(s.List)
 		l.popScope()
 		return err
@@ -2842,11 +2936,10 @@ func (l *Lowerer) lowerLocalConsts(gd *ast.GenDecl) error {
 					return err
 				}
 				if size > 1 {
-					l.result.IntConsts[name.Name] = uint64(val) // #nosec G115
-					l.result.IntConstSize[name.Name] = size
+					sc[name.Name] = &intConstBinding{value: uint64(val), size: size} // #nosec G115
 				} else {
-					sc.consts[name.Name] = byte(val) // #nosec G115
-					allConsts[name.Name] = byte(val) // #nosec G115
+					sc[name.Name] = &constBinding{value: byte(val)} // #nosec G115
+					allConsts[name.Name] = byte(val)                // #nosec G115
 				}
 			}
 		}
@@ -2918,6 +3011,7 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 }
 
 func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
+	l.declareFromDecl(s)
 	gd, ok := s.Decl.(*ast.GenDecl)
 	if !ok {
 		return fmt.Errorf("unsupported declaration")
@@ -3032,15 +3126,15 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 	if unary, ok := rhs.(*ast.UnaryExpr); ok && unary.Op == token.AND {
 		if rhsID, ok := unary.X.(*ast.Ident); ok {
 			if si, ok := l.lookupStruct(rhsID.Name); ok {
-				l.currentScope().ptrType[name] = si.def.Name
+				l.currentScope().annotatePtrType(name, si.def.Name)
 			}
 			if ai, ok := l.lookupArray(rhsID.Name); ok {
-				l.currentScope().ptrArray[name] = ai
+				l.currentScope().annotatePtrArray(name, ai)
 			}
 		}
 		if comp, ok := unary.X.(*ast.CompositeLit); ok {
 			if def := l.structDef(comp.Type); def != nil {
-				l.currentScope().ptrType[name] = def.Name
+				l.currentScope().annotatePtrType(name, def.Name)
 			}
 		}
 	}
@@ -3049,14 +3143,14 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 	if rhsID, ok := rhs.(*ast.Ident); ok {
 		if srcSI, ok := l.lookupStruct(rhsID.Name); ok {
 			sc := l.currentScope()
-			delete(sc.vars, name)
-			if _, exists := sc.structs[name]; !exists {
+			delete(sc, name)
+			if !sc.hasStruct(name) {
 				l.defineStruct(sc, name, srcSI.def)
 			}
 		} else if srcAI, ok := l.lookupArray(rhsID.Name); ok {
 			sc := l.currentScope()
-			delete(sc.vars, name)
-			if _, exists := sc.arrays[name]; !exists {
+			delete(sc, name)
+			if !sc.hasArray(name) {
 				if srcAI.elemSize > 1 || srcAI.elemType != "" {
 					l.defineStructArray(sc, name, srcAI.count, srcAI.elemSize, srcAI.elemType,
 						srcAI.elemIntSize, srcAI.innerElemSize, srcAI.innerElemIntSize)
@@ -3072,17 +3166,17 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr) error {
 	}
 	// Track pointer type from expression result (function returns, etc.).
 	if r.ptrIntSize >= 2 {
-		l.currentScope().ptrIntSize[name] = r.ptrIntSize
+		l.currentScope().annotatePtrIntSize(name, r.ptrIntSize)
 	}
 	if r.isPointer {
 		sc := l.currentScope()
 		if r.typeName != "" {
-			sc.ptrType[name] = r.typeName
+			sc.annotatePtrType(name, r.typeName)
 		} else if r.elemCount > 0 && r.elemCount != 255 {
-			sc.ptrArray[name] = arrayInfo{
+			sc.annotatePtrArray(name, arrayInfo{
 				size: r.elemCount, count: r.elemCount,
 				elemSize: max(r.elemSize, 1), elemType: r.elemType,
-			}
+			})
 		}
 	}
 	// Resolve destination and copy.
@@ -3156,6 +3250,7 @@ var assignOp = map[token.Token]token.Token{
 }
 
 func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
+	l.declareFromAssign(s)
 	// Desugar assignment operations: x += y -> x = x + y
 	if op, ok := assignOp[s.Tok]; ok && len(s.Lhs) == 1 && len(s.Rhs) == 1 {
 		s = &ast.AssignStmt{
@@ -3477,12 +3572,12 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 		return err
 	}
 	// Find or define the composite variable and get its base.
-	// Remove any scalar cell allocated by scanAndAllocLocals,
+	// Remove any scalar cell that may have been allocated already,
 	// since the variable is actually a composite.
 	var base Cell
 	if info.ReturnType.IsSlice {
 		sc := l.currentScope()
-		delete(sc.vars, id.Name)
+		delete(sc, id.Name)
 		es := max(info.ReturnType.SliceElemSize, 1)
 		et := info.ReturnType.SliceElemType
 		if si, ok := l.lookupSlice(id.Name); ok {
@@ -3500,8 +3595,8 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 	if info.ReturnType.StructType != "" {
 		def := l.result.Structs[info.ReturnType.StructType]
 		sc := l.currentScope()
-		delete(sc.vars, id.Name)
-		if _, exists := sc.structs[id.Name]; !exists {
+		delete(sc, id.Name)
+		if !sc.hasStruct(id.Name) {
 			l.defineStruct(sc, id.Name, def)
 		}
 		si, _ := l.lookupStruct(id.Name)
@@ -3509,8 +3604,8 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 	} else {
 		size := info.ReturnType.ArraySize
 		sc := l.currentScope()
-		delete(sc.vars, id.Name)
-		if _, exists := sc.arrays[id.Name]; !exists {
+		delete(sc, id.Name)
+		if !sc.hasArray(id.Name) {
 			l.defineArray(sc, id.Name, size)
 		}
 		ai, _ := l.lookupArray(id.Name)
@@ -4024,7 +4119,7 @@ func (l *Lowerer) lowerSwitch(s *ast.SwitchStmt) error {
 			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
 		} else {
 			tagCell := l.allocCell()
-			l.currentScope().vars[tagName] = tagCell
+			l.currentScope().defineByte(tagName, tagCell)
 			l.emitCopyOrMove(tagCell, r)
 		}
 	}
@@ -4139,6 +4234,8 @@ func stripFallthrough(stmts []ast.Stmt) []ast.Stmt {
 }
 
 func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
+	l.pushScope()
+	defer l.popScope()
 	if s.Init != nil {
 		if err := l.lowerStmt(s.Init); err != nil {
 			return err
@@ -4237,6 +4334,9 @@ func (l *Lowerer) emitCondTo(dst Cell, expr ast.Expr) error {
 }
 
 func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
+	l.pushScope()
+	defer l.popScope()
+	l.declareFromRange(s)
 	var cell Cell
 	var counterIntSize int // 0 for byte, >= 2 for multi-byte integers
 	if s.Key != nil {
@@ -4744,17 +4844,15 @@ func (l *Lowerer) lowerDefer(s *ast.DeferStmt) error {
 			return err
 		}
 		name := fmt.Sprintf("$defer_%d_%d", len(l.deferredCalls), i)
+		sc := l.currentScope()
 		if r.intSize >= 2 {
 			base := l.allocCells(r.intSize)
 			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
-			sc := l.currentScope()
-			l.defineIntVar(sc, name, r.intSize)
-			sc.intCells[name] = base
+			sc[name] = &intBinding{base: base, size: r.intSize}
 		} else {
 			cell := l.allocCell()
 			l.emitCopyOrMove(cell, r)
-			l.defineVar(name)
-			l.currentScope().vars[name] = cell
+			sc.defineByte(name, cell)
 		}
 		capturedArgs[i] = ast.NewIdent(name)
 	}
@@ -4997,18 +5095,18 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				l.emit(&IRCopy{Dst: cell, Src: args[i].cell})
 				sc := l.currentScope()
 				if pt.PtrArrayInfo != nil {
-					sc.ptrArray[paramName] = arrayInfo{
+					sc.annotatePtrArray(paramName, arrayInfo{
 						size:     pt.PtrArrayInfo.ArraySize,
 						count:    pt.PtrArrayInfo.ArrayCount,
 						elemSize: pt.PtrArrayInfo.ArrayElemSize,
 						elemType: pt.PtrArrayInfo.ArrayElemType,
-					}
+					})
 				}
 				if pt.PtrStructType != "" {
-					sc.ptrType[paramName] = pt.PtrStructType
+					sc.annotatePtrType(paramName, pt.PtrStructType)
 				}
 				if pt.PtrIntSize >= 2 {
-					sc.ptrIntSize[paramName] = pt.PtrIntSize
+					sc.annotatePtrIntSize(paramName, pt.PtrIntSize)
 				}
 				continue
 			}
@@ -5021,9 +5119,6 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 			l.freeCell(args[i].cell)
 		}
 	}
-
-	// Scan and allocate local variables.
-	l.scanAndAllocLocals(info.Body)
 
 	// Allocate return value cells.
 	// For composite return types (struct/array), allocate contiguous cells.
@@ -5055,12 +5150,12 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	if len(info.ReturnNames) > 0 {
 		sc := l.currentScope()
 		if info.ReturnType.IntSize >= 2 && len(info.ReturnNames) == 1 {
-			sc.intCells[info.ReturnNames[0]] = retCells[0]
-			sc.intSizes[info.ReturnNames[0]] = info.ReturnType.IntSize
+			n := info.ReturnNames[0]
+			sc[n] = &intBinding{base: retCells[0], size: info.ReturnType.IntSize}
 		} else {
 			for i, name := range info.ReturnNames {
 				if i < len(retCells) {
-					sc.vars[name] = retCells[i]
+					sc.defineByte(name, retCells[i])
 				}
 			}
 		}
@@ -5425,6 +5520,24 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 			}
 			if si.elemIntSize >= 2 {
 				r.ptrIntSize = si.elemIntSize
+			}
+			return r, nil
+		}
+		// &p[i] for pointer-to-array param: ptrDynIndex computes
+		// *p + i*elemSize, where *p holds the caller's array base.
+		if ptrAI, ok := l.lookupPtrArray(id.Name); ok {
+			cell, err := l.lookupVar(id.Name)
+			if err != nil {
+				return exprResult{}, err
+			}
+			idx, err := l.ptrDynIndex(cell, e.Index, max(ptrAI.elemSize, 1))
+			if err != nil {
+				return exprResult{}, err
+			}
+			r := exprResult{cell: idx, temp: true}
+			if ptrAI.elemType != "" {
+				r.isPointer = true
+				r.typeName = ptrAI.elemType
 			}
 			return r, nil
 		}

@@ -7978,6 +7978,65 @@ func main() {
 			"", "4294967295\n65535\n0\n",
 		},
 		{
+			"consecutive for-loops with same name at different widths",
+			`package main
+func main() {
+	for i := uint8(0); i < uint8(3); i++ {
+		println(i)
+	}
+	for i := uint16(0); i < uint16(3); i++ {
+		println(i)
+	}
+	for i := uint32(0); i < uint32(3); i++ {
+		println(i)
+	}
+	for i := uint64(0); i < uint64(3); i++ {
+		println(i)
+	}
+}`,
+			"", "0\n1\n2\n0\n1\n2\n0\n1\n2\n0\n1\n2\n",
+		},
+		{
+			"nested for-loops shadowing same name at different widths",
+			`package main
+func main() {
+	for i := uint32(10); i < uint32(13); i++ {
+		for i := byte(0); i < 3; i++ {
+			print(i)
+			print(" ")
+		}
+		println(i)
+	}
+}`,
+			"", "0 1 2 10\n0 1 2 11\n0 1 2 12\n",
+		},
+		{
+			"inner var shadows outer const",
+			`package main
+func main() {
+	const x = 5
+	{
+		x := byte(1)
+		print(x)
+	}
+}`,
+			"", "1",
+		},
+		{
+			"inner var shadows outer uint16 const",
+			`package main
+func main() {
+	const x uint16 = 50000
+	{
+		x := byte(7)
+		print(x)
+	}
+	print(" ")
+	print(x)
+}`,
+			"", "7 50000",
+		},
+		{
 			"standalone block shadows outer with different width",
 			`package main
 func main() {

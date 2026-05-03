@@ -42,6 +42,15 @@ Each Go variable maps to one or more abstract cells:
 Temporaries for intermediate expression results are allocated and freed
 as needed. The allocator reuses freed cell IDs.
 
+Local cell allocation is lazy: when `lowerAssign` / `lowerDecl` /
+`lowerRange` first encounter a declaration, `declareFromAssign` /
+`declareFromDecl` / `declareFromRange` allocate the cells in the
+current scope. A `scope` is a `map[string]binding`, where `binding`
+is a tagged union (`*byteBinding`, `*intBinding`, `*arrayBinding`,
+`*structBinding`, `*sliceBinding`, `*constBinding`,
+`*intConstBinding`). `lowerFor` and `lowerRange` push their own scope
+so loop variables and consecutive same-name loops don't collide.
+
 ### Variable Initialization
 
 Simple assignments (`x = expr`, `x := expr`) and `var x = expr`
@@ -65,9 +74,11 @@ each element from the flat array via `emitVariableIndexRead`.
   registers them in `result.Structs`, identical to top-level types.
 - **`var`**: falls through to `lowerVarInit`.
 
-Both `const` and `type` declarations are also processed during
-`scanAndAllocLocals` so that subsequent variable declarations in
-the same scope can reference them.
+`const` declarations bind into the current scope (`constBinding` for
+byte, `intConstBinding` for `uintN`), so they respect lexical
+shadowing -- an inner `x := byte(1)` overrides an outer
+`const x = 5`. `type` declarations register in `l.result.Structs`
+since struct types are package-level after analysis.
 
 ### Field Assignment
 
@@ -283,7 +294,7 @@ or assigned to local struct variables.
 Reslicing (`s[i:j]`) propagates `elemSize`, `elemType`,
 and `elemSlice` from the source. The analyzer stores
 `SliceElemSize` and `SliceElemType` in `ReturnInfo` for
-functions returning struct slices. `scanAndAllocLocals`
+functions returning struct slices. `declareFromAssign`
 detects struct slice range values, `tmp := s[i]`
 patterns, and `row := grid[i]` on 2D arrays or struct
 arrays to allocate appropriately-sized variables.
