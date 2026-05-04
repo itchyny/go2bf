@@ -283,7 +283,7 @@ The generated Brainfuck uses a CPU-like execution model:
 - Composite literals, copy assignment
 - `p.x++`, `p.x += v`, `a[i].x = v`, `s.vals[i] = v`
 - Pass to and return from functions
-- Method receivers and method calls
+- Value and pointer receivers (`func (v T) m()`, `func (p *T) m()`)
 
 ### Slices
 

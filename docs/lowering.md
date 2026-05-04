@@ -136,7 +136,11 @@ so no special-casing is needed for composite swap.
 ### Method Receivers
 
 Method receivers are desugared: `func (p Point) sum() byte` becomes a
-function `Point.sum` with `p` as the first parameter.
+function `Point.sum` with `p` as the first parameter. Pointer
+receivers (`func (p *Point) shift()`) register under the same
+`Point.shift` name and are dispatched the same way; the analyzer
+records `IsPointer=true` and `PtrStructType="Point"` on the first
+parameter so the inlined body sees it as a struct pointer.
 
 Method calls resolve the receiver's struct type via
 `resolveExprTypeName`, which walks the AST without evaluating.
@@ -145,6 +149,32 @@ variables (`p.sum()`), array elements (`a[i].sum()`), function
 returns (`makePoint(1, 2).sum()`), and chained methods
 (`p.scale(3).sum()`). The receiver expression is evaluated via
 `lowerExpr` and passed as the first argument to the inlined method.
+
+**Auto-conversion across the value/pointer boundary.** Go's method
+calls implicitly take the address of a value receiver when the
+method has a pointer receiver, and vice versa. `prependReceiver`
+implements both directions:
+
+- *Value caller, pointer method* (`p.shift()` where `p` is a value
+  and `shift` has a `*Point` receiver): the receiver expression is
+  wrapped in a synthetic `&ast.UnaryExpr{Op: AND, X: receiver}`
+  before being prepended. `lowerAddressOf` then materializes the
+  address as a const slot index.
+- *Pointer caller, value method* (`pp.sum()` where `pp` is `*Point`
+  and `sum` has a value receiver): the implicit deref happens later,
+  in `inlineCall`'s arg-evaluation loop. When the lowered argument
+  is `isPointer && typeName != "" && !elemSlice` and the parameter
+  is a value-typed struct, the loop reads each cell of the pointed
+  struct via `ptrLoad` into a fresh contiguous block and replaces
+  the arg with that materialized value. The traversal copies the
+  pointer cell into a temp before bumping it, so the source
+  variable's value is preserved across the call. Skipped entirely
+  when the parameter itself is a pointer, since the byte cell
+  holding the slot index is what the callee expects.
+
+`isPointerReceiver` checks `lookupPtrType` for the receiver ident
+to decide whether wrapping is needed; an already-pointer receiver
+passes through unchanged.
 
 ## Arrays
 

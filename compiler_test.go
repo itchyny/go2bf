@@ -7484,6 +7484,118 @@ func main() {
 			"", "42",
 		},
 		{
+			"pointer receiver mutates struct",
+			`package main
+type C struct { n byte }
+func (c *C) inc() { c.n++ }
+func (c *C) add(d byte) { c.n += d }
+func (c *C) get() byte { return c.n }
+func main() {
+	c := C{n: 0}
+	c.inc()
+	c.add(5)
+	pc := &c
+	pc.inc()
+	pc.add(10)
+	println(c.get())
+	println(pc.get())
+}`,
+			"", "17\n17\n",
+		},
+		{
+			"pointer receiver string field rename",
+			`package main
+type T struct { name string }
+func (t *T) rename(s string) { t.name = s }
+func main() {
+	a := T{name: "alice"}
+	a.rename("ALICE")
+	pa := &a
+	pa.rename("everyone")
+	println(a.name)
+}`,
+			"", "everyone\n",
+		},
+		{
+			"value and pointer methods on same type",
+			`package main
+type Point struct { x, y byte }
+func (p Point) translated(dx, dy byte) Point { return Point{x: p.x + dx, y: p.y + dy} }
+func (p *Point) shift(dx, dy byte) { p.x += dx; p.y += dy }
+func main() {
+	p := Point{x: 1, y: 2}
+	q := p.translated(10, 20)
+	println(q.x, q.y)
+	p.shift(5, 5)
+	pp := &p
+	pp.shift(100, 100)
+	println(p.x, p.y)
+}`,
+			"", "11 22\n106 107\n",
+		},
+		{
+			"value method called via pointer auto-derefs",
+			`package main
+type C struct { n byte }
+func (c C) snapshot() byte { return c.n }
+func main() {
+	c := C{n: 42}
+	pc := &c
+	println(pc.snapshot())
+	c.n = 99
+	println(pc.snapshot())
+}`,
+			"", "42\n99\n",
+		},
+		{
+			"pointer receiver on array element via variable index",
+			`package main
+type Item struct { tag, val byte }
+func (i *Item) set(t, v byte) { i.tag = t; i.val = v }
+func main() {
+	xs := [3]Item{}
+	for i := byte(0); i < 3; i++ {
+		xs[i].set(i, i*10)
+	}
+	for i := 0; i < 3; i++ {
+		println(xs[i].tag, xs[i].val)
+	}
+}`,
+			"", "0 0\n1 10\n2 20\n",
+		},
+		{
+			"pointer receiver method chaining other methods on self",
+			`package main
+type N struct { v byte }
+func (n *N) inc()    { n.v++ }
+func (n *N) double() { n.v *= 2 }
+func (n *N) chain()  { n.inc(); n.double(); n.inc() }
+func main() {
+	x := N{v: 1}
+	px := &x
+	px.chain()
+	println(x.v)
+	px.chain()
+	println(x.v)
+}`,
+			"", "5\n13\n",
+		},
+		{
+			"pointer receiver multi-return divmod",
+			`package main
+type C struct { n byte }
+func (c *C) divmod(d byte) (byte, byte) { return c.n / d, c.n % d }
+func main() {
+	c := C{n: 23}
+	q, r := c.divmod(5)
+	println(q, r)
+	pc := &c
+	q2, r2 := pc.divmod(7)
+	println(q2, r2)
+}`,
+			"", "4 3\n3 2\n",
+		},
+		{
 			"local struct type",
 			`package main
 func main() {

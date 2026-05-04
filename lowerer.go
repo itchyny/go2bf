@@ -2711,10 +2711,7 @@ func (l *Lowerer) lowerCallStmt(call *ast.CallExpr) error {
 	if !ok {
 		return fmt.Errorf("unsupported function: %s", funcName)
 	}
-	args := call.Args
-	if receiver != nil {
-		args = append([]ast.Expr{receiver}, args...)
-	}
+	args := l.prependReceiver(receiver, info, call.Args)
 	retCells, err := l.inlineCall(info, args)
 	if err != nil {
 		return err
@@ -2723,6 +2720,33 @@ func (l *Lowerer) lowerCallStmt(call *ast.CallExpr) error {
 		l.freeCell(c)
 	}
 	return nil
+}
+
+// prependReceiver returns args with the method receiver prepended. If the
+// method has a pointer receiver and the supplied expression is a value-typed
+// struct, the receiver is implicitly wrapped with `&` so the inlined body
+// sees a pointer (matching Go's auto-address-of semantics on method calls).
+func (l *Lowerer) prependReceiver(receiver ast.Expr, info *FuncInfo, args []ast.Expr) []ast.Expr {
+	if receiver == nil {
+		return args
+	}
+	if len(info.ParamTypes) > 0 && info.ParamTypes[0].IsPointer && info.ParamTypes[0].PtrStructType != "" {
+		if !l.isPointerReceiver(receiver) {
+			receiver = &ast.UnaryExpr{Op: token.AND, X: receiver}
+		}
+	}
+	return append([]ast.Expr{receiver}, args...)
+}
+
+// isPointerReceiver reports whether the receiver expression already evaluates
+// to a struct pointer (so &-wrapping should be skipped).
+func (l *Lowerer) isPointerReceiver(receiver ast.Expr) bool {
+	if id, ok := receiver.(*ast.Ident); ok {
+		if _, ok := l.lookupPtrType(id.Name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveCall returns the function name and optional receiver for a call expression.
@@ -2846,10 +2870,7 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 		if call, ok := args[0].(*ast.CallExpr); ok {
 			funcName, receiver := l.resolveCall(call)
 			if info, ok := l.result.Funcs[funcName]; ok && len(info.ReturnSizes) > 1 {
-				callArgs := call.Args
-				if receiver != nil {
-					callArgs = append([]ast.Expr{receiver}, callArgs...)
-				}
+				callArgs := l.prependReceiver(receiver, info, call.Args)
 				retCells, err := l.inlineCall(info, callArgs)
 				if err != nil {
 					return err
@@ -3692,10 +3713,7 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 		if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
 			funcName, receiver := l.resolveCall(call)
 			if info, ok := l.result.Funcs[funcName]; ok {
-				args := call.Args
-				if receiver != nil {
-					args = append([]ast.Expr{receiver}, args...)
-				}
+				args := l.prependReceiver(receiver, info, call.Args)
 				// Multi-return: q, r := divmod(a, b) or a[0], a[1] = divmod(a, b)
 				if len(info.ReturnSizes) == len(s.Lhs) && len(info.ReturnSizes) > 1 {
 					return l.lowerMultiReturnAssign(s, info, args)
@@ -5728,18 +5746,30 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		if err != nil {
 			return nil, err
 		}
-		// Pointer-based composite: materialize into contiguous temp cells.
-		if r.isPointer && r.elemCount > 1 && !r.elemSlice {
+		// Pointer-based composite: materialize into contiguous temp cells, unless
+		// the parameter itself wants a pointer (e.g. `setName(pg, ...)` where
+		// `setName` takes `*Greeter`). In the pointer-param case the byte cell
+		// holding the slot index is exactly what the callee expects.
+		paramWantsPointer := i < len(info.ParamTypes) && info.ParamTypes[i].IsPointer
+		if r.isPointer && r.elemCount >= 1 && r.typeName != "" && !r.elemSlice && !paramWantsPointer {
 			base := l.allocCells(r.elemCount)
+			// Copy r.cell into a temp index so the loop can bump it without
+			// corrupting the source variable (e.g. a `*T` ident may be reused
+			// by later code).
+			idx := l.allocCell()
+			l.emit(&IRCopy{Dst: idx, Src: r.cell})
 			for j := range r.elemCount {
-				val := l.ptrLoad(r.cell)
+				val := l.ptrLoad(idx)
 				l.emit(&IRMove{Dst: base + j, Src: val})
 				l.freeCell(val)
 				if j < r.elemCount-1 {
-					l.emit(&IRAddI{Dst: r.cell, Value: 1})
+					l.emit(&IRAddI{Dst: idx, Value: 1})
 				}
 			}
-			l.freeCell(r.cell)
+			l.freeCell(idx)
+			if r.temp {
+				l.freeCell(r.cell)
+			}
 			r = exprResult{cell: base, temp: true, size: r.elemCount, typeName: r.typeName}
 		}
 		// Flat-offset result: materialize into contiguous temp cells.
@@ -6401,16 +6431,25 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 			if err != nil {
 				return exprResult{}, err
 			}
+			scaled := idxR.cell
+			scaledTemp := idxR.temp
 			if es > 1 {
+				if !scaledTemp {
+					// Don't clobber a bound variable by multiplying in place.
+					t := l.allocCell()
+					l.emit(&IRCopy{Dst: t, Src: scaled})
+					scaled = t
+					scaledTemp = true
+				}
 				esCell := l.allocCell()
 				l.emit(&IRConst{Dst: esCell, Value: byte(es)}) // #nosec G115
-				l.emit(&IRMul{Dst: idxR.cell, Src1: idxR.cell, Src2: esCell})
+				l.emit(&IRMul{Dst: scaled, Src1: scaled, Src2: esCell})
 				l.freeCell(esCell)
 			}
 			l.emit(&IRConst{Dst: t, Value: byte(baseSlot)}) // #nosec G115
-			l.emit(&IRAdd{Dst: t, Src1: t, Src2: idxR.cell})
-			if idxR.temp {
-				l.freeCell(idxR.cell)
+			l.emit(&IRAdd{Dst: t, Src1: t, Src2: scaled})
+			if scaledTemp {
+				l.freeCell(scaled)
 			}
 		}
 		r := exprResult{cell: t, temp: true}
@@ -7953,10 +7992,7 @@ func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
 	if info.Returns == 0 {
 		return exprResult{}, fmt.Errorf("function %s has no return value", funcName)
 	}
-	args := call.Args
-	if receiver != nil {
-		args = append([]ast.Expr{receiver}, args...)
-	}
+	args := l.prependReceiver(receiver, info, call.Args)
 	retCells, err := l.inlineCall(info, args)
 	if err != nil {
 		return exprResult{}, err

@@ -321,10 +321,15 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			}
 			funcName := fn.Name.Name
 			// Method receiver: func (p Point) name() -> stored as "Point.name"
+			// Pointer receiver: func (p *Point) name() -> stored as "Point.name"
 			if fn.Recv != nil && len(fn.Recv.List) == 1 {
 				recvField := fn.Recv.List[0]
 				if recvType, ok := recvField.Type.(*ast.Ident); ok {
 					funcName = recvType.Name + "." + fn.Name.Name
+				} else if star, ok := recvField.Type.(*ast.StarExpr); ok {
+					if recvType, ok := star.X.(*ast.Ident); ok {
+						funcName = recvType.Name + "." + fn.Name.Name
+					}
 				}
 			}
 
@@ -340,17 +345,25 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			// Prepend receiver as first parameter for methods.
 			if fn.Recv != nil && len(fn.Recv.List) == 1 {
 				recvField := fn.Recv.List[0]
-				var structType string
+				var structType, ptrStructType string
 				if recvType, ok := recvField.Type.(*ast.Ident); ok {
 					if _, ok := result.Structs[recvType.Name]; ok {
 						structType = recvType.Name
+					}
+				} else if star, ok := recvField.Type.(*ast.StarExpr); ok {
+					if recvType, ok := star.X.(*ast.Ident); ok {
+						if _, ok := result.Structs[recvType.Name]; ok {
+							ptrStructType = recvType.Name
+						}
 					}
 				}
 				for _, name := range recvField.Names {
 					info.Params = append(info.Params, name.Name)
 					info.ParamTypes = append(info.ParamTypes, ParamInfo{
-						Name:       name.Name,
-						StructType: structType,
+						Name:          name.Name,
+						StructType:    structType,
+						IsPointer:     ptrStructType != "",
+						PtrStructType: ptrStructType,
 					})
 				}
 			}
