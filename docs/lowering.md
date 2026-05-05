@@ -713,10 +713,15 @@ Assigning a wider integer to a narrower variable is a
 compile error. `byte()`, `uint16()`, and `uint32()` are
 the explicit truncation paths.
 
-Truncation guards emit errors for: assigning wider
-integers to narrower variables, `putchar` with non-byte,
-`return` type mismatch, and wider integers as
-array/slice indices.
+Truncation guards emit errors at every site where a
+narrower type would silently lose bytes: assigning a
+wider integer to a narrower variable, multi-byte values
+in `putchar` / byte parameters / `[]byte` composite
+literals, mismatched element widths in array/slice
+writes (`a[i] = 50000` for `[]uint32`), `return` type
+mismatch, wider integers as array/slice indices, and
+`make` sizes that exceed the byte-sized capacity cell
+(constant or runtime).
 
 ### Function parameters and returns
 

@@ -834,15 +834,39 @@ func (l *Lowerer) evalSliceMake(typeExpr ast.Expr, args []ast.Expr) (sliceInfo, 
 }
 
 func (l *Lowerer) lowerSliceMake(si sliceInfo, args []ast.Expr) error {
+	// Compile-time bounds check: a constant size that exceeds the byte-sized
+	// cap cell would silently truncate. Reject early so users see
+	// "make size 256 too large for byte cap" instead of a length-0 slice.
+	es := max(si.elemSize, 1)
+	if n, ok := l.constValue(args[0]); ok && n*es > 255 {
+		return fmt.Errorf("make size %d (* elemSize %d = %d cells) exceeds the 255-slot ceiling", n, es, n*es)
+	}
+	if len(args) >= 2 {
+		if n, ok := l.constValue(args[1]); ok && n*es > 255 {
+			return fmt.Errorf("make cap %d (* elemSize %d = %d cells) exceeds the 255-slot ceiling", n, es, n*es)
+		}
+	}
 	lenR, err := l.lowerExpr(args[0])
 	if err != nil {
 		return err
+	}
+	if lenR.intSize >= 2 {
+		if lenR.temp {
+			l.freeCellRange(lenR.cell, lenR.cellCount())
+		}
+		return fmt.Errorf("make size must be byte (got uint%d), use byte() to truncate", lenR.intSize*8)
 	}
 	var capR exprResult
 	if len(args) >= 2 {
 		capR, err = l.lowerExpr(args[1])
 		if err != nil {
 			return err
+		}
+		if capR.intSize >= 2 {
+			if capR.temp {
+				l.freeCellRange(capR.cell, capR.cellCount())
+			}
+			return fmt.Errorf("make cap must be byte (got uint%d), use byte() to truncate", capR.intSize*8)
 		}
 	} else {
 		capR = lenR
@@ -2335,6 +2359,12 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 		r, err := l.lowerExpr(valExpr)
 		if err != nil {
 			return err
+		}
+		if r.intSize >= 2 {
+			if r.temp {
+				l.freeCellRange(r.cell, r.cellCount())
+			}
+			return fmt.Errorf("cannot use uint%d value in []byte literal, use byte() to truncate", r.intSize*8)
 		}
 		l.emitCopyOrMove(arr.base+idx, r)
 		idx++
@@ -5900,6 +5930,15 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				continue
 			}
 		}
+		// Default scalar (byte) param: reject multi-byte source so a literal
+		// like 256 doesn't silently truncate to its low byte.
+		if args[i].intSize >= 2 {
+			if args[i].temp {
+				l.freeCellRange(args[i].cell, args[i].cellCount())
+				args[i].temp = false
+			}
+			return nil, fmt.Errorf("cannot pass uint%d value to byte parameter %s, use byte() to truncate", args[i].intSize*8, paramName)
+		}
 		cell := l.defineVar(paramName)
 		l.emit(&IRCopy{Dst: cell, Src: args[i].cell})
 	}
@@ -8494,6 +8533,16 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 // writeInto writes val into a composite at the given index.
 // The base must have elemSize and elemCount set.
 func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult) error {
+	// Strict integer width: assigning to a multi-byte int element requires
+	// the RHS to already be at the matching width. No implicit promotion of
+	// narrower literals or byte values; the user must use an explicit cast
+	// like a[i] = uint32(50000).
+	if base.elemIntSize >= 2 && val.intSize != base.elemIntSize {
+		if val.temp {
+			l.freeCellRange(val.cell, val.cellCount())
+		}
+		return fmt.Errorf("mismatched integer sizes in element assignment, use explicit conversion")
+	}
 	if base.isPointer {
 		idx, err := l.ptrDynIndex(base.cell, indexExpr, base.elemSize)
 		if err != nil {

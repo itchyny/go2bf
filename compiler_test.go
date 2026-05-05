@@ -7997,6 +7997,21 @@ func main() {
 			"", "1000000\n1100000\n",
 		},
 		{
+			"uint32 element write requires explicit cast",
+			`package main
+func main() {
+	a := make([]uint32, 2)
+	a[0] = uint32(50000)
+	a[1] = uint32(100)
+	println(a[0], a[1])
+	var b [2]uint32
+	b[0] = uint32(70000)
+	b[1] = uint32(byte(50))
+	println(b[0], b[1])
+}`,
+			"", "50000 100\n70000 50\n",
+		},
+		{
 			"uint32 struct field inc dec",
 			`package main
 type Counter struct { val uint32 }
@@ -10396,6 +10411,43 @@ func main() { println(f()) }`,
 			`package main
 func main() { var x uint16 = 1; y := byte(2); println(x + y) }`,
 			"mismatched integer sizes",
+		},
+		{
+			"uint32 slice element assigned narrow literal",
+			`package main
+func main() { a := make([]uint32, 1); a[0] = 50000; println(a[0]) }`,
+			"mismatched integer sizes",
+		},
+		{
+			"uint16 array element assigned byte var",
+			`package main
+func main() { var a [3]uint16; b := byte(5); a[0] = b; println(a[0]) }`,
+			"mismatched integer sizes",
+		},
+		{
+			"make literal size exceeds 255",
+			`package main
+func main() { a := make([]byte, 1000); println(len(a)) }`,
+			"exceeds the 255-slot ceiling",
+		},
+		{
+			"make uint16 size",
+			`package main
+func main() { var n uint16 = 5; a := make([]byte, n); println(len(a)) }`,
+			"make size must be byte",
+		},
+		{
+			"byte array literal element overflow",
+			`package main
+func main() { a := [3]byte{1, 2, 300}; println(a[2]) }`,
+			"cannot use uint16 value in []byte literal",
+		},
+		{
+			"byte arg literal overflow",
+			`package main
+func f(x byte) { println(x) }
+func main() { f(256) }`,
+			"cannot pass uint16 value to byte parameter",
 		},
 		{
 			"uint16 array index",
