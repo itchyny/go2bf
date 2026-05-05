@@ -185,9 +185,24 @@ type sliceInfo struct {
 	elemIntSize int    // >1 for slices of multi-byte integers (uint16/uint32/uint64)
 }
 
+// exprResult carries the cell(s) produced by lowerExpr along with shape
+// metadata. Ownership is encoded by `temp`:
+//
+//   - temp = true: the cell(s) were freshly allocated for this expression.
+//     The consumer is responsible for freeing via freeCell / freeCellRange,
+//     and may mutate r.cell in place (e.g. as the destination of an IRMove
+//     or to walk a pointer with IRAddI).
+//   - temp = false: the cell(s) belong to a scope binding (variable, named
+//     return, etc.) and outlive the call. Reading r.cell as an IR Src is
+//     safe; freeing or mutating in place corrupts the binding.
+//
+// Helpers like emitCopyOrMove and freeSliceInfo respect this. When
+// walking a pointer-composite by bumping r.cell with IRAddI, the bump
+// must happen on a freshly-allocated temp index copy of r.cell so the
+// source variable's value is preserved.
 type exprResult struct {
 	cell             Cell
-	temp             bool   // if true, the caller should free this cell via freeCell
+	temp             bool   // true if the caller owns this cell and must free it
 	size             int    // total number of cells; 0 means 1 (scalar)
 	intSize          int    // >1 for multi-byte integers (2, 4, or 8)
 	typeName         string // struct type name of this result (empty for non-struct)
@@ -796,9 +811,7 @@ func (l *Lowerer) lowerSliceAssign(si sliceInfo, rhs ast.Expr) error {
 	if err != nil {
 		return err
 	}
-	l.emit(&IRMove{Dst: si.ptr, Src: tmp.ptr})
-	l.emit(&IRMove{Dst: si.len, Src: tmp.len})
-	l.emit(&IRMove{Dst: si.cap, Src: tmp.cap})
+	l.moveSliceHeader(si, tmp.ptr, tmp.len, tmp.cap)
 	l.freeSliceInfo(tmp)
 	return nil
 }
@@ -2878,10 +2891,7 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 				off := 0
 				for i, sz := range info.ReturnSizes {
 					if i > 0 && name == "println" {
-						t := l.allocCell()
-						l.emit(&IRConst{Dst: t, Value: ' '})
-						l.emit(&IRPutc{Src: t})
-						l.freeCell(t)
+						l.emitPutcLiteral(' ')
 					}
 					if sz >= 2 {
 						l.emitPrintInt(retCells[off], sz)
@@ -2894,10 +2904,7 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 					off += sz
 				}
 				if name == "println" {
-					t := l.allocCell()
-					l.emit(&IRConst{Dst: t, Value: '\n'})
-					l.emit(&IRPutc{Src: t})
-					l.freeCell(t)
+					l.emitPutcLiteral('\n')
 				}
 				return nil
 			}
@@ -2905,10 +2912,7 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 	}
 	for i, arg := range args {
 		if i > 0 && name == "println" {
-			t := l.allocCell()
-			l.emit(&IRConst{Dst: t, Value: ' '})
-			l.emit(&IRPutc{Src: t})
-			l.freeCell(t)
+			l.emitPutcLiteral(' ')
 		}
 		if s := l.resolveStringArg(arg); s != "" {
 			t := l.allocCell()
@@ -2968,10 +2972,7 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 		}
 	}
 	if name == "println" {
-		t := l.allocCell()
-		l.emit(&IRConst{Dst: t, Value: '\n'})
-		l.emit(&IRPutc{Src: t})
-		l.freeCell(t)
+		l.emitPutcLiteral('\n')
 	}
 	return nil
 }
@@ -3006,6 +3007,15 @@ func (l *Lowerer) resolveStringArg(expr ast.Expr) string {
 		return l.lookupStringConst(id.Name)
 	}
 	return ""
+}
+
+// emitPutcLiteral writes a single compile-time-known byte to stdout.
+// Used for separators and terminators in the print/println paths.
+func (l *Lowerer) emitPutcLiteral(b byte) {
+	t := l.allocCell()
+	l.emit(&IRConst{Dst: t, Value: b})
+	l.emit(&IRPutc{Src: t})
+	l.freeCell(t)
 }
 
 // emitPrintByte emits IR to print a byte value as a decimal number (0-255).
@@ -3662,20 +3672,26 @@ func (l *Lowerer) assignResult(dst, r exprResult) error {
 			dsts[j] = dst.cell + Cell(j) // #nosec G115
 		}
 		l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
-		l.freeCell(r.cell)
+		if r.temp {
+			l.freeCell(r.cell)
+		}
 		return nil
 	}
-	// Pointer-based composite: materialize by loading each cell.
+	// Pointer-based composite: materialize by loading each cell. Copy r.cell
+	// into a temp index so loadConsecutiveViaPtr can bump and free it without
+	// corrupting the source variable when r is a borrowed *T ident.
 	if r.isPointer && r.elemCount > 1 && dst.size > 1 {
-		for j := range min(r.elemCount, dst.size) {
-			val := l.ptrLoad(r.cell)
-			l.emit(&IRMove{Dst: dst.cell + j, Src: val})
-			l.freeCell(val)
-			if j < r.elemCount-1 {
-				l.emit(&IRAddI{Dst: r.cell, Value: 1})
-			}
+		n := min(r.elemCount, dst.size)
+		dsts := make([]Cell, n)
+		for j := range n {
+			dsts[j] = dst.cell + Cell(j) // #nosec G115
 		}
-		l.freeCell(r.cell)
+		idx := l.allocCell()
+		l.emit(&IRCopy{Dst: idx, Src: r.cell})
+		l.loadConsecutiveViaPtr(idx, dsts)
+		if r.temp {
+			l.freeCell(r.cell)
+		}
 		return nil
 	}
 	l.emitCopyOrMove(dst.cell, r)
@@ -3849,9 +3865,7 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 		case *ast.Ident:
 			if n == 3 {
 				if si, ok := l.lookupSlice(target.Name); ok {
-					l.emit(&IRMove{Dst: si.ptr, Src: retCells[off]})
-					l.emit(&IRMove{Dst: si.len, Src: retCells[off+1]})
-					l.emit(&IRMove{Dst: si.cap, Src: retCells[off+2]})
+					l.moveSliceHeader(si, retCells[off], retCells[off+1], retCells[off+2])
 				}
 			} else if n >= 2 {
 				if base, ok := l.lookupIntCell(target.Name); ok {
@@ -3874,7 +3888,6 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 			if err := l.writeInto(base, target.Index, exprResult{cell: retCells[off]}); err != nil {
 				return err
 			}
-			l.freeCell(retCells[off])
 		case *ast.SelectorExpr:
 			r, err := l.lowerSelectorExpr(target)
 			if err != nil {
@@ -3887,6 +3900,9 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 			return fmt.Errorf("unsupported assignment target")
 		}
 		off += n
+	}
+	for _, c := range retCells {
+		l.freeCell(c)
 	}
 	return nil
 }
@@ -3969,6 +3985,13 @@ func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 		return err
 	}
 	return l.writeInto(base, idx.Index, r)
+}
+
+// moveSliceHeader moves three source cells into dst's ptr/len/cap.
+func (l *Lowerer) moveSliceHeader(dst sliceInfo, srcPtr, srcLen, srcCap Cell) {
+	l.emit(&IRMove{Dst: dst.ptr, Src: srcPtr})
+	l.emit(&IRMove{Dst: dst.len, Src: srcLen})
+	l.emit(&IRMove{Dst: dst.cap, Src: srcCap})
 }
 
 // storeSliceHeader stores a 3-cell slice header (ptr, len, cap) at the
@@ -4089,13 +4112,7 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 		if err != nil {
 			return err
 		}
-		retSize := info.Returns
-		if info.ReturnType.StructType != "" {
-			retSize = l.result.Structs[info.ReturnType.StructType].Size
-		} else if info.ReturnType.ArraySize > 0 {
-			retSize = info.ReturnType.ArraySize
-		}
-		val := exprResult{cell: retCells[0], temp: true, size: retSize}
+		val := exprResult{cell: retCells[0], temp: true, size: l.returnCellCount(info)}
 		return l.writeInto(base, idx.Index, val)
 	}
 	id, ok := lhs.(*ast.Ident)
@@ -4116,14 +4133,13 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 		es := max(info.ReturnType.SliceElemSize, 1)
 		et := info.ReturnType.SliceElemType
 		if si, ok := l.lookupSlice(id.Name); ok {
-			l.emit(&IRMove{Dst: si.ptr, Src: retCells[0]})
-			l.emit(&IRMove{Dst: si.len, Src: retCells[1]})
-			l.emit(&IRMove{Dst: si.cap, Src: retCells[2]})
+			l.moveSliceHeader(si, retCells[0], retCells[1], retCells[2])
 		} else {
 			newSI := l.defineSlice(sc, id.Name, es, et, info.ReturnType.SliceElemSlice, "", info.ReturnType.SliceElemIntSize)
-			l.emit(&IRMove{Dst: newSI.ptr, Src: retCells[0]})
-			l.emit(&IRMove{Dst: newSI.len, Src: retCells[1]})
-			l.emit(&IRMove{Dst: newSI.cap, Src: retCells[2]})
+			l.moveSliceHeader(newSI, retCells[0], retCells[1], retCells[2])
+		}
+		for _, c := range retCells {
+			l.freeCell(c)
 		}
 		return nil
 	}
@@ -4148,6 +4164,9 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 	}
 	for j := range len(retCells) {
 		l.emit(&IRMove{Dst: base + j, Src: retCells[j]})
+	}
+	for _, c := range retCells {
+		l.freeCell(c)
 	}
 	return nil
 }
@@ -4603,43 +4622,57 @@ func (l *Lowerer) lowerDerefIncDec(ptr ast.Expr, tok token.Token) error {
 	if n := p.ptrIntSize; n >= 2 {
 		idx := l.allocCell()
 		l.emit(&IRCopy{Dst: idx, Src: p.cell})
-		tmp := l.allocCells(n)
-		for j := range n {
-			val := l.ptrLoad(idx)
-			l.emit(&IRMove{Dst: tmp + j, Src: val})
-			l.freeCell(val)
-			if j < n-1 {
-				l.emit(&IRAddI{Dst: idx, Value: 1})
-			}
-		}
-		if tok == token.INC {
-			l.emitIncInt(tmp, n)
-		} else {
-			l.emitDecInt(tmp, n)
-		}
-		// Store back (idx still points to last byte).
-		for j := n - 1; j >= 0; j-- {
-			l.ptrStore(idx, tmp+j)
-			if j > 0 {
-				l.emit(&IRSubI{Dst: idx, Value: 1})
-			}
-		}
-		l.freeCellRange(tmp, n)
+		l.ptrIncDecInt(idx, n, tok)
 		l.freeCell(idx)
-		return nil
+	} else {
+		l.ptrIncDecByte(p.cell, tok)
 	}
-	t := l.ptrLoad(p.cell)
+	if p.temp {
+		l.freeCell(p.cell)
+	}
+	return nil
+}
+
+// ptrIncDecByte loads heap[*idx], applies inc/dec, and stores back. The
+// idx cell is read but not freed -- caller manages its lifetime.
+func (l *Lowerer) ptrIncDecByte(idx Cell, tok token.Token) {
+	t := l.ptrLoad(idx)
 	if tok == token.INC {
 		l.emit(&IRAddI{Dst: t, Value: 1})
 	} else {
 		l.emit(&IRSubI{Dst: t, Value: 1})
 	}
-	l.ptrStore(p.cell, t)
+	l.ptrStore(idx, t)
 	l.freeCell(t)
-	if p.temp {
-		l.freeCell(p.cell)
+}
+
+// ptrIncDecInt loads n bytes starting at heap[*idx] into a temp block,
+// applies inc/dec on the n-byte little-endian value, and stores back.
+// idx is bumped through to the last byte and walked back to the start
+// during the store-back; on return idx points at heap[*idx]'s original
+// position. Caller frees idx.
+func (l *Lowerer) ptrIncDecInt(idx Cell, n int, tok token.Token) {
+	tmp := l.allocCells(n)
+	for j := range n {
+		val := l.ptrLoad(idx)
+		l.emit(&IRMove{Dst: tmp + j, Src: val})
+		l.freeCell(val)
+		if j < n-1 {
+			l.emit(&IRAddI{Dst: idx, Value: 1})
+		}
 	}
-	return nil
+	if tok == token.INC {
+		l.emitIncInt(tmp, n)
+	} else {
+		l.emitDecInt(tmp, n)
+	}
+	for j := n - 1; j >= 0; j-- {
+		l.ptrStore(idx, tmp+j)
+		if j > 0 {
+			l.emit(&IRSubI{Dst: idx, Value: 1})
+		}
+	}
+	l.freeCellRange(tmp, n)
 }
 
 // lowerFieldIncDec handles p.x++ / p.x-- and a[i].x++ / a[i].x--.
@@ -4682,39 +4715,12 @@ func (l *Lowerer) lowerFieldIncDec(sel *ast.SelectorExpr, tok token.Token) error
 			idx := l.allocCell()
 			l.emit(&IRCopy{Dst: idx, Src: base.cell})
 			l.emit(&IRAddI{Dst: idx, Value: byte(offset)}) // #nosec G115
-			tmp := l.allocCells(n)
-			for j := range n {
-				val := l.ptrLoad(idx)
-				l.emit(&IRMove{Dst: tmp + j, Src: val})
-				l.freeCell(val)
-				if j < n-1 {
-					l.emit(&IRAddI{Dst: idx, Value: 1})
-				}
-			}
-			if tok == token.INC {
-				l.emitIncInt(tmp, n)
-			} else {
-				l.emitDecInt(tmp, n)
-			}
-			for j := n - 1; j >= 0; j-- {
-				l.ptrStore(idx, tmp+j)
-				if j > 0 {
-					l.emit(&IRSubI{Dst: idx, Value: 1})
-				}
-			}
-			l.freeCellRange(tmp, n)
+			l.ptrIncDecInt(idx, n, tok)
 			l.freeCell(idx)
 			return nil
 		}
 		idx := l.ptrOffset(base.cell, offset)
-		val := l.ptrLoad(idx)
-		if tok == token.INC {
-			l.emit(&IRAddI{Dst: val, Value: 1})
-		} else {
-			l.emit(&IRSubI{Dst: val, Value: 1})
-		}
-		l.ptrStore(idx, val)
-		l.freeCell(val)
+		l.ptrIncDecByte(idx, tok)
 		l.freeCell(idx)
 		return nil
 	}
@@ -5083,7 +5089,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 				r = exprResult{
 					cell: si.ptr, lenCell: si.len, capCell: si.cap,
 					elemSize: max(si.elemSize, 1), elemCount: 255,
-					elemSlice: si.elemSlice, isPointer: true,
+					elemSlice: si.elemSlice, isPointer: true, temp: true,
 				}
 				err = nil
 			}
@@ -5271,6 +5277,11 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.freeCell(condCell)
 	if limit.temp {
 		l.freeCellRange(limit.cell, max(limit.intSize, 1))
+	}
+	if rangeBase.temp && rangeBase.lenCell != 0 {
+		l.freeCell(rangeBase.cell)
+		l.freeCell(rangeBase.lenCell)
+		l.freeCell(rangeBase.capCell)
 	}
 	return nil
 }
@@ -5666,21 +5677,43 @@ func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	// Pointer-based composite: materialize into contiguous temp cells.
+	// Pointer-based composite: materialize into contiguous temp cells. Copy
+	// r.cell into a temp index so loadConsecutiveViaPtr can bump and free it
+	// without corrupting the source variable when r is a borrowed *T ident.
 	if r.isPointer && r.elemCount > 1 && !r.elemSlice {
 		base := l.allocCells(r.elemCount)
+		dsts := make([]Cell, r.elemCount)
 		for j := range r.elemCount {
-			val := l.ptrLoad(r.cell)
-			l.emit(&IRMove{Dst: base + j, Src: val})
-			l.freeCell(val)
-			if j < r.elemCount-1 {
-				l.emit(&IRAddI{Dst: r.cell, Value: 1})
-			}
+			dsts[j] = base + Cell(j) // #nosec G115
 		}
-		l.freeCell(r.cell)
+		idx := l.allocCell()
+		l.emit(&IRCopy{Dst: idx, Src: r.cell})
+		l.loadConsecutiveViaPtr(idx, dsts)
+		if r.temp {
+			l.freeCell(r.cell)
+		}
 		return base, r.elemCount, nil
 	}
 	return r.cell, r.cellCount(), nil
+}
+
+// returnCellCount derives the total cell count needed to hold a function's
+// return value(s). Composite returns (struct / array / slice / multi-byte
+// int) override the byte-per-return default in info.Returns.
+func (l *Lowerer) returnCellCount(info *FuncInfo) int {
+	if info.ReturnType.IsSlice {
+		return 3 // ptr, len, cap
+	}
+	if info.ReturnType.IntSize >= 2 {
+		return info.ReturnType.IntSize
+	}
+	if info.ReturnType.ArraySize > 0 && !info.ReturnType.IsPointer {
+		return info.ReturnType.ArraySize
+	}
+	if info.ReturnType.StructType != "" && !info.ReturnType.IsPointer {
+		return l.result.Structs[info.ReturnType.StructType].Size
+	}
+	return info.Returns
 }
 
 func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error) {
@@ -5753,20 +5786,16 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		paramWantsPointer := i < len(info.ParamTypes) && info.ParamTypes[i].IsPointer
 		if r.isPointer && r.elemCount >= 1 && r.typeName != "" && !r.elemSlice && !paramWantsPointer {
 			base := l.allocCells(r.elemCount)
-			// Copy r.cell into a temp index so the loop can bump it without
-			// corrupting the source variable (e.g. a `*T` ident may be reused
-			// by later code).
+			dsts := make([]Cell, r.elemCount)
+			for j := range r.elemCount {
+				dsts[j] = base + Cell(j) // #nosec G115
+			}
+			// Copy r.cell into a temp index so loadConsecutiveViaPtr can bump
+			// and free it without corrupting the source variable (e.g. a *T
+			// ident that may be reused by later code).
 			idx := l.allocCell()
 			l.emit(&IRCopy{Dst: idx, Src: r.cell})
-			for j := range r.elemCount {
-				val := l.ptrLoad(idx)
-				l.emit(&IRMove{Dst: base + j, Src: val})
-				l.freeCell(val)
-				if j < r.elemCount-1 {
-					l.emit(&IRAddI{Dst: idx, Value: 1})
-				}
-			}
-			l.freeCell(idx)
+			l.loadConsecutiveViaPtr(idx, dsts)
 			if r.temp {
 				l.freeCell(r.cell)
 			}
@@ -5818,9 +5847,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 					sc := l.currentScope()
 					paramSI := l.defineSlice(sc, paramName, inner.elemSize, inner.elemType,
 						inner.elemSlice, inner.elemPtrType, inner.elemIntSize)
-					l.emit(&IRMove{Dst: paramSI.ptr, Src: inner.ptr})
-					l.emit(&IRMove{Dst: paramSI.len, Src: inner.len})
-					l.emit(&IRMove{Dst: paramSI.cap, Src: inner.cap})
+					l.moveSliceHeader(paramSI, inner.ptr, inner.len, inner.cap)
 					l.freeSliceInfo(inner)
 					continue
 				}
@@ -5884,16 +5911,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 
 	// Allocate return value cells.
 	// For composite return types (struct/array), allocate contiguous cells.
-	retSize := info.Returns
-	if info.ReturnType.IsSlice {
-		retSize = 3 // ptr, len, cap
-	} else if info.ReturnType.IntSize >= 2 {
-		retSize = info.ReturnType.IntSize
-	} else if info.ReturnType.ArraySize > 0 && !info.ReturnType.IsPointer {
-		retSize = info.ReturnType.ArraySize
-	} else if info.ReturnType.StructType != "" && !info.ReturnType.IsPointer {
-		retSize = l.result.Structs[info.ReturnType.StructType].Size
-	}
+	retSize := l.returnCellCount(info)
 	retCells := make([]Cell, retSize)
 	if retSize > 1 {
 		base := l.allocCells(retSize)
@@ -8482,17 +8500,23 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 			return err
 		}
 		if val.isPointer && val.size > 1 {
-			// Multi-cell pointer-to-pointer copy: read from val, write to idx.
+			// Copy val.cell into a temp index so the bump loop doesn't corrupt
+			// a borrowed source ident.
+			srcIdx := l.allocCell()
+			l.emit(&IRCopy{Dst: srcIdx, Src: val.cell})
 			for j := range val.elemCount {
-				t := l.ptrLoad(val.cell)
+				t := l.ptrLoad(srcIdx)
 				l.ptrStore(idx, t)
 				l.freeCell(t)
 				if j < val.elemCount-1 {
-					l.emit(&IRAddI{Dst: val.cell, Value: 1})
+					l.emit(&IRAddI{Dst: srcIdx, Value: 1})
 					l.emit(&IRAddI{Dst: idx, Value: 1})
 				}
 			}
-			l.freeCell(val.cell)
+			l.freeCell(srcIdx)
+			if val.temp {
+				l.freeCell(val.cell)
+			}
 		} else if val.size > 1 {
 			// Multi-cell direct struct: write each cell via pointer store.
 			for j := range val.size {

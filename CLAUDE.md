@@ -157,6 +157,9 @@ inside loops inside recursive functions).
   (e.g., `"unsupported expression: %T"`).
 - Cross-references in `docs/` use markdown links
   (e.g., `[`stack.md`](stack.md)`).
+- When inserting a new helper next to an existing function,
+  insert *after* the existing function rather than before, to
+  avoid orphaning the existing doc comment.
 
 ## Multi-byte Integers
 
