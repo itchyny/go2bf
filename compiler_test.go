@@ -6001,6 +6001,44 @@ func main() {
 			"", "4 3 2 1",
 		},
 		{
+			"slice of structs parallel swap",
+			`package main
+type Item struct{ key, val byte }
+func main() {
+	xs := []Item{Item{key: 5, val: 50}, Item{key: 2, val: 20}, Item{key: 8, val: 80}}
+	xs[0], xs[2] = xs[2], xs[0]
+	for i := 0; i < len(xs); i++ {
+		if i > 0 { print(" ") }
+		print(xs[i].key); print(":"); print(xs[i].val)
+	}
+}`,
+			"", "8:80 2:20 5:50",
+		},
+		{
+			"slice of structs selection sort",
+			`package main
+type Item struct{ key, val byte }
+func sortItems(xs []Item) {
+	n := byte(len(xs))
+	for i := byte(0); i < n; i++ {
+		min := i
+		for j := i + 1; j < n; j++ {
+			if xs[j].key < xs[min].key { min = j }
+		}
+		xs[i], xs[min] = xs[min], xs[i]
+	}
+}
+func main() {
+	xs := []Item{Item{key: 5, val: 50}, Item{key: 2, val: 20}, Item{key: 8, val: 80}, Item{key: 1, val: 10}}
+	sortItems(xs)
+	for i := 0; i < len(xs); i++ {
+		if i > 0 { print(" ") }
+		print(xs[i].key); print(":"); print(xs[i].val)
+	}
+}`,
+			"", "1:10 2:20 5:50 8:80",
+		},
+		{
 			"slice of structs read write",
 			`package main
 type Point struct { x, y byte }
@@ -9392,6 +9430,41 @@ func main() {
 	print(p.x + p.y)
 }`,
 			"", "10 30",
+		},
+		{
+			"nested struct field via pointer",
+			`package main
+type Inner struct { v byte; w uint16 }
+type Mid struct { d Inner }
+type Outer struct { a byte; m Mid }
+func main() {
+	o := Outer{a: 1, m: Mid{d: Inner{v: 3, w: 30000}}}
+	po := &o
+	x := po.m.d.v
+	y := po.m.d.w
+	println(x, y)
+	po.m.d.v = 99
+	po.m.d.w = uint16(50000)
+	println(o.m.d.v, o.m.d.w)
+}`,
+			"", "3 30000\n99 50000\n",
+		},
+		{
+			"nested struct string field via pointer",
+			`package main
+type Inner struct { s string }
+type Outer struct { a byte; q Inner }
+func setVia(p *Outer, s string) { p.q.s = s }
+func main() {
+	o := Outer{a: 1, q: Inner{s: "hello"}}
+	po := &o
+	println(po.q.s)
+	po.q.s = "world"
+	println(o.q.s)
+	setVia(po, "everyone")
+	println(o.q.s)
+}`,
+			"", "hello\nworld\neveryone\n",
 		},
 		{
 			"len and cap via pointer",

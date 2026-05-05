@@ -3809,6 +3809,14 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				rhsVals[i] = rhsValue{isStr: true, str: sliceInfo{ptr: ptrT, len: lenT, cap: capT, elemSize: 1}}
 				continue
 			}
+			if r.isPointer && r.size > 1 {
+				// Pointer-shaped struct element (e.g. xs[i] for []Item):
+				// materialize the fields into a contiguous temp so later
+				// writes through the same backing slice can't corrupt them.
+				dst := l.materializePtrComposite(r.cell, r.temp, r.size)
+				rhsVals[i] = rhsValue{cell: dst, size: r.size}
+				continue
+			}
 			r = l.ensureTemp(r)
 			rhsVals[i] = rhsValue{cell: r.cell, size: r.cellCount()}
 		}
@@ -5707,21 +5715,11 @@ func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	// Pointer-based composite: materialize into contiguous temp cells. Copy
-	// r.cell into a temp index so loadConsecutiveViaPtr can bump and free it
-	// without corrupting the source variable when r is a borrowed *T ident.
+	// Pointer-based composite: materialize into contiguous temp cells so the
+	// caller can read fields by offset without re-deref'ing through a
+	// possibly-borrowed source variable.
 	if r.isPointer && r.elemCount > 1 && !r.elemSlice {
-		base := l.allocCells(r.elemCount)
-		dsts := make([]Cell, r.elemCount)
-		for j := range r.elemCount {
-			dsts[j] = base + Cell(j) // #nosec G115
-		}
-		idx := l.allocCell()
-		l.emit(&IRCopy{Dst: idx, Src: r.cell})
-		l.loadConsecutiveViaPtr(idx, dsts)
-		if r.temp {
-			l.freeCell(r.cell)
-		}
+		base := l.materializePtrComposite(r.cell, r.temp, r.elemCount)
 		return base, r.elemCount, nil
 	}
 	return r.cell, r.cellCount(), nil
@@ -5815,20 +5813,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		// holding the slot index is exactly what the callee expects.
 		paramWantsPointer := i < len(info.ParamTypes) && info.ParamTypes[i].IsPointer
 		if r.isPointer && r.elemCount >= 1 && r.typeName != "" && !r.elemSlice && !paramWantsPointer {
-			base := l.allocCells(r.elemCount)
-			dsts := make([]Cell, r.elemCount)
-			for j := range r.elemCount {
-				dsts[j] = base + Cell(j) // #nosec G115
-			}
-			// Copy r.cell into a temp index so loadConsecutiveViaPtr can bump
-			// and free it without corrupting the source variable (e.g. a *T
-			// ident that may be reused by later code).
-			idx := l.allocCell()
-			l.emit(&IRCopy{Dst: idx, Src: r.cell})
-			l.loadConsecutiveViaPtr(idx, dsts)
-			if r.temp {
-				l.freeCell(r.cell)
-			}
+			base := l.materializePtrComposite(r.cell, r.temp, r.elemCount)
 			r = exprResult{cell: base, temp: true, size: r.elemCount, typeName: r.typeName}
 		}
 		// Flat-offset result: materialize into contiguous temp cells.
@@ -6312,6 +6297,27 @@ func (l *Lowerer) loadMultiByteIntViaPtr(idx Cell, n int) exprResult {
 	}
 	l.loadConsecutiveViaPtr(idx, dsts)
 	return exprResult{cell: base, temp: true, size: n, intSize: n}
+}
+
+// materializePtrComposite reads n consecutive bytes through a borrowed
+// pointer cell (e.g. an *T ident or a slice-element index) into a fresh
+// contiguous block and returns the base cell. srcCell is copied into a
+// scratch index so loadConsecutiveViaPtr can bump and free the scratch
+// without corrupting the source. If srcTemp is true the caller's srcCell
+// is freed too -- callers must not reference it afterwards.
+func (l *Lowerer) materializePtrComposite(srcCell Cell, srcTemp bool, n int) Cell {
+	base := l.allocCells(n)
+	dsts := make([]Cell, n)
+	for j := range n {
+		dsts[j] = base + Cell(j) // #nosec G115
+	}
+	idx := l.allocCell()
+	l.emit(&IRCopy{Dst: idx, Src: srcCell})
+	l.loadConsecutiveViaPtr(idx, dsts)
+	if srcTemp {
+		l.freeCell(srcCell)
+	}
+	return base
 }
 
 // loadConsecutiveViaIndex reads len(dsts) bytes from a flat-array
@@ -8671,6 +8677,15 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			// String field: load 3 cells (ptr, len, cap) into a fresh sliceInfo.
 			if ptrDef.FieldStrings[e.Sel.Name] {
 				return l.loadStringHeaderViaPtr(idx), nil
+			}
+			// Nested struct field: hand back a pointer-to-struct view so the
+			// caller can keep walking selectors (pb.q.v) or write through it.
+			if nestedType := ptrDef.FieldTypes[e.Sel.Name]; nestedType != "" {
+				nestedDef := l.result.Structs[nestedType]
+				return exprResult{
+					cell: idx, temp: true, isPointer: true,
+					typeName: nestedType, elemSize: 1, elemCount: nestedDef.Size,
+				}, nil
 			}
 			result := l.ptrLoad(idx)
 			l.freeCell(idx)
