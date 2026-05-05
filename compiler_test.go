@@ -9861,16 +9861,16 @@ func f() {}`,
 			"integer overflow",
 			`package main
 func main() { putchar(256) }`,
-			"cannot use uint16 as argument to putchar",
+			"cannot use uint16 as argument to putchar, use byte() to truncate",
 		},
 		{
-			"undefined variable",
+			"undefined variable: x",
 			`package main
 func main() { putchar(x) }`,
 			"undefined variable: x",
 		},
 		{
-			"unsupported function",
+			"unsupported function in expression: unknown",
 			`package main
 func main() { foo() }`,
 			"unsupported function: foo",
@@ -9880,14 +9880,14 @@ func main() { foo() }`,
 			`package main
 import "fmt"
 func main() { fmt.Println("hello") }`,
-			"imports are not supported",
+			"input.go:2:8: imports are not supported",
 		},
 		{
 			"wrong argument count",
 			`package main
 func f(x byte) byte { return x }
 func main() { f(1, 2) }`,
-			"expects 1 arguments, got 2",
+			"function f expects 1 arguments, got 2",
 		},
 		{
 			"array out of bounds",
@@ -9896,7 +9896,7 @@ func main() {
 	a := [3]byte{1, 2, 3}
 	putchar(a[3])
 }`,
-			"array index 3 out of bounds",
+			"array index 3 out of bounds [0:3]",
 		},
 		{
 			"break outside loop",
@@ -9916,7 +9916,7 @@ func main() { continue }`,
 func main() {
 	putchar(a[0])
 }`,
-			"undefined",
+			"undefined variable: a",
 		},
 		{
 			"string literal",
@@ -9942,7 +9942,7 @@ func main() { putchar(f(1)) }`,
 			"too many local variables in recursive function",
 		},
 		{
-			"unsupported expression statement",
+			"unsupported expression statement in recursive function",
 			`package main
 func main() {
 	x := byte(1)
@@ -9954,7 +9954,7 @@ func main() {
 			"wrong package name",
 			`package notmain
 func main() { }`,
-			"expected package main",
+			"input.go: expected package main, got package notmain",
 		},
 		{
 			"recursive unsupported stmt",
@@ -9966,7 +9966,7 @@ func f(n byte) byte {
 	return a
 }
 func main() { putchar(f(1)) }`,
-			"unsupported statement in recursive function",
+			"unsupported statement in recursive function: *ast.GoStmt",
 		},
 		{
 			"recursive call as statement error",
@@ -9982,7 +9982,7 @@ func f(n byte) byte {
 	return r
 }
 func main() { print(f(1)) }`,
-			"unsupported recursive call as statement",
+			"unsupported recursive call as statement: g",
 		},
 		{
 			"unsupported expression statement in recursive",
@@ -9994,13 +9994,13 @@ func f(n byte) byte {
 	return r
 }
 func main() { print(f(1)) }`,
-			"unsupported expression statement",
+			"unsupported expression statement in recursive function",
 		},
 		{
 			"parse error",
 			`package main
 func main() { `,
-			"expected",
+			"input.go:2:15: expected '}', found 'EOF'",
 		},
 		{
 			"composite literal out of bounds",
@@ -10009,7 +10009,7 @@ func main() {
 	a := [2]byte{0: 1, 5: 2}
 	putchar(a[0])
 }`,
-			"array index 5 out of bounds",
+			"array index 5 out of bounds [0:2]",
 		},
 		{
 			"array index out of bounds write",
@@ -10018,7 +10018,7 @@ func main() {
 	a := [3]byte{1, 2, 3}
 	a[3] = 4
 }`,
-			"out of bounds",
+			"array index 3 out of bounds [0:3]",
 		},
 		{
 			"multi return array out of bounds",
@@ -10028,7 +10028,7 @@ func main() {
 	var a [2]byte
 	a[0], a[2] = f()
 }`,
-			"out of bounds",
+			"array index 2 out of bounds [0:2]",
 		},
 		{
 			"multi return undefined array",
@@ -10038,7 +10038,7 @@ func main() {
 	x, b[0] = f()
 	_ = x
 }`,
-			"undefined",
+			"undefined variable: x",
 		},
 		{
 			"deref assign undefined variable",
@@ -10046,7 +10046,7 @@ func main() {
 func main() {
 	*x = 1
 }`,
-			"undefined variable",
+			"undefined variable: x",
 		},
 		{
 			"max wrong args",
@@ -10064,7 +10064,7 @@ func main() { print(cap(1, 2)) }`,
 			"cap on non-array",
 			`package main
 func main() { x := byte(1); print(cap(x)) }`,
-			"must be an array",
+			"cap() argument must be an array",
 		},
 		{
 			"len wrong args",
@@ -10082,13 +10082,13 @@ func main() { putchar(byte(1, 2)) }`,
 			"len on non-array",
 			`package main
 func main() { x := byte(1); print(len(x)) }`,
-			"must be an array",
+			"len() argument must be an array",
 		},
 		{
 			"putchar no args",
 			`package main
 func main() { putchar() }`,
-			"putchar expects 1 argument",
+			"putchar expects 1 argument, got 0",
 		},
 		{
 			"getchar wrong args",
@@ -10101,13 +10101,13 @@ func main() { x := getchar(1) }`,
 			`package main
 func f() { }
 func main() { x := f() }`,
-			"no return value",
+			"function f has no return value",
 		},
 		{
 			"unknown function in expression",
 			`package main
 func main() { x := unknown() }`,
-			"unsupported function",
+			"unsupported function in expression: unknown",
 		},
 		{
 			"clear wrong arg count",
@@ -10140,7 +10140,7 @@ func main() {
 	x := byte(1)
 	x.y = 2
 }`,
-			"undefined struct",
+			"undefined struct in field assignment",
 		},
 		{
 			"min wrong args",
@@ -10152,7 +10152,7 @@ func main() { print(min(byte(1))) }`,
 			"putchar wrong args",
 			`package main
 func main() { putchar(1, 2) }`,
-			"putchar expects 1 argument",
+			"putchar expects 1 argument, got 2",
 		},
 		{
 			"unsupported call in expression",
@@ -10169,7 +10169,7 @@ func main() {
 	a[0] = 1
 	b[0] = 2
 }`,
-			"too many variables",
+			"too many variables: 259 stack slots (max 255)",
 		},
 		{
 			"void function in recursive expression",
@@ -10193,7 +10193,7 @@ func f(n byte) byte {
 	return a + x
 }
 func main() { putchar(f(1)) }`,
-			"undefined variable in recursive function",
+			"undefined variable in recursive function: x",
 		},
 		{
 			"function no return value in expression",
@@ -10221,7 +10221,7 @@ func main() {
 	x := byte(1)
 	putchar(len(x))
 }`,
-			"len()",
+			"len() argument must be an array",
 		},
 		{
 			"defer in loop",
@@ -10238,21 +10238,21 @@ func main() {
 			`package main
 const x uint32 = 4294967296
 func main() {}`,
-			"out of uint32 range",
+			"const x: value 4294967296 out of uint32 range (0-4294967295)",
 		},
 		{
 			"const division by zero",
 			`package main
 const x = 10 / 0
 func main() {}`,
-			"division by zero in constant expression",
+			"const x: division by zero in constant expression",
 		},
 		{
 			"const modulo by zero",
 			`package main
 const x = 10 % 0
 func main() {}`,
-			"modulo by zero in constant expression",
+			"const x: modulo by zero in constant expression",
 		},
 		{
 			"unknown struct field",
@@ -10262,7 +10262,7 @@ func main() {
 	p := Point{1, 2}
 	print(p.z)
 }`,
-			"unknown field z",
+			"unknown field z in struct Point",
 		},
 		{
 			"struct argument undefined",
@@ -10272,7 +10272,7 @@ func f(p Point) byte { return p.x }
 func main() {
 	print(f(q))
 }`,
-			"undefined",
+			"undefined variable: q",
 		},
 		{
 			"recursive unsupported nested if both",
@@ -10289,7 +10289,7 @@ func f(n byte) byte {
 	return f(n-1) + 1
 }
 func main() { print(f(1)) }`,
-			"unsupported recursive call pattern",
+			"unsupported recursive call pattern in then-branch of f",
 		},
 		{
 			"mutual recursion",
@@ -10319,7 +10319,7 @@ func main() { putchar(byte(1, 2)) }`,
 			"address of literal",
 			`package main
 func main() { putchar(&1) }`,
-			"cannot take address",
+			"cannot take address of *ast.BasicLit",
 		},
 		{
 			"use struct as byte",
@@ -10329,7 +10329,7 @@ func main() {
 	p := P{1}
 	putchar(p)
 }`,
-			"cannot use struct",
+			"cannot use struct P as byte value",
 		},
 		{
 			"use array as byte",
@@ -10338,7 +10338,7 @@ func main() {
 	a := [3]byte{1, 2, 3}
 	putchar(a)
 }`,
-			"cannot use array",
+			"cannot use array as byte value",
 		},
 		{
 			"string constant in byte context",
@@ -10355,7 +10355,7 @@ func main() {
 	s := S{data: [2]byte{1, 2}}
 	print(s.data[3])
 }`,
-			"out of bounds",
+			"array index 3 out of bounds [0:2]",
 		},
 		{
 			"array nesting too deep",
@@ -10364,7 +10364,7 @@ func main() {
 	var a [2][3][4][5]byte
 	a[0][0][0][0] = 1
 }`,
-			"nesting deeper than 3",
+			"array nesting deeper than 3 levels is not supported",
 		},
 		{
 			"string literal in expression",
@@ -10379,98 +10379,98 @@ func main() {
 			"uint64 putchar",
 			`package main
 func main() { putchar(5000000000) }`,
-			"cannot use uint64 as argument to putchar",
+			"cannot use uint64 as argument to putchar, use byte() to truncate",
 		},
 		{
 			"uint16 assign to byte variable",
 			`package main
 func main() { v := 300; _ = v }`,
-			"cannot assign wider integer to byte variable",
+			"cannot assign wider integer to byte variable, use explicit conversion",
 		},
 		{
 			"uint16 putchar",
 			`package main
 func main() { var x uint16 = 1; putchar(x) }`,
-			"cannot use uint16 as argument to putchar",
+			"cannot use uint16 as argument to putchar, use byte() to truncate",
 		},
 		{
 			"uint16 switch mixed type",
 			`package main
 func main() { var x uint16 = 1; switch x { case 1: println(1) } }`,
-			"mismatched integer sizes",
+			"mismatched integer sizes in ==, use explicit conversion",
 		},
 		{
 			"uint16 return from byte function",
 			`package main
 func f() byte { var x uint16 = 1; return x }
 func main() { println(f()) }`,
-			"cannot return wider integer from byte-returning function",
+			"cannot return wider integer from byte-returning function, use byte() to truncate",
 		},
 		{
 			"uint16 mixed type",
 			`package main
 func main() { var x uint16 = 1; y := byte(2); println(x + y) }`,
-			"mismatched integer sizes",
+			"mismatched integer sizes in +, use explicit conversion",
 		},
 		{
 			"uint32 slice element assigned narrow literal",
 			`package main
 func main() { a := make([]uint32, 1); a[0] = 50000; println(a[0]) }`,
-			"mismatched integer sizes",
+			"mismatched integer sizes in element assignment, use explicit conversion",
 		},
 		{
 			"uint16 array element assigned byte var",
 			`package main
 func main() { var a [3]uint16; b := byte(5); a[0] = b; println(a[0]) }`,
-			"mismatched integer sizes",
+			"mismatched integer sizes in element assignment, use explicit conversion",
 		},
 		{
 			"make literal size exceeds 255",
 			`package main
 func main() { a := make([]byte, 1000); println(len(a)) }`,
-			"exceeds the 255-slot ceiling",
+			"make size 1000 (* elemSize 1 = 1000 cells) exceeds the 255-slot ceiling",
 		},
 		{
 			"make uint16 size",
 			`package main
 func main() { var n uint16 = 5; a := make([]byte, n); println(len(a)) }`,
-			"make size must be byte",
+			"make size must be byte (got uint16), use byte() to truncate",
 		},
 		{
 			"byte array literal element overflow",
 			`package main
 func main() { a := [3]byte{1, 2, 300}; println(a[2]) }`,
-			"cannot use uint16 value in []byte literal",
+			"cannot use uint16 value in []byte literal, use byte() to truncate",
 		},
 		{
 			"byte arg literal overflow",
 			`package main
 func f(x byte) { println(x) }
 func main() { f(256) }`,
-			"cannot pass uint16 value to byte parameter",
+			"cannot pass uint16 value to byte parameter x, use byte() to truncate",
 		},
 		{
 			"uint16 array index",
 			`package main
 func main() { a := [3]byte{1, 2, 3}; var i uint16 = 0; println(a[i]) }`,
-			"cannot use multi-byte integer as array index",
+			"cannot use multi-byte integer as array index, use byte() to truncate",
 		},
 		{
 			"uint16 struct array index",
 			`package main
 type Point struct { x byte; y byte }
 func main() { a := [2]Point{Point{1, 2}, Point{3, 4}}; var i uint16 = 0; println(a[i].x) }`,
-			"cannot use multi-byte integer as array index",
+			"cannot use multi-byte integer as array index, use byte() to truncate",
 		},
 		{
 			"uint16 in recursive function",
 			`package main
 func sum(n, acc uint16) uint16 { if n == uint16(0) { return acc }; return sum(n-uint16(1), acc+n) }
 func main() { println(sum(uint16(10), uint16(0))) }`,
-			"not supported in recursive function",
+			"multi-byte integer parameters are not supported in recursive function sum",
 		},
 		{
-			"unsupported call in recursive expression",
+			"unsupported call in recursive expression: *ast.Ident",
 			`package main
 func f(n byte) byte {
 	if n == 0 { return 0 }
@@ -10478,7 +10478,7 @@ func f(n byte) byte {
 	return r + unknown(n)
 }
 func main() { print(f(1)) }`,
-			"unsupported call in recursive expression",
+			"unsupported call in recursive expression: *ast.Ident",
 		},
 		{
 			"unsupported function call in recursive",
@@ -10490,7 +10490,7 @@ func f(n byte) byte {
 	return r
 }
 func main() { print(f(1)) }`,
-			"unsupported function in recursive function",
+			"unsupported function in recursive function: unknown",
 		},
 		{
 			"unsupported defer in recursive",
@@ -10503,7 +10503,7 @@ func f(n byte) byte {
 	return r
 }
 func main() { print(f(1)) }`,
-			"unsupported defer call in recursive function",
+			"unsupported defer call in recursive function: double",
 		},
 		{
 			"slices in recursive function",
@@ -10543,7 +10543,7 @@ func main() {
 	var s []byte
 	s = byte(1)
 }`,
-			"unsupported slice expression",
+			"unsupported slice expression: *ast.CallExpr",
 		},
 		{
 			"field not an array in struct array field index",
@@ -10563,8 +10563,8 @@ func main() {
 			if err == nil {
 				t.Fatal("expected error")
 			}
-			if !strings.Contains(err.Error(), tt.err) {
-				t.Errorf("got error %q, want it to contain %q", err, tt.err)
+			if err.Error() != tt.err {
+				t.Errorf("got error %q, want %q", err, tt.err)
 			}
 		})
 	}
@@ -10651,7 +10651,7 @@ func main() {}`,
 				`package util
 func helper() {}`,
 			},
-			"expected package main, got package util",
+			"file1.go: expected package main, got package util",
 		},
 	}
 	for _, tt := range tests {
@@ -10660,8 +10660,8 @@ func helper() {}`,
 			if err == nil {
 				t.Fatal("expected error")
 			}
-			if !strings.Contains(err.Error(), tt.err) {
-				t.Errorf("got error %q, want it to contain %q", err, tt.err)
+			if err.Error() != tt.err {
+				t.Errorf("got error %q, want %q", err, tt.err)
 			}
 		})
 	}
