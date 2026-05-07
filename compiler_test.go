@@ -316,6 +316,45 @@ func main() {
 }`,
 			"", "5\n",
 		},
+		{
+			"if branch declares same name with wider type",
+			`package main
+func main() {
+	x := byte(1)
+	if x == 1 {
+		x := uint16(50000)
+		println(x)
+	} else {
+		x := []byte{9, 9}
+		println(len(x))
+	}
+	println(x)
+}`,
+			"", "50000\n1\n",
+		},
+		{
+			"else-if branches each declare same name with different kinds",
+			`package main
+func main() {
+	x := byte(2)
+	if x == 1 {
+		x := byte(11)
+		print(x)
+	} else if x == 2 {
+		x := uint16(42000)
+		print(x)
+	} else if x == 3 {
+		x := []byte{9, 9, 9}
+		print(len(x))
+	} else {
+		x := byte(99)
+		print(x)
+	}
+	print("/")
+	println(x)
+}`,
+			"", "42000/2\n",
+		},
 		// --- For loops ---
 		{
 			"for loop countdown",
@@ -404,6 +443,61 @@ func main() {
 	}
 }`,
 			"", "54321",
+		},
+		{
+			"for-loop body declares same name as init with wider type",
+			`package main
+func main() {
+	for i := byte(0); i < 3; i++ {
+		j := uint16(i) * uint16(100)
+		print(j)
+		print(" ")
+	}
+}`,
+			"", "0 100 200 ",
+		},
+		{
+			"for-range body declares same name as range variable",
+			`package main
+func main() {
+	v := byte(99)
+	for _, v := range []byte{1, 2, 3} {
+		x := uint16(v) * uint16(100)
+		print(x)
+		print(" ")
+	}
+	println(v)
+}`,
+			"", "100 200 300 99\n",
+		},
+		{
+			"shadowing := with self-reference reads outer",
+			`package main
+func main() {
+	v := byte(99)
+	for _, v := range []byte{1, 2, 3} {
+		v := uint16(v) * uint16(100)
+		print(v)
+		print(" ")
+	}
+	println(v)
+}`,
+			"", "100 200 300 99\n",
+		},
+		{
+			"nested for-loops shadow same iter variable",
+			`package main
+func main() {
+	for i := byte(0); i < 2; i++ {
+		for i := byte(10); i < 12; i++ {
+			print(i)
+			print(" ")
+		}
+		print("/")
+	}
+	println()
+}`,
+			"", "10 11 /10 11 /\n",
 		},
 		// --- Break/Continue ---
 		{
@@ -744,6 +838,40 @@ func main() {
 	}
 }`,
 			"", "AB",
+		},
+		{
+			"switch case declares same name with wider type",
+			`package main
+func main() {
+	x := byte(7)
+	switch x {
+	case 7:
+		x := uint16(40000)
+		println(x)
+	default:
+		x := []byte{1}
+		println(len(x))
+	}
+	println(x)
+}`,
+			"", "40000\n7\n",
+		},
+		{
+			"switch init declares same name as outer slice",
+			`package main
+func main() {
+	x := []byte{77, 88, 99}
+	switch x := byte(2); x {
+	case 1:
+		println("one")
+	case 2:
+		println("two")
+	default:
+		println("other")
+	}
+	println(len(x))
+}`,
+			"", "two\n3\n",
 		},
 		// --- Arithmetic operators ---
 		{
@@ -1754,6 +1882,41 @@ func main() {
 	println(a, b, c, d)
 }`,
 			"", "1 2 3 4\n",
+		},
+		{
+			"local var shadows predeclared nil",
+			`package main
+func main() {
+	nil := 30
+	if nil == 30 {
+		print(nil)
+	}
+}`,
+			"", "30",
+		},
+		{
+			"four levels of nested shadow with different kinds",
+			`package main
+func main() {
+	x := byte(1)
+	{
+		x := uint16(2)
+		{
+			x := uint32(3)
+			{
+				x := []byte{4, 5, 6}
+				print(len(x))
+				print(" ")
+			}
+			print(x)
+			print(" ")
+		}
+		print(x)
+		print(" ")
+	}
+	println(x)
+}`,
+			"", "3 3 2 1\n",
 		},
 		// --- Type conversion ---
 		{
@@ -4587,6 +4750,35 @@ func main() {
 }`,
 			"", "hi\n",
 		},
+		{
+			"local string const does not leak across functions",
+			`package main
+func b() string {
+	const msg = "beta"
+	return msg
+}
+func a() string {
+	const msg = "alpha"
+	inner := b()
+	return msg + " " + inner
+}
+func main() {
+	println(a())
+}`,
+			"", "alpha beta\n",
+		},
+		{
+			"inner byte var shadows outer string const",
+			`package main
+const x = "alpha"
+func main() {
+	{
+		x := byte(5)
+		println(x)
+	}
+}`,
+			"", "5\n",
+		},
 		// --- Arrays ---
 		{
 			"array composite literal",
@@ -5424,6 +5616,37 @@ func main() {
 	}
 }`,
 			"", "1 10\n2 11\n3 12\n",
+		},
+		{
+			"array of structs variable index inc/dec on uint16 field",
+			`package main
+type R struct{ v uint16 }
+func main() {
+	a := [2]R{R{v: 255}, R{v: 256}}
+	i := byte(0)
+	a[i].v++
+	a[1].v--
+	println(a[0].v, a[1].v)
+}`,
+			"", "256 255\n",
+		},
+		{
+			"nested array of multi-byte int variable read/write",
+			`package main
+func main() {
+	var a [2][2]uint16
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 2; j++ {
+			a[i][j] = uint16(i)*uint16(100) + uint16(j)*uint16(10)
+		}
+	}
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 2; j++ {
+			println(a[i][j])
+		}
+	}
+}`,
+			"", "0\n10\n100\n110\n",
 		},
 		{
 			"array of structs variable index struct assign",
@@ -6833,6 +7056,32 @@ func main() {
 			"", "1 2 3 4 5 5\n",
 		},
 		{
+			"append slice from outer scope inside nested block",
+			`package main
+func main() {
+	var x []byte
+	{
+		v := append(x, 3)
+		println(v[0])
+	}
+	_ = x
+}`,
+			"", "3\n",
+		},
+		{
+			"shadowing := with append self-reference reads outer",
+			`package main
+func main() {
+	s := []byte{1, 2, 3}
+	{
+		s := append(s, 4)
+		println(len(s), s[0], s[3])
+	}
+	println(len(s))
+}`,
+			"", "4 1 4\n3\n",
+		},
+		{
 			"return slice literal from function",
 			`package main
 func f() []byte { return []byte{10, 20, 30} }
@@ -7952,6 +8201,30 @@ func main() {
 	}
 }`,
 			"", "10010\n9744\n",
+		},
+		{
+			"inner byte shadows outer uint16",
+			`package main
+func main() {
+	x := uint16(50000)
+	_ = x
+	{
+		x := byte(5)
+		print(x * x)
+	}
+}`,
+			"", "25",
+		},
+		{
+			"discard multi-byte expression with blank identifier",
+			`package main
+func main() {
+	x := uint16(50000)
+	_ = x
+	_ = x + uint16(7)
+	print("ok")
+}`,
+			"", "ok",
 		},
 		// --- uint32 ---
 		{

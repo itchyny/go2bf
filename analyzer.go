@@ -198,7 +198,11 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					for i, name := range vs.Names {
 						if i < len(lastExprs) {
 							// String-typed constants (literal, ident reference, or concat).
-							if s, ok := evalStringConstExpr(lastExprs[i], result.StringConsts); ok {
+							lookupStrConst := func(n string) (string, bool) {
+								s, ok := result.StringConsts[n]
+								return s, ok
+							}
+							if s, ok := evalStringConstExpr(lastExprs[i], lookupStrConst); ok {
 								result.StringConsts[name.Name] = s
 								continue
 							}
@@ -565,23 +569,23 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 }
 
 // evalStringConstExpr folds a string-typed constant expression at compile
-// time. Handles string literals, references to known string constants,
-// and concatenation chains thereof. Returns (value, true) if foldable.
-func evalStringConstExpr(expr ast.Expr, stringConsts map[string]string) (string, bool) {
+// time. Handles string literals, references to known string constants
+// (resolved via lookup), and concatenation chains thereof. Returns
+// (value, true) if foldable.
+func evalStringConstExpr(expr ast.Expr, lookup func(string) (string, bool)) (string, bool) {
 	if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 		s, err := strconv.Unquote(lit.Value)
 		return s, err == nil
 	}
 	if id, ok := expr.(*ast.Ident); ok {
-		s, ok := stringConsts[id.Name]
-		return s, ok
+		return lookup(id.Name)
 	}
 	if bin, ok := expr.(*ast.BinaryExpr); ok && bin.Op == token.ADD {
-		l, ok := evalStringConstExpr(bin.X, stringConsts)
+		l, ok := evalStringConstExpr(bin.X, lookup)
 		if !ok {
 			return "", false
 		}
-		r, ok := evalStringConstExpr(bin.Y, stringConsts)
+		r, ok := evalStringConstExpr(bin.Y, lookup)
 		if !ok {
 			return "", false
 		}
