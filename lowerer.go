@@ -20,9 +20,10 @@ type Lowerer struct {
 	scopes    []scope
 
 	// Return context for inlined functions.
-	returnDst  []Cell // cells where return values should be written
-	returnFlag Cell   // 1 after a return statement
-	inFunc     bool   // true when inside an inlined function body
+	returnDst  []Cell    // cells where return values should be written
+	returnFlag Cell      // 1 after a return statement
+	inFunc     bool      // true when inside an inlined function body
+	curFunc    *FuncInfo // current function's info (nil at top level)
 
 	// Tail-call context.
 	tailCallFunc string // name of the function being tail-call optimized
@@ -190,8 +191,25 @@ type sliceInfo struct {
 // must happen on a freshly-allocated temp index copy of r.cell so the
 // source variable's value is preserved.
 type exprResult struct {
-	cell             Cell
-	temp             bool   // true if the caller owns this cell and must free it
+	cell     Cell
+	temp     bool // true if the caller owns this cell and must free it
+	flatBase Cell // for flat-offset results: base of the original array
+	lenCell  Cell // runtime length cell (0 if compile-time elemCount)
+	capCell  Cell // runtime capacity cell (0 if not applicable)
+	exprShape
+}
+
+// cellCount returns the number of cells in this result (1 for scalars).
+func (r exprResult) cellCount() int {
+	return max(r.size, 1)
+}
+
+// exprShape describes the type/layout of an expression -- what kind of
+// value it is and how its cells are arranged. It carries no runtime
+// location info (those live on exprResult). It is also used as a
+// standalone by shapeOf/shapeOfCall/elementShapeOf etc. to describe a
+// would-be variable for defineFromShape without evaluating any code.
+type exprShape struct {
 	size             int    // total number of cells; 0 means 1 (scalar)
 	intSize          int    // >1 for multi-byte integers (2, 4, or 8)
 	typeName         string // struct type name of this result (empty for non-struct)
@@ -205,14 +223,6 @@ type exprResult struct {
 	innerElemIntSize int    // for nested arrays: >1 if inner elements are multi-byte ints
 	isPointer        bool   // cell is a slot index for indirect access (pointer-to-struct/array, or a 3-cell slice header where lenCell/capCell carry the length and capacity)
 	ptrIntSize       int    // >1 if this pointer targets a multi-byte integer
-	flatBase         Cell   // for flat-offset results: base of the original array
-	lenCell          Cell   // runtime length cell (0 if compile-time elemCount)
-	capCell          Cell   // runtime capacity cell (0 if not applicable)
-}
-
-// cellCount returns the number of cells in this result (1 for scalars).
-func (r exprResult) cellCount() int {
-	return max(r.size, 1)
 }
 
 // Lower converts the analyzed AST to an IR program.
@@ -361,7 +371,7 @@ func (l *Lowerer) ensureTemp(r exprResult) exprResult {
 	for j := range n {
 		l.emit(&IRCopy{Dst: base + j, Src: r.cell + j})
 	}
-	return exprResult{cell: base, temp: true, size: r.size}
+	return exprResult{cell: base, temp: true, exprShape: exprShape{size: r.size}}
 }
 
 // Scope management.
@@ -1038,16 +1048,15 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 			l.storeConsecutiveViaPtr(idx, srcs)
 			l.freeCellRange(base, size)
 			continue
-		} else {
-			r, err := l.lowerExpr(elt)
-			if err != nil {
-				return sliceInfo{}, err
-			}
-			t := l.allocCell()
-			l.emitCopyOrMove(t, r)
-			l.ptrStore(idx, t)
-			l.freeCell(t)
 		}
+		r, err := l.lowerExpr(elt)
+		if err != nil {
+			return sliceInfo{}, err
+		}
+		t := l.allocCell()
+		l.emitCopyOrMove(t, r)
+		l.ptrStore(idx, t)
+		l.freeCell(t)
 		l.freeCell(idx)
 	}
 	return si, nil
@@ -1055,6 +1064,11 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 
 // evalSliceExpr handles s[low:high] or a[low:high].
 func (l *Lowerer) evalSliceExpr(se *ast.SliceExpr) (sliceInfo, error) {
+	if p, ok := se.X.(*ast.ParenExpr); ok {
+		return l.evalSliceExpr(&ast.SliceExpr{
+			X: p.X, Low: se.Low, High: se.High, Max: se.Max, Slice3: se.Slice3,
+		})
+	}
 	si := l.allocSliceInfo()
 	switch x := se.X.(type) {
 	case *ast.Ident:
@@ -1124,7 +1138,21 @@ func (l *Lowerer) lowerSliceFromSliceExpr(si sliceInfo, se *ast.SliceExpr) error
 	}
 	id, ok := se.X.(*ast.Ident)
 	if !ok {
-		return fmt.Errorf("unsupported slice expression")
+		// Fallback: any slice-yielding expression (call, index, etc.).
+		src, err := l.lowerSliceExpr(se.X)
+		if err != nil {
+			return fmt.Errorf("unsupported slice expression: %v", err)
+		}
+		if si.elemSize == 0 {
+			si.elemSize = src.elemSize
+			si.elemType = src.elemType
+			si.elemSlice = src.elemSlice
+			si.elemPtrType = src.elemPtrType
+			si.elemIntSize = src.elemIntSize
+		}
+		err = l.lowerSliceFromSrcSliceInfo(si, src, se)
+		l.freeSliceInfo(src)
+		return err
 	}
 	switch b := l.lookupBinding(id.Name).(type) {
 	case *stringConstBinding:
@@ -1269,8 +1297,9 @@ func (l *Lowerer) lowerSliceAppend(si sliceInfo, valArg ast.Expr) error {
 		l.emit(&IRCopy{Dst: valBase + 1, Src: inner.len})
 		l.emit(&IRCopy{Dst: valBase + 2, Src: inner.cap})
 		l.freeSliceInfo(inner)
-	} else if es > 1 {
-		// Multi-cell element: resolve struct arg (handles composite literals).
+	} else if es > 1 || si.elemType != "" {
+		// Composite element (struct, including size-1 struct): resolve via
+		// resolveStructArg to handle composite literals.
 		base, size, err := l.resolveStructArg(valArg)
 		if err != nil {
 			return err
@@ -1468,6 +1497,37 @@ func (l *Lowerer) lowerSliceAppendSpread(si sliceInfo, srcExpr ast.Expr) error {
 	return nil
 }
 
+// returnShape converts a ReturnInfo (per-return composite type info)
+// into an exprShape suitable for defineFromShape.
+func returnShape(ri ReturnInfo, size int) exprShape {
+	if ri.IsSlice {
+		return exprShape{
+			elemSize: max(ri.SliceElemSize, 1), elemType: ri.SliceElemType,
+			elemSlice: ri.SliceElemSlice, elemIntSize: ri.SliceElemIntSize,
+			isPointer: true,
+		}
+	}
+	if ri.IsPointer && ri.StructType != "" {
+		return exprShape{isPointer: true, typeName: ri.StructType}
+	}
+	if ri.IsPointer && ri.ArraySize > 0 {
+		return exprShape{isPointer: true, elemSize: 1, elemCount: ri.ArraySize}
+	}
+	if ri.StructType != "" {
+		return exprShape{typeName: ri.StructType}
+	}
+	if ri.ArraySize > 0 {
+		return exprShape{elemSize: 1, elemCount: ri.ArraySize}
+	}
+	if ri.IntSize >= 2 {
+		return exprShape{intSize: ri.IntSize}
+	}
+	if size >= 2 {
+		return exprShape{intSize: size}
+	}
+	return exprShape{}
+}
+
 // structDef returns the StructDef for a named struct type, or nil.
 func (l *Lowerer) structDef(expr ast.Expr) *StructDef {
 	id, ok := expr.(*ast.Ident)
@@ -1490,305 +1550,43 @@ func (l *Lowerer) declareFromAssign(s *ast.AssignStmt) {
 	// Multi-return: x, y := f() where f returns multiple values.
 	if len(s.Rhs) == 1 && len(s.Lhs) > 1 {
 		if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
-			if fn, ok := call.Fun.(*ast.Ident); ok {
-				if info, ok := l.result.Funcs[fn.Name]; ok && len(info.ReturnSizes) == len(s.Lhs) {
-					for i, lhs := range s.Lhs {
-						lid, ok := lhs.(*ast.Ident)
-						if !ok || lid.Name == "_" {
-							continue
-						}
-						if i < len(info.ReturnSizes) && info.ReturnSizes[i] == 3 {
-							if !sc.has(lid.Name) {
-								l.defineSlice(sc, lid.Name, 1, "", false, "", 0)
-							}
-						} else if i < len(info.ReturnSizes) && info.ReturnSizes[i] >= 2 {
-							if !sc.has(lid.Name) {
-								l.defineIntVar(sc, lid.Name, info.ReturnSizes[i])
-							}
-						} else if !sc.has(lid.Name) {
-							sc.defineByte(lid.Name, l.allocCell())
-						}
+			funcName, _ := l.resolveCall(call)
+			if info, ok := l.result.Funcs[funcName]; ok && len(info.ReturnSizes) == len(s.Lhs) {
+				for i, lhs := range s.Lhs {
+					lid, ok := lhs.(*ast.Ident)
+					if !ok || lid.Name == "_" || sc.has(lid.Name) {
+						continue
 					}
-					return
+					l.defineFromShape(sc, lid.Name, returnShape(info.ReturnTypes[i], info.ReturnSizes[i]))
 				}
+				return
 			}
 		}
 	}
 	for i, lhs := range s.Lhs {
 		id, ok := lhs.(*ast.Ident)
-		if !ok || id.Name == "_" {
+		if !ok || id.Name == "_" || sc.has(id.Name) {
 			continue
 		}
-		// Skip if already bound (e.g. parameters in the inlined-call scope).
-		if sc.has(id.Name) {
-			continue
-		}
-		// s := "hello" -- string literal lowers to []byte slice.
-		if i < len(s.Rhs) {
-			if lit, ok := s.Rhs[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-				continue
-			}
-		}
-		// c := a + b where both are string-like -- string concat.
-		if i < len(s.Rhs) {
-			if bin, ok := s.Rhs[i].(*ast.BinaryExpr); ok && bin.Op == token.ADD {
-				if l.isStringExpr(bin.X) && l.isStringExpr(bin.Y) {
-					l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-					continue
-				}
-			}
-		}
-		// t := string(bs) or b := []byte(s) -- string/byte-slice cast.
-		// t := string(byteExpr) -- 1-char string from a byte value.
-		if i < len(s.Rhs) {
-			if call, ok := s.Rhs[i].(*ast.CallExpr); ok && len(call.Args) == 1 {
-				stringCast := false
-				byteToString := false
-				if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "string" {
-					stringCast = true
-					if !l.isStringExpr(call.Args[0]) {
-						byteToString = true
-					}
-				} else if at, ok := call.Fun.(*ast.ArrayType); ok && at.Len == nil {
-					if eid, ok := at.Elt.(*ast.Ident); ok && eid.Name == "byte" {
-						stringCast = true
-					}
-				}
-				if (stringCast && l.isStringExpr(call.Args[0])) || byteToString {
-					l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-					continue
-				}
-			}
-		}
-		// Check for composite literal: a := [N]byte{...} or p := Point{...}
-		if i < len(s.Rhs) {
-			if comp, ok := s.Rhs[i].(*ast.CompositeLit); ok {
-				if count, elemSize, elemType, eis, esl, ies, ieis := l.arrayElementInfo(comp.Type); count > 0 {
-					if !sc.has(id.Name) {
-						if elemSize > 1 {
-							l.defineStructArray(sc, id.Name, count, elemSize, elemType, eis, esl, ies, ieis)
-						} else {
-							l.defineArray(sc, id.Name, count)
-						}
-					}
-					continue
-				}
-				if isSliceType(comp.Type) {
-					if !sc.has(id.Name) {
-						es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
-						l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-					}
-					continue
-				}
-				if def := l.structDef(comp.Type); def != nil {
-					if !sc.has(id.Name) {
-						l.defineStruct(sc, id.Name, def)
-					}
-					continue
-				}
-			}
-		}
-		// s := make([]byte, n) or s := append(...)
-		if i < len(s.Rhs) {
-			if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
-				if fn, ok := call.Fun.(*ast.Ident); ok {
-					if (fn.Name == "uint16" || fn.Name == "uint32" || fn.Name == "uint64") && len(call.Args) == 1 {
-						if !sc.has(id.Name) {
-							l.defineIntVar(sc, id.Name, intIdentSize(fn.Name))
-						}
-						continue
-					}
-					if fn.Name == "make" && len(call.Args) >= 2 && isSliceType(call.Args[0]) {
-						if !sc.has(id.Name) {
-							es, et, esl, ept, eis := l.sliceElemInfo(call.Args[0])
-							l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-						}
-						continue
-					}
-					if fn.Name == "append" && len(call.Args) >= 2 {
-						if !sc.has(id.Name) {
-							// append(s, ...) where s is a known slice (any
-							// enclosing scope, not just the current one).
-							if srcID, ok := call.Args[0].(*ast.Ident); ok {
-								if src, ok := l.lookupSlice(srcID.Name); ok {
-									l.defineSlice(sc, id.Name, src.elemSize, src.elemType,
-										src.elemSlice, src.elemPtrType, src.elemIntSize)
-									continue
-								}
-							}
-							// append(make(...), ...) or append([]byte{...}, ...).
-							if innerCall, ok := call.Args[0].(*ast.CallExpr); ok {
-								if innerFn, ok := innerCall.Fun.(*ast.Ident); ok && innerFn.Name == "make" && len(innerCall.Args) >= 2 && isSliceType(innerCall.Args[0]) {
-									es, et, esl, ept, eis := l.sliceElemInfo(innerCall.Args[0])
-									l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-									continue
-								}
-							}
-							if comp, ok := call.Args[0].(*ast.CompositeLit); ok && isSliceType(comp.Type) {
-								es, et, esl, ept, eis := l.sliceElemInfo(comp.Type)
-								l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-								continue
-							}
-						}
-					}
-				}
-			}
-		}
-		// s := a[1:3] or s := t[:]
-		if i < len(s.Rhs) {
-			if se, ok := s.Rhs[i].(*ast.SliceExpr); ok {
-				if !sc.has(id.Name) {
-					es, et, esl, ept, eis := 1, "", false, "", 0
-					if srcID, ok := se.X.(*ast.Ident); ok {
-						switch b := l.lookupBinding(srcID.Name).(type) {
-						case *sliceBinding:
-							si := b.info
-							es, et, esl, ept, eis = si.elemSize, si.elemType, si.elemSlice, si.elemPtrType, si.elemIntSize
-						case *arrayBinding:
-							ai := b.info
-							es, et, eis = max(ai.elemSize, 1), ai.elemType, ai.elemIntSize
-						}
-					}
-					l.defineSlice(sc, id.Name, es, et, esl, ept, eis)
-				}
-				continue
-			}
-		}
-		// inner := s[i] where s is [][]byte, []P, [N][M]byte, [N]P, or [N]uintN
-		if i < len(s.Rhs) {
-			if idxExpr, ok := s.Rhs[i].(*ast.IndexExpr); ok {
-				if arrID, ok := idxExpr.X.(*ast.Ident); ok {
-					switch b := l.lookupBinding(arrID.Name).(type) {
-					case *sliceBinding:
-						si := b.info
-						if si.elemSlice {
-							if !sc.has(id.Name) {
-								l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-							}
-							continue
-						}
-						if si.elemIntSize >= 2 {
-							if !sc.has(id.Name) {
-								l.defineIntVar(sc, id.Name, si.elemIntSize)
-							}
-							continue
-						}
-						if si.elemType != "" {
-							if !sc.has(id.Name) {
-								def := l.result.Structs[si.elemType]
-								l.defineStruct(sc, id.Name, def)
-							}
-							continue
-						}
-					case *arrayBinding:
-						ai := b.info
-						if ai.elemSize > 1 {
-							if ai.elemIntSize >= 2 {
-								// [N]uintN -> uintN
-								if !sc.has(id.Name) {
-									l.defineIntVar(sc, id.Name, ai.elemIntSize)
-								}
-							} else if ai.elemType != "" {
-								// [N]Point -> Point
-								if !sc.has(id.Name) {
-									def := l.result.Structs[ai.elemType]
-									l.defineStruct(sc, id.Name, def)
-								}
-							} else {
-								// [N][M]byte -> [M]byte
-								if !sc.has(id.Name) {
-									l.defineArray(sc, id.Name, ai.elemSize)
-								}
-							}
-							continue
-						}
-					}
-				}
-			}
-		}
-		// s := t where t is a slice
-		if i < len(s.Rhs) {
-			if rhsID, ok := s.Rhs[i].(*ast.Ident); ok {
-				if src, ok := l.lookupSlice(rhsID.Name); ok {
-					if !sc.has(id.Name) {
-						l.defineSlice(sc, id.Name, src.elemSize, src.elemType, src.elemSlice, src.elemPtrType, src.elemIntSize)
-					}
-					continue
-				}
-			}
-		}
-		// t := p.name where p.name is a string-typed struct field
-		// (direct, pointer, or chained access).
-		if i < len(s.Rhs) {
-			if sel, ok := s.Rhs[i].(*ast.SelectorExpr); ok {
-				if l.isStringSelector(sel) {
-					if !sc.has(id.Name) {
-						l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-					}
-					continue
-				}
-			}
-		}
-		// s := f() where f returns a slice
-		if i < len(s.Rhs) {
-			if call, ok := s.Rhs[i].(*ast.CallExpr); ok {
-				if fn, ok := call.Fun.(*ast.Ident); ok {
-					if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
-						if !sc.has(id.Name) {
-							es := max(info.ReturnType.SliceElemSize, 1)
-							l.defineSlice(sc, id.Name, es, info.ReturnType.SliceElemType, info.ReturnType.SliceElemSlice, "", info.ReturnType.SliceElemIntSize)
-						}
-						continue
-					}
-				}
-			}
-		}
-		// p := a[i] where a is [N]Struct
-		if i < len(s.Rhs) {
-			if idx, ok := s.Rhs[i].(*ast.IndexExpr); ok {
-				if arrID, ok := idx.X.(*ast.Ident); ok {
-					if ai, ok := l.lookupArray(arrID.Name); ok && ai.elemType != "" {
-						if def, ok := l.result.Structs[ai.elemType]; ok {
-							if !sc.has(id.Name) {
-								l.defineStruct(sc, id.Name, def)
-							}
-							continue
-						}
-					}
-				}
-			}
-		}
-		if !sc.has(id.Name) {
-			n := 0
-			if i < len(s.Rhs) {
-				n = l.exprIntSize(s.Rhs[i], sc)
-			}
-			if n >= 2 {
-				l.defineIntVar(sc, id.Name, n)
-			} else {
-				sc.defineByte(id.Name, l.allocCell())
-			}
-		}
+		l.defineFromShape(sc, id.Name, l.shapeOf(s.Rhs[i], sc))
+
 		// Track &var for pointer type info. Annotations come AFTER allocation
 		// so byteBindingFor returns the just-defined binding instead of
 		// creating a stub.
-		if i < len(s.Rhs) {
-			if unary, ok := s.Rhs[i].(*ast.UnaryExpr); ok && unary.Op == token.AND {
-				if rhsID, ok := unary.X.(*ast.Ident); ok {
-					switch b := l.lookupBinding(rhsID.Name).(type) {
-					case *intBinding:
-						sc.annotatePtrIntSize(id.Name, b.size)
-					case *structBinding:
-						sc.annotatePtrType(id.Name, b.info.def.Name)
-					}
+		if unary, ok := s.Rhs[i].(*ast.UnaryExpr); ok && unary.Op == token.AND {
+			if rhsID, ok := unary.X.(*ast.Ident); ok {
+				switch b := l.lookupBinding(rhsID.Name).(type) {
+				case *intBinding:
+					sc.annotatePtrIntSize(id.Name, b.size)
+				case *structBinding:
+					sc.annotatePtrType(id.Name, b.info.def.Name)
 				}
-				if sel, ok := unary.X.(*ast.SelectorExpr); ok {
-					typeName := l.resolveExprTypeName(sel.X)
-					if def, ok := l.result.Structs[typeName]; ok {
-						if n := def.FieldIntSizes[sel.Sel.Name]; n >= 2 {
-							sc.annotatePtrIntSize(id.Name, n)
-						}
+			}
+			if sel, ok := unary.X.(*ast.SelectorExpr); ok {
+				typeName := l.resolveExprTypeName(sel.X)
+				if def, ok := l.result.Structs[typeName]; ok {
+					if n := def.FieldIntSizes[sel.Sel.Name]; n >= 2 {
+						sc.annotatePtrIntSize(id.Name, n)
 					}
 				}
 			}
@@ -1802,187 +1600,365 @@ func (l *Lowerer) declareFromRange(s *ast.RangeStmt) {
 
 	if s.Key != nil {
 		if id, ok := s.Key.(*ast.Ident); ok {
-			if !sc.has(id.Name) {
-				if n := l.exprIntSize(s.X, sc); n >= 2 {
-					l.defineIntVar(sc, id.Name, n)
-				} else {
-					sc.defineByte(id.Name, l.allocCell())
-				}
-			}
-		}
-	}
-	if s.Value != nil {
-		if id, ok := s.Value.(*ast.Ident); ok {
-			if sc.has(id.Name) {
-				return
-			}
-			// Multi-byte int element: allocate v as an intVar. If the same
-			// name was already defined as an intCell at a smaller width,
-			// reject -- our flat scope can't hold both. Same name reused
-			// for a wider element would silently truncate.
-			var n int
-			if rangeID, ok := s.X.(*ast.Ident); ok {
-				switch b := l.lookupBinding(rangeID.Name).(type) {
-				case *arrayBinding:
-					if b.info.elemIntSize >= 2 {
-						n = b.info.elemIntSize
-					}
-				case *sliceBinding:
-					if b.info.elemIntSize >= 2 {
-						n = b.info.elemIntSize
-					}
-				}
-			} else if sel, ok := s.X.(*ast.SelectorExpr); ok {
-				// `for _, v := range s.vals` where s is struct, vals is multi-byte int array.
-				if structID, ok := sel.X.(*ast.Ident); ok {
-					if si, ok := l.lookupStruct(structID.Name); ok {
-						if eis := si.def.FieldArrayElemIntSize[sel.Sel.Name]; eis >= 2 {
-							n = eis
-						}
-					}
-				}
-			}
-			if n >= 2 {
-				if !sc.has(id.Name) {
-					l.defineIntVar(sc, id.Name, n)
-				}
-				return
-			}
-			if !sc.has(id.Name) {
-				// Struct/pointer slice range: allocate appropriately.
-				var rangeElemType string
-				if rangeID, ok := s.X.(*ast.Ident); ok {
-					if si, ok := l.lookupSlice(rangeID.Name); ok {
-						if si.elemSlice {
-							// `[][]byte` / `[]string`: each element is a 3-cell slice header.
-							l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-							return
-						}
-						if si.elemType != "" {
-							rangeElemType = si.elemType
-						} else if si.elemPtrType != "" {
-							sc.defineByte(id.Name, l.allocCell())
-							sc.annotatePtrType(id.Name, si.elemPtrType)
-							return
-						}
-					}
-					if ai, ok := l.lookupArray(rangeID.Name); ok {
-						if ai.elemSlice {
-							// `[N]string`: each element is a 3-cell slice header.
-							l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-							return
-						}
-						if ai.elemType != "" {
-							rangeElemType = ai.elemType
-						}
-					}
-				}
-				if rangeElemType == "" {
-					if call, ok := s.X.(*ast.CallExpr); ok {
-						if fn, ok := call.Fun.(*ast.Ident); ok {
-							if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
-								if info.ReturnType.SliceElemSlice {
-									l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-									return
-								}
-								rangeElemType = info.ReturnType.SliceElemType
-							}
-						}
-					}
-				}
-				if rangeElemType == "" {
-					if se, ok := s.X.(*ast.SliceExpr); ok {
-						if srcID, ok := se.X.(*ast.Ident); ok {
-							if si, ok := l.lookupSlice(srcID.Name); ok {
-								rangeElemType = si.elemType
-							}
-						}
-					}
-				}
-				if comp, ok := s.X.(*ast.CompositeLit); ok {
-					if at, ok := comp.Type.(*ast.ArrayType); ok && at.Len == nil {
-						if eid, ok := at.Elt.(*ast.Ident); ok && eid.Name == "string" {
-							l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-							return
-						}
-						if eltAt, ok := at.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
-							l.defineSlice(sc, id.Name, 1, "", false, "", 0)
-							return
-						}
-					}
-				}
-				if rangeElemType != "" {
-					def := l.result.Structs[rangeElemType]
-					l.defineStruct(sc, id.Name, def)
-					return
-				}
+			if n := l.exprIntSize(s.X, sc); n >= 2 {
+				l.defineIntVar(sc, id.Name, n)
+			} else {
 				sc.defineByte(id.Name, l.allocCell())
 			}
 		}
 	}
+
+	if s.Value != nil {
+		if id, ok := s.Value.(*ast.Ident); ok {
+			l.defineFromShape(sc, id.Name, elementShapeOf(l.shapeOf(s.X, sc)))
+		}
+	}
 }
 
-// declareFromDecl allocates cells for variables introduced by `var`,
-// and registers local consts and types.
-func (l *Lowerer) declareFromDecl(s *ast.DeclStmt) {
-	sc := l.currentScope()
+// byteSliceShape is the exprShape for a default `[]byte` slice
+// header (covers string literals, concats, []byte casts, etc.).
+func byteSliceShape() exprShape {
+	return exprShape{elemSize: 1, isPointer: true}
+}
 
-	gd, ok := s.Decl.(*ast.GenDecl)
-	if !ok {
-		return
+// arrayShapeFrom converts an arrayInfo into an exprShape
+// describing the whole array (suitable for defineFromShape, or as the
+// parent of elementShapeOf).
+func arrayShapeFrom(ai arrayInfo) exprShape {
+	return exprShape{
+		elemCount: ai.count, elemSize: ai.elemSize, elemType: ai.elemType,
+		elemSlice: ai.elemSlice, elemIntSize: ai.elemIntSize,
+		innerElemSize: ai.innerElemSize, innerElemIntSize: ai.innerElemIntSize,
 	}
-	if gd.Tok == token.CONST {
-		// Register local consts so subsequent declarations can reference them.
-		// Errors are caught again during lowerDecl.
-		_ = l.lowerLocalConsts(gd)
-		return
+}
+
+// sliceShapeFrom converts a sliceInfo into an exprShape.
+func sliceShapeFrom(si sliceInfo) exprShape {
+	return exprShape{
+		elemSize: si.elemSize, elemType: si.elemType, elemSlice: si.elemSlice,
+		elemPtrType: si.elemPtrType, elemIntSize: si.elemIntSize,
+		isPointer: true,
 	}
-	if gd.Tok == token.TYPE {
-		// Register local types so subsequent variable declarations can reference them.
-		// Errors are caught again during lowerDecl.
-		_ = l.lowerLocalTypes(gd)
-		return
-	}
-	for _, spec := range gd.Specs {
-		vs, ok := spec.(*ast.ValueSpec)
-		if !ok {
-			continue
+}
+
+// defineFromShape allocates a binding for `name` based on an
+// exprShape describing the kind. Field conventions:
+//   - intSize >= 2: multi-byte int var.
+//   - isPointer && typeName != "": byte var with ptr-to-struct annotation.
+//   - isPointer: slice (carries elem* fields).
+//   - elemCount > 0 & elemSize > 1: struct array.
+//   - elemCount > 0: byte array of that size.
+//   - typeName != "": struct (looked up in result.Structs).
+//   - default: byte.
+func (l *Lowerer) defineFromShape(sc scope, name string, sh exprShape) {
+	switch {
+	case sh.ptrIntSize >= 2:
+		sc.defineByte(name, l.allocCell())
+		sc.annotatePtrIntSize(name, sh.ptrIntSize)
+	case sh.intSize >= 2:
+		l.defineIntVar(sc, name, sh.intSize)
+	case sh.isPointer && sh.typeName != "":
+		sc.defineByte(name, l.allocCell())
+		sc.annotatePtrType(name, sh.typeName)
+	case sh.isPointer && sh.elemCount > 0:
+		// Pointer to array: byte cell holding the array's slot, with array shape.
+		sc.defineByte(name, l.allocCell())
+		sc.annotatePtrArray(name, arrayInfo{
+			size: sh.elemCount * max(sh.elemSize, 1), count: sh.elemCount,
+			elemSize: max(sh.elemSize, 1), elemType: sh.elemType,
+			elemIntSize: sh.elemIntSize,
+		})
+	case sh.isPointer:
+		l.defineSlice(sc, name, sh.elemSize, sh.elemType, sh.elemSlice, sh.elemPtrType, sh.elemIntSize)
+	case sh.elemCount > 0 && (sh.elemSize > 1 || sh.elemType != ""):
+		l.defineStructArray(sc, name, sh.elemCount, max(sh.elemSize, 1), sh.elemType,
+			sh.elemIntSize, sh.elemSlice, sh.innerElemSize, sh.innerElemIntSize)
+	case sh.elemCount > 0:
+		l.defineArray(sc, name, sh.elemCount)
+	case sh.typeName != "":
+		if def, ok := l.result.Structs[sh.typeName]; ok {
+			l.defineStruct(sc, name, def)
+			return
 		}
-		for _, name := range vs.Names {
-			if sc.has(name.Name) {
-				continue
+		sc.defineByte(name, l.allocCell())
+	default:
+		sc.defineByte(name, l.allocCell())
+	}
+}
+
+// elementShapeOf returns the shape of an element of a slice or array
+// described by `parent` (a shape carrying elem* fields).
+func elementShapeOf(parent exprShape) exprShape {
+	switch {
+	case parent.elemSlice:
+		return byteSliceShape()
+	case parent.elemIntSize >= 2:
+		return exprShape{intSize: parent.elemIntSize}
+	case parent.elemType != "":
+		return exprShape{typeName: parent.elemType}
+	case parent.elemPtrType != "":
+		return exprShape{isPointer: true, typeName: parent.elemPtrType}
+	case parent.elemSize > 1:
+		// [N][M]T -> [M]T -- propagate the inner element info.
+		inner := max(parent.innerElemSize, 1)
+		return exprShape{
+			elemCount: parent.elemSize / inner, elemSize: inner,
+			elemIntSize: parent.innerElemIntSize,
+		}
+	default:
+		return exprShape{} // byte
+	}
+}
+
+// shapeOf examines an expression's AST shape and returns an exprShape
+// describing the kind of value it would produce.
+func (l *Lowerer) shapeOf(expr ast.Expr, sc scope) exprShape {
+	switch expr := expr.(type) {
+	case *ast.ParenExpr:
+		return l.shapeOf(expr.X, sc)
+	case *ast.StarExpr:
+		// *p -- deref a pointer to a value of the target's shape.
+		if id, ok := expr.X.(*ast.Ident); ok {
+			if def, ok := l.lookupPtrType(id.Name); ok {
+				return exprShape{typeName: def.Name}
 			}
-			{
-				if count, elemSize, elemType, eis, esl, ies, ieis := l.arrayElementInfo(vs.Type); count > 0 {
-					if elemSize > 1 {
-						l.defineStructArray(sc, name.Name, count, elemSize, elemType, eis, esl, ies, ieis)
-					} else {
-						l.defineArray(sc, name.Name, count)
+			if ai, ok := l.lookupPtrArray(id.Name); ok {
+				return arrayShapeFrom(ai)
+			}
+			if n := l.lookupPtrIntSize(id.Name); n >= 2 {
+				return exprShape{intSize: n}
+			}
+		}
+	case *ast.UnaryExpr:
+		// &x -- pointer to the operand's shape.
+		if expr.Op == token.AND {
+			switch x := expr.X.(type) {
+			case *ast.Ident:
+				switch b := l.lookupBinding(x.Name).(type) {
+				case *structBinding:
+					return exprShape{isPointer: true, typeName: b.info.def.Name}
+				case *arrayBinding:
+					sh := arrayShapeFrom(b.info)
+					sh.isPointer = true
+					return sh
+				case *intBinding:
+					return exprShape{ptrIntSize: b.size}
+				}
+			case *ast.SelectorExpr:
+				if id, ok := x.X.(*ast.Ident); ok {
+					if si, ok := l.lookupStruct(id.Name); ok {
+						field := x.Sel.Name
+						if t := si.def.FieldTypes[field]; t != "" {
+							return exprShape{isPointer: true, typeName: t}
+						}
+						if n := si.def.FieldIntSizes[field]; n >= 2 {
+							return exprShape{ptrIntSize: n}
+						}
 					}
-				} else if n := intTypeSize(vs.Type); n >= 2 {
-					if !sc.has(name.Name) {
-						l.defineIntVar(sc, name.Name, n)
+				}
+			case *ast.IndexExpr:
+				return exprShape{} // &a[i] -- byte cell holding slot index
+			}
+		}
+	case *ast.BasicLit:
+		// "hello" -- string literal lowers to []byte slice.
+		if expr.Kind == token.STRING {
+			return byteSliceShape()
+		}
+	case *ast.BinaryExpr:
+		// a + b where both are string-like -- string concat.
+		if expr.Op == token.ADD && l.isStringExpr(expr.X) && l.isStringExpr(expr.Y) {
+			return byteSliceShape()
+		}
+	case *ast.CompositeLit:
+		// [N]byte{...}, []T{...}, Point{...}.
+		if expr.Type != nil {
+			return l.shapeOfType(expr.Type)
+		}
+	case *ast.SliceExpr:
+		// a[1:3] or t[:] -- inherit elem info from the source slice/array.
+		parent := l.shapeOf(expr.X, sc)
+		if parent.isPointer {
+			return parent // source is already a slice
+		}
+		if parent.elemCount > 0 {
+			return exprShape{
+				elemSize: max(parent.elemSize, 1), elemType: parent.elemType,
+				elemIntSize: parent.elemIntSize,
+				isPointer:   true,
+			}
+		}
+		return byteSliceShape()
+	case *ast.IndexExpr:
+		// inner := x[i] where x is any indexable expression.
+		return elementShapeOf(l.shapeOf(expr.X, sc))
+	case *ast.Ident:
+		// t := s -- carry the source's shape.
+		switch b := l.lookupBinding(expr.Name).(type) {
+		case *arrayBinding:
+			return arrayShapeFrom(b.info)
+		case *sliceBinding:
+			return sliceShapeFrom(b.info)
+		case *structBinding:
+			return exprShape{typeName: b.info.def.Name}
+		case *byteBinding:
+			if def, ok := l.lookupPtrType(expr.Name); ok {
+				return exprShape{isPointer: true, typeName: def.Name}
+			}
+		}
+	case *ast.SelectorExpr:
+		// t := p.name where p.name is a string-typed struct field.
+		if l.isStringSelector(expr) {
+			return byteSliceShape()
+		}
+		if structID, ok := expr.X.(*ast.Ident); ok {
+			if si, ok := l.lookupStruct(structID.Name); ok {
+				field := expr.Sel.Name
+				// Nested struct field: t := o.inner where inner is a struct.
+				if fieldType := si.def.FieldTypes[field]; fieldType != "" {
+					return exprShape{typeName: fieldType}
+				}
+				// Multi-byte int field.
+				if n := si.def.FieldIntSizes[field]; n >= 2 {
+					return exprShape{intSize: n}
+				}
+				// Array field: `[N]uintN`, `[N]Point`, `[N][M]uintN`, etc.
+				if arrSize := si.def.FieldArraySizes[field]; arrSize > 0 {
+					elemIntSize := si.def.FieldArrayElemIntSize[field]
+					elemType := si.def.FieldArrayElemType[field]
+					inner := si.def.FieldInnerSizes[field]
+					innerInt := si.def.FieldInnerIntSize[field]
+					elemSize := 1
+					innerElemSize := 0
+					if elemIntSize >= 2 {
+						elemSize = elemIntSize
+					} else if elemType != "" {
+						if def, ok := l.result.Structs[elemType]; ok {
+							elemSize = def.Size
+						}
+					} else if inner > 0 {
+						elemSize = inner
+						innerElemSize = max(innerInt, 1)
 					}
-				} else if isSliceType(vs.Type) {
-					if !sc.has(name.Name) {
-						es, et, esl, ept, eis := l.sliceElemInfo(vs.Type)
-						l.defineSlice(sc, name.Name, es, et, esl, ept, eis)
+					return exprShape{
+						elemCount: arrSize / elemSize, elemSize: elemSize,
+						elemType: elemType, elemIntSize: elemIntSize,
+						innerElemSize: innerElemSize, innerElemIntSize: innerInt,
 					}
-				} else if id, ok := vs.Type.(*ast.Ident); ok && id.Name == "string" {
-					// var s string -- backed by a 3-cell []byte slice header.
-					if !sc.has(name.Name) {
-						l.defineSlice(sc, name.Name, 1, "", false, "", 0)
-					}
-				} else if def := l.structDef(vs.Type); def != nil {
-					if !sc.has(name.Name) {
-						l.defineStruct(sc, name.Name, def)
-					}
-				} else {
-					sc.defineByte(name.Name, l.allocCell())
 				}
 			}
 		}
+	case *ast.CallExpr:
+		if shape, ok := l.shapeOfCall(expr); ok {
+			return shape
+		}
 	}
+	// Scalar: byte or multi-byte int derived from exprIntSize.
+	n := 0
+	if expr != nil {
+		n = l.exprIntSize(expr, sc)
+	}
+	return exprShape{intSize: n}
+}
+
+// shapeOfCall returns the shape for `name := f(...)` if the call is
+// a recognized form. Returns ok=false to fall through to scalar.
+func (l *Lowerer) shapeOfCall(call *ast.CallExpr) (exprShape, bool) {
+	// string(x) / []byte(s) / string(byteVal) -- byte-slice header.
+	if len(call.Args) == 1 {
+		stringCast := false
+		byteToString := false
+		if fn, ok := call.Fun.(*ast.Ident); ok && fn.Name == "string" {
+			stringCast = true
+			if !l.isStringExpr(call.Args[0]) {
+				byteToString = true
+			}
+		} else if at, ok := call.Fun.(*ast.ArrayType); ok && at.Len == nil {
+			if eid, ok := at.Elt.(*ast.Ident); ok && eid.Name == "byte" {
+				stringCast = true
+			}
+		}
+		if (stringCast && l.isStringExpr(call.Args[0])) || byteToString {
+			return byteSliceShape(), true
+		}
+		// []T(s) -- slice-type cast yields the slice shape from the type.
+		if isSliceType(call.Fun) {
+			return l.shapeOfType(call.Fun), true
+		}
+	}
+	fn, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return exprShape{}, false
+	}
+	// uintN(x) -- multi-byte int.
+	if n := intIdentSize(fn.Name); n >= 2 && len(call.Args) == 1 {
+		return exprShape{intSize: n}, true
+	}
+	// make([]T, n) -- slice with elem info from the type.
+	if fn.Name == "make" && len(call.Args) >= 2 && isSliceType(call.Args[0]) {
+		return l.shapeOfType(call.Args[0]), true
+	}
+	// append(s, ...) -- carry the source slice's elem info.
+	if fn.Name == "append" && len(call.Args) >= 2 {
+		if srcID, ok := call.Args[0].(*ast.Ident); ok {
+			if src, ok := l.lookupSlice(srcID.Name); ok {
+				return sliceShapeFrom(src), true
+			}
+		}
+		if innerCall, ok := call.Args[0].(*ast.CallExpr); ok {
+			if innerFn, ok := innerCall.Fun.(*ast.Ident); ok && innerFn.Name == "make" && len(innerCall.Args) >= 2 && isSliceType(innerCall.Args[0]) {
+				return l.shapeOfType(innerCall.Args[0]), true
+			}
+		}
+		if comp, ok := call.Args[0].(*ast.CompositeLit); ok && isSliceType(comp.Type) {
+			return l.shapeOfType(comp.Type), true
+		}
+	}
+	// User function returning a slice.
+	if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.IsSlice {
+		return exprShape{
+			elemSize: max(info.ReturnType.SliceElemSize, 1),
+			elemType: info.ReturnType.SliceElemType, elemSlice: info.ReturnType.SliceElemSlice,
+			elemIntSize: info.ReturnType.SliceElemIntSize,
+			isPointer:   true,
+		}, true
+	}
+	return exprShape{}, false
+}
+
+// shapeOfType returns the shape for a Go type expression.
+func (l *Lowerer) shapeOfType(typeExpr ast.Expr) exprShape {
+	if count, elemSize, elemType, eis, esl, ies, ieis := l.arrayElementInfo(typeExpr); count > 0 {
+		return exprShape{
+			elemCount: count, elemSize: elemSize, elemType: elemType,
+			elemIntSize: eis, elemSlice: esl,
+			innerElemSize: ies, innerElemIntSize: ieis,
+		}
+	}
+	if n := intTypeSize(typeExpr); n >= 2 {
+		return exprShape{intSize: n}
+	}
+	if isSliceType(typeExpr) {
+		es, et, esl, ept, eis := l.sliceElemInfo(typeExpr)
+		return exprShape{
+			elemSize: es, elemType: et, elemSlice: esl,
+			elemPtrType: ept, elemIntSize: eis,
+			isPointer: true,
+		}
+	}
+	if id, ok := typeExpr.(*ast.Ident); ok && id.Name == "string" {
+		return byteSliceShape()
+	}
+	if def := l.structDef(typeExpr); def != nil {
+		return exprShape{typeName: def.Name}
+	}
+	return exprShape{} // byte
+}
+
+// defineFromTypeExpr allocates a binding for `name` based on the shape
+// of a Go type expression. Caller must check sc.has(name) first.
+func (l *Lowerer) defineFromTypeExpr(sc scope, name string, typeExpr ast.Expr) {
+	l.defineFromShape(sc, name, l.shapeOfType(typeExpr))
 }
 
 // lowerStructLit handles p := Point{x: 1, y: 2}.
@@ -2020,23 +1996,60 @@ func (l *Lowerer) lowerStructValueTo(base Cell, def *StructDef, valExpr ast.Expr
 				}
 				continue
 			}
-			// String field: build a slice header at base+off.
-			if def.FieldStrings[fieldName] {
-				si, isTemp, err := l.resolveStringSlice(ve)
+			// Slice field (string, []byte, []uintN, []Struct): build a 3-cell
+			// header at base+off.
+			if def.FieldSliceElemSize[fieldName] > 0 {
+				si, err := l.lowerSliceExpr(ve)
 				if err != nil {
 					return err
 				}
-				l.emit(&IRCopy{Dst: base + off, Src: si.ptr})
-				l.emit(&IRCopy{Dst: base + off + 1, Src: si.len})
-				l.emit(&IRCopy{Dst: base + off + 2, Src: si.cap})
-				if isTemp {
-					l.freeSliceInfo(si)
-				}
+				l.emit(&IRMove{Dst: base + off, Src: si.ptr})
+				l.emit(&IRMove{Dst: base + off + 1, Src: si.len})
+				l.emit(&IRMove{Dst: base + off + 2, Src: si.cap})
+				l.freeSliceInfo(si)
 				continue
 			}
 			// Array field: lower each element.
 			if arrSize := def.FieldArraySizes[fieldName]; arrSize > 0 {
 				if comp, ok := ve.(*ast.CompositeLit); ok {
+					// Multi-byte int element: stride by elemSize.
+					if eis := def.FieldArrayElemIntSize[fieldName]; eis >= 2 {
+						count := arrSize / eis
+						ai := arrayInfo{
+							base: base + off, size: arrSize, count: count,
+							elemSize: eis, elemIntSize: eis,
+						}
+						if err := l.lowerCompositeLitInto(ai, comp); err != nil {
+							return err
+						}
+						continue
+					}
+					// Nested array element ([N][M]byte): recurse via inner array.
+					if inner := def.FieldInnerSizes[fieldName]; inner > 0 {
+						count := arrSize / inner
+						ai := arrayInfo{
+							base: base + off, size: arrSize, count: count,
+							elemSize: inner, innerElemSize: 1,
+						}
+						if err := l.lowerCompositeLitInto(ai, comp); err != nil {
+							return err
+						}
+						continue
+					}
+					// Struct array element ([N]Inner): recurse via element type.
+					if et := def.FieldArrayElemType[fieldName]; et != "" {
+						if structDef, ok := l.result.Structs[et]; ok {
+							count := arrSize / structDef.Size
+							ai := arrayInfo{
+								base: base + off, size: arrSize, count: count,
+								elemSize: structDef.Size, elemType: et,
+							}
+							if err := l.lowerCompositeLitInto(ai, comp); err != nil {
+								return err
+							}
+							continue
+						}
+					}
 					for k, innerElt := range comp.Elts {
 						r, err := l.lowerExpr(innerElt)
 						if err != nil {
@@ -2165,6 +2178,19 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 				return fmt.Errorf("array-of-array element must be a literal")
 			}
 			base := arr.base + idx*arr.elemSize
+			// Multi-byte int inner element: stride by innerElemSize.
+			if arr.innerElemIntSize >= 2 {
+				innerCount := arr.elemSize / arr.innerElemIntSize
+				innerAi := arrayInfo{
+					base: base, size: arr.elemSize, count: innerCount,
+					elemSize: arr.innerElemIntSize, elemIntSize: arr.innerElemIntSize,
+				}
+				if err := l.lowerCompositeLitInto(innerAi, comp); err != nil {
+					return err
+				}
+				idx++
+				continue
+			}
 			for j, innerElt := range comp.Elts {
 				r, err := l.lowerExpr(innerElt)
 				if err != nil {
@@ -2667,6 +2693,16 @@ func (l *Lowerer) resolveExprTypeName(expr ast.Expr) string {
 				return def.FieldTypes[x.Sel.Name]
 			}
 		}
+	case *ast.CompositeLit:
+		// P{...}.method() -- struct literal as receiver.
+		if def := l.structDef(x.Type); def != nil {
+			return def.Name
+		}
+	case *ast.ParenExpr:
+		return l.resolveExprTypeName(x.X)
+	case *ast.StarExpr:
+		// (*p).method() -- equivalent to p.method() for pointer-to-struct.
+		return l.resolveExprTypeName(x.X)
 	}
 	return ""
 }
@@ -3249,14 +3285,19 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 			return fmt.Errorf("unsupported local type: only struct types are supported")
 		}
 		def := &StructDef{
-			Name:               ts.Name.Name,
-			Offsets:            make(map[string]int),
-			FieldTypes:         make(map[string]string),
-			FieldArraySizes:    make(map[string]int),
-			FieldInnerSizes:    make(map[string]int),
-			FieldArrayElemType: make(map[string]string),
-			FieldIntSizes:      make(map[string]int),
-			FieldStrings:       make(map[string]bool),
+			Name:                  ts.Name.Name,
+			Offsets:               make(map[string]int),
+			FieldTypes:            make(map[string]string),
+			FieldArraySizes:       make(map[string]int),
+			FieldInnerSizes:       make(map[string]int),
+			FieldInnerIntSize:     make(map[string]int),
+			FieldArrayElemType:    make(map[string]string),
+			FieldIntSizes:         make(map[string]int),
+			FieldStrings:          make(map[string]bool),
+			FieldSliceElemSize:    make(map[string]int),
+			FieldSliceElemType:    make(map[string]string),
+			FieldSliceElemIntSize: make(map[string]int),
+			FieldSliceElemSlice:   make(map[string]bool),
 		}
 		offset := 0
 		for _, field := range st.Fields.List {
@@ -3265,6 +3306,10 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 			fieldArraySize := 0
 			fieldArrayElemType := ""
 			fieldIsString := false
+			fieldSliceElemSize := 0
+			fieldSliceElemType := ""
+			fieldSliceElemIntSize := 0
+			fieldSliceElemSlice := false
 			if id, ok := field.Type.(*ast.Ident); ok {
 				if nested, ok := l.result.Structs[id.Name]; ok {
 					fieldSize = nested.Size
@@ -3274,19 +3319,50 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 				} else if id.Name == "string" {
 					fieldSize = 3
 					fieldIsString = true
+					fieldSliceElemSize = 1
+				}
+			} else if at, ok := field.Type.(*ast.ArrayType); ok && at.Len == nil {
+				fieldSize = 3
+				fieldSliceElemSize = 1
+				if eltID, ok := at.Elt.(*ast.Ident); ok {
+					if eltID.Name == "byte" {
+						fieldIsString = true
+					} else if eltID.Name == "string" {
+						fieldSliceElemSize = 3
+						fieldSliceElemSlice = true
+					} else if n := intIdentSize(eltID.Name); n > 0 {
+						fieldSliceElemSize = n
+						fieldSliceElemIntSize = n
+					} else if structDef, ok := l.result.Structs[eltID.Name]; ok {
+						fieldSliceElemSize = structDef.Size
+						fieldSliceElemType = eltID.Name
+					}
+				} else if eltAt, ok := at.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
+					fieldSliceElemSize = 3
+					fieldSliceElemSlice = true
 				}
 			} else if at, ok := field.Type.(*ast.ArrayType); ok && at.Len != nil {
-				if arrSize, ies := arrayFieldInfo(field.Type); arrSize > 0 {
+				if arrSize, ies, iis := arrayFieldInfo(field.Type); arrSize > 0 {
 					fieldSize = arrSize
 					fieldArraySize = arrSize
+					innermost := at.Elt
+					for nat, ok := innermost.(*ast.ArrayType); ok && nat.Len != nil; nat, ok = innermost.(*ast.ArrayType) {
+						innermost = nat.Elt
+					}
+					if eltID, ok := innermost.(*ast.Ident); ok {
+						if structDef, ok := l.result.Structs[eltID.Name]; ok {
+							fieldArrayElemType = eltID.Name
+							fieldSize = arrSize * structDef.Size
+							fieldArraySize = arrSize * structDef.Size
+							ies *= structDef.Size
+						}
+					}
 					if ies > 0 {
 						for _, name := range field.Names {
 							def.FieldInnerSizes[name.Name] = ies
-						}
-					}
-					if eltID, ok := at.Elt.(*ast.Ident); ok {
-						if _, ok := l.result.Structs[eltID.Name]; ok {
-							fieldArrayElemType = eltID.Name
+							if iis > 0 {
+								def.FieldInnerIntSize[name.Name] = iis
+							}
 						}
 					}
 				}
@@ -3305,8 +3381,20 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 				}
 				if fieldIsString {
 					def.FieldStrings[name.Name] = true
-				} else if fieldSize >= 2 && fieldType == "" && fieldArraySize == 0 {
+				} else if fieldSliceElemSize == 0 && fieldSize >= 2 && fieldType == "" && fieldArraySize == 0 {
 					def.FieldIntSizes[name.Name] = fieldSize
+				}
+				if fieldSliceElemSize > 0 {
+					def.FieldSliceElemSize[name.Name] = fieldSliceElemSize
+					if fieldSliceElemSlice {
+						def.FieldSliceElemSlice[name.Name] = true
+					}
+					if fieldSliceElemType != "" {
+						def.FieldSliceElemType[name.Name] = fieldSliceElemType
+					}
+					if fieldSliceElemIntSize > 0 {
+						def.FieldSliceElemIntSize[name.Name] = fieldSliceElemIntSize
+					}
 				}
 				offset += fieldSize
 			}
@@ -3317,6 +3405,50 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 		}
 	}
 	return nil
+}
+
+// declareFromDecl allocates cells for variables introduced by `var`,
+// and registers local consts and types.
+func (l *Lowerer) declareFromDecl(s *ast.DeclStmt) {
+	sc := l.currentScope()
+
+	gd, ok := s.Decl.(*ast.GenDecl)
+	if !ok {
+		return
+	}
+	if gd.Tok == token.CONST {
+		// Register local consts so subsequent declarations can reference them.
+		// Errors are caught again during lowerDecl.
+		_ = l.lowerLocalConsts(gd)
+		return
+	}
+	if gd.Tok == token.TYPE {
+		// Register local types so subsequent variable declarations can reference them.
+		// Errors are caught again during lowerDecl.
+		_ = l.lowerLocalTypes(gd)
+		return
+	}
+	for _, spec := range gd.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		for i, name := range vs.Names {
+			if sc.has(name.Name) {
+				continue
+			}
+			if vs.Type != nil {
+				l.defineFromTypeExpr(sc, name.Name, vs.Type)
+				continue
+			}
+			// Typeless `var x = expr`: infer kind from RHS, same as `:=`.
+			var rhs ast.Expr
+			if i < len(vs.Values) {
+				rhs = vs.Values[i]
+			}
+			l.defineFromShape(sc, name.Name, l.shapeOf(rhs, sc))
+		}
+	}
 }
 
 func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
@@ -3463,7 +3595,7 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 			return err
 		}
 		if r.intSize >= 2 {
-			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
+			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, exprShape: exprShape{size: r.intSize}})
 			return nil
 		}
 		// byte -> multi-byte: zero-extend.
@@ -3490,7 +3622,7 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 				sc := l.currentScope()
 				if r.typeName != "" {
 					sc.annotatePtrType(name, r.typeName)
-				} else if r.elemCount > 0 && r.elemCount != 255 {
+				} else if r.elemCount > 0 {
 					sc.annotatePtrArray(name, arrayInfo{
 						size: r.elemCount, count: r.elemCount,
 						elemSize: max(r.elemSize, 1), elemType: r.elemType,
@@ -3570,7 +3702,7 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 		sc := l.currentScope()
 		if r.typeName != "" {
 			sc.annotatePtrType(name, r.typeName)
-		} else if r.elemCount > 0 && r.elemCount != 255 {
+		} else if r.elemCount > 0 {
 			sc.annotatePtrArray(name, arrayInfo{
 				size: r.elemCount, count: r.elemCount,
 				elemSize: max(r.elemSize, 1), elemType: r.elemType,
@@ -3653,6 +3785,7 @@ var assignOp = map[token.Token]token.Token{
 
 func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 	l.declareFromAssign(s)
+
 	// Desugar assignment operations: x += y -> x = x + y
 	if op, ok := assignOp[s.Tok]; ok && len(s.Lhs) == 1 && len(s.Rhs) == 1 {
 		s = &ast.AssignStmt{
@@ -3740,14 +3873,14 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				l.freeCell(rv.str.cap)
 				continue
 			}
-			val := exprResult{cell: rv.cell, temp: true, size: rv.size}
+			val := exprResult{cell: rv.cell, temp: true, exprShape: exprShape{size: rv.size}}
 			switch t := lhs.(type) {
 			case *ast.IndexExpr:
 				base, err := l.lowerExpr(t.X)
 				if err != nil {
 					return err
 				}
-				if base.elemCount > 0 {
+				if base.elemCount > 0 || base.lenCell != 0 {
 					if err := l.writeInto(base, t.Index, val); err != nil {
 						return err
 					}
@@ -3809,10 +3942,16 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 		}
 		switch target := lhs.(type) {
 		case *ast.Ident:
-			if n == 3 {
-				if si, ok := l.lookupSlice(target.Name); ok {
-					l.moveSliceHeader(si, retCells[off], retCells[off+1], retCells[off+2])
+			if si, ok := l.lookupStruct(target.Name); ok {
+				for j := range n {
+					l.emit(&IRMove{Dst: si.base + j, Src: retCells[off+j]})
 				}
+			} else if ai, ok := l.lookupArray(target.Name); ok {
+				for j := range n {
+					l.emit(&IRMove{Dst: ai.base + j, Src: retCells[off+j]})
+				}
+			} else if si, ok := l.lookupSlice(target.Name); ok && n == 3 {
+				l.moveSliceHeader(si, retCells[off], retCells[off+1], retCells[off+2])
 			} else if n >= 2 {
 				if base, ok := l.lookupIntCell(target.Name); ok {
 					for j := range n {
@@ -3831,7 +3970,12 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 			if err != nil {
 				return err
 			}
-			if err := l.writeInto(base, target.Index, exprResult{cell: retCells[off]}); err != nil {
+			val := exprResult{cell: retCells[off]}
+			if n >= 2 {
+				val.size = n
+				val.intSize = n
+			}
+			if err := l.writeInto(base, target.Index, val); err != nil {
 				return err
 			}
 		case *ast.SelectorExpr:
@@ -3858,7 +4002,7 @@ func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 	if err != nil {
 		return err
 	}
-	if base.elemCount == 0 {
+	if base.elemCount == 0 && base.lenCell == 0 {
 		depth := 0
 		for x := ast.Expr(idx); ; depth++ {
 			if ie, ok := x.(*ast.IndexExpr); ok {
@@ -3981,7 +4125,7 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 	}
 	// Constant index: write directly into the element.
 	if constIdx, ok := l.constValue(indexExpr); ok {
-		if constIdx >= base.elemCount {
+		if base.elemCount > 0 && constIdx >= base.elemCount {
 			return fmt.Errorf("array index %d out of bounds [0:%d]", constIdx, base.elemCount)
 		}
 		if base.isPointer {
@@ -4064,7 +4208,7 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 		if err != nil {
 			return err
 		}
-		val := exprResult{cell: retCells[0], temp: true, size: l.returnCellCount(info)}
+		val := exprResult{cell: retCells[0], temp: true, exprShape: exprShape{size: l.returnCellCount(info)}}
 		return l.writeInto(base, idx.Index, val)
 	}
 	id, ok := lhs.(*ast.Ident)
@@ -4123,7 +4267,93 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 	return nil
 }
 
+// assignSliceStructField writes rhs into s[i].field where s is a slice
+// of struct elements, by computing the slice element address and
+// storing through it cell-by-cell.
+func (l *Lowerer) assignSliceStructField(si sliceInfo, indexExpr ast.Expr, def *StructDef, fieldName string, rhs ast.Expr) error {
+	offset, ok := def.Offsets[fieldName]
+	if !ok {
+		return fmt.Errorf("unknown field %s in struct %s", fieldName, def.Name)
+	}
+	addr, err := l.ptrDynIndex(si.ptr, indexExpr, si.elemSize)
+	if err != nil {
+		return err
+	}
+	if offset > 0 {
+		l.emit(&IRAddI{Dst: addr, Value: byte(offset)}) // #nosec G115
+	}
+	// Slice-typed field (string, []byte, []uintN, []Struct): write 3 cells.
+	if def.FieldSliceElemSize[fieldName] > 0 {
+		src, err := l.lowerSliceExpr(rhs)
+		if err != nil {
+			l.freeCell(addr)
+			return err
+		}
+		l.ptrStore(addr, src.ptr)
+		l.emit(&IRAddI{Dst: addr, Value: 1})
+		l.ptrStore(addr, src.len)
+		l.emit(&IRAddI{Dst: addr, Value: 1})
+		l.ptrStore(addr, src.cap)
+		l.freeCell(addr)
+		l.freeSliceInfo(src)
+		return nil
+	}
+	// Multi-byte int field: write N cells via successive ptrStore.
+	if n := def.FieldIntSizes[fieldName]; n >= 2 {
+		val, err := l.lowerExpr(rhs)
+		if err != nil {
+			l.freeCell(addr)
+			return err
+		}
+		for j := range n {
+			t := l.allocCell()
+			l.emit(&IRMove{Dst: t, Src: val.cell + j})
+			l.ptrStore(addr, t)
+			l.freeCell(t)
+			if j < n-1 {
+				l.emit(&IRAddI{Dst: addr, Value: 1})
+			}
+		}
+		l.freeCell(addr)
+		if val.temp {
+			l.freeCellRange(val.cell, n)
+		}
+		return nil
+	}
+	// Byte field: ptrStore.
+	val, err := l.lowerExpr(rhs)
+	if err != nil {
+		l.freeCell(addr)
+		return err
+	}
+	t := l.allocCell()
+	l.emitCopyOrMove(t, val)
+	l.ptrStore(addr, t)
+	l.freeCell(t)
+	l.freeCell(addr)
+	return nil
+}
+
 func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
+	// (expr).field is the same as expr.field; (*pp).field auto-derefs to
+	// pp.field. Rewrite so the pointer/struct path resolves the base.
+	if p, ok := sel.X.(*ast.ParenExpr); ok {
+		return l.lowerFieldAssign(&ast.SelectorExpr{X: p.X, Sel: sel.Sel}, rhs)
+	}
+	if star, ok := sel.X.(*ast.StarExpr); ok {
+		return l.lowerFieldAssign(&ast.SelectorExpr{X: star.X, Sel: sel.Sel}, rhs)
+	}
+	// s[i].field = v where s is a slice of structs: write through the
+	// slice's pointer rather than to a loaded copy.
+	if idx, ok := sel.X.(*ast.IndexExpr); ok {
+		if id, ok := idx.X.(*ast.Ident); ok {
+			if si, ok := l.lookupSlice(id.Name); ok && si.elemType != "" {
+				if def, ok := l.result.Structs[si.elemType]; ok {
+					return l.assignSliceStructField(si, idx.Index, def, sel.Sel.Name, rhs)
+				}
+			}
+		}
+	}
 	// Resolve the base (struct, array element, or pointer).
 	base, err := l.lowerExpr(sel.X)
 	if err != nil {
@@ -4176,18 +4406,16 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 		fieldDef := l.result.Structs[fieldType]
 		return l.lowerStructValueTo(base.cell+offset, fieldDef, rhs)
 	}
-	// String field: copy ptr/len/cap (3 cells).
-	if def.FieldStrings[sel.Sel.Name] {
-		si, isTemp, err := l.resolveStringSlice(rhs)
+	// Slice field: write ptr/len/cap (3 cells).
+	if def.FieldSliceElemSize[sel.Sel.Name] > 0 {
+		si, err := l.lowerSliceExpr(rhs)
 		if err != nil {
 			return err
 		}
-		l.emit(&IRCopy{Dst: base.cell + offset, Src: si.ptr})
-		l.emit(&IRCopy{Dst: base.cell + offset + 1, Src: si.len})
-		l.emit(&IRCopy{Dst: base.cell + offset + 2, Src: si.cap})
-		if isTemp {
-			l.freeSliceInfo(si)
-		}
+		l.emit(&IRMove{Dst: base.cell + offset, Src: si.ptr})
+		l.emit(&IRMove{Dst: base.cell + offset + 1, Src: si.len})
+		l.emit(&IRMove{Dst: base.cell + offset + 2, Src: si.cap})
+		l.freeSliceInfo(si)
 		return nil
 	}
 	// Multi-byte int field, non-pointer base. (The pointer case is
@@ -4213,7 +4441,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 			return nil
 		}
 		dst := base.cell + offset
-		l.emitCopyOrMove(dst, exprResult{cell: val.cell, temp: val.temp, size: intSize})
+		l.emitCopyOrMove(dst, exprResult{cell: val.cell, temp: val.temp, exprShape: exprShape{size: intSize}})
 		return nil
 	}
 	// Direct or flat-offset write via writeInto.
@@ -4728,7 +4956,7 @@ func (l *Lowerer) lowerSwitch(s *ast.SwitchStmt) error {
 			if r.intSize >= 2 {
 				sc := l.currentScope()
 				base := l.defineIntVar(sc, tagName, r.intSize)
-				l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
+				l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, exprShape: exprShape{size: r.intSize}})
 			} else {
 				tagCell := l.allocCell()
 				l.currentScope().defineByte(tagName, tagCell)
@@ -4953,6 +5181,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.pushScope()
 	defer l.popScope()
 	l.declareFromRange(s)
+
 	var cell Cell
 	var counterIntSize int // 0 for byte, >= 2 for multi-byte integers
 	if s.Key != nil {
@@ -4996,14 +5225,13 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 			// element layout of the materialized slice.
 			if si, sliceErr := l.lowerSliceExpr(s.X); sliceErr == nil {
 				r = exprResult{
-					cell: si.ptr, lenCell: si.len, capCell: si.cap,
-					elemSize: max(si.elemSize, 1), elemCount: 255,
-					elemSlice: si.elemSlice, isPointer: true, temp: true,
+					cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true,
+					exprShape: exprShape{elemSize: max(si.elemSize, 1), elemSlice: si.elemSlice, isPointer: true},
 				}
 				err = nil
 			}
 		}
-		if err == nil && r.elemCount > 0 {
+		if err == nil && (r.elemCount > 0 || r.lenCell != 0) {
 			rangeBase = r
 			hasVal = true
 			valID, ok := s.Value.(*ast.Ident)
@@ -5033,7 +5261,20 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 			if err == nil {
 				rangeBase = r
 			}
+		case *structBinding:
+			return fmt.Errorf("cannot range over struct: %s", id.Name)
 		}
+	} else if l.isStringExpr(s.X) {
+		// `for range "hello"` etc.: materialize the string into a temp
+		// slice header and use its length for iteration.
+		if si, err := l.lowerSliceExpr(s.X); err == nil {
+			rangeBase = exprResult{
+				cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true,
+				exprShape: exprShape{elemSize: 1, isPointer: true},
+			}
+		}
+	} else if u, ok := s.X.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		return fmt.Errorf("cannot range over pointer expression")
 	}
 
 	// Evaluate the range limit.
@@ -5043,7 +5284,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		t := l.allocCell()
 		l.emit(&IRCopy{Dst: t, Src: rangeBase.lenCell})
 		limit = exprResult{cell: t, temp: true}
-	} else if rangeBase.elemCount > 0 && rangeBase.elemCount != 255 {
+	} else if rangeBase.elemCount > 0 {
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: byte(rangeBase.elemCount)}) // #nosec G115
 		limit = exprResult{cell: t, temp: true}
@@ -5265,7 +5506,42 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 		}
 	}
 	off := 0
-	for _, expr := range s.Results {
+	for i, expr := range s.Results {
+		// Composite return value (struct, array): resolve base+size and copy.
+		if l.curFunc != nil && i < len(l.curFunc.ReturnTypes) {
+			ri := l.curFunc.ReturnTypes[i]
+			if ri.StructType != "" && !ri.IsPointer {
+				base, size, err := l.resolveStructArg(expr)
+				if err != nil {
+					return err
+				}
+				for j := range size {
+					l.emit(&IRMove{Dst: l.returnDst[off+j], Src: base + j})
+				}
+				off += size
+				continue
+			}
+			if ri.ArraySize > 0 && !ri.IsPointer {
+				if id, ok := expr.(*ast.Ident); ok {
+					if ai, ok := l.lookupArray(id.Name); ok {
+						for j := range ai.size {
+							l.emit(&IRCopy{Dst: l.returnDst[off+j], Src: ai.base + j})
+						}
+						off += ai.size
+						continue
+					}
+				}
+				base, size, err := l.resolveStructArg(expr)
+				if err != nil {
+					return err
+				}
+				for j := range size {
+					l.emit(&IRMove{Dst: l.returnDst[off+j], Src: base + j})
+				}
+				off += size
+				continue
+			}
+		}
 		r, err := l.lowerExpr(expr)
 		if err != nil {
 			// String/slice literal in return position: write the 3-cell header.
@@ -5502,7 +5778,7 @@ func (l *Lowerer) lowerDefer(s *ast.DeferStmt) error {
 		}
 		if r.intSize >= 2 {
 			base := l.allocCells(r.intSize)
-			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, size: r.intSize})
+			l.emitCopyOrMove(base, exprResult{cell: r.cell, temp: r.temp, exprShape: exprShape{size: r.intSize}})
 			sc[name] = &intBinding{base: base, size: r.intSize}
 		} else {
 			cell := l.allocCell()
@@ -5639,7 +5915,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				if err := l.lowerStructValueTo(base, def, comp); err != nil {
 					return nil, err
 				}
-				args[i] = exprResult{cell: base, temp: true, size: def.Size}
+				args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: def.Size}}
 				continue
 			}
 			size := l.arraySize(comp.Type)
@@ -5653,7 +5929,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				if err := l.lowerCompositeLitInto(arr, comp); err != nil {
 					return nil, err
 				}
-				args[i] = exprResult{cell: base, temp: true, size: size}
+				args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: size}}
 				continue
 			}
 		}
@@ -5668,7 +5944,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		paramWantsPointer := i < len(info.ParamTypes) && info.ParamTypes[i].IsPointer
 		if r.isPointer && r.elemCount >= 1 && r.typeName != "" && !r.elemSlice && !paramWantsPointer {
 			base := l.materializePtrComposite(r.cell, r.temp, r.elemCount)
-			r = exprResult{cell: base, temp: true, size: r.elemCount, typeName: r.typeName}
+			r = exprResult{cell: base, temp: true, exprShape: exprShape{size: r.elemCount, typeName: r.typeName}}
 		}
 		// Flat-offset result: materialize into contiguous temp cells.
 		if r.flatBase != 0 {
@@ -5682,7 +5958,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 			}
 			l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
 			l.freeCell(r.cell)
-			r = exprResult{cell: base, temp: true, size: n}
+			r = exprResult{cell: base, temp: true, exprShape: exprShape{size: n}}
 		}
 		args[i] = r
 	}
@@ -5727,7 +6003,8 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				if pt.ArraySize > 0 {
 					sc := l.currentScope()
 					if pt.ArrayElemSize > 1 {
-						l.defineStructArray(sc, paramName, pt.ArrayCount, pt.ArrayElemSize, pt.ArrayElemType, pt.ArrayElemIntSize, pt.ArrayElemSlice, 0, 0)
+						l.defineStructArray(sc, paramName, pt.ArrayCount, pt.ArrayElemSize,
+							pt.ArrayElemType, pt.ArrayElemIntSize, pt.ArrayElemSlice, 0, 0)
 					} else {
 						l.defineArray(sc, paramName, pt.ArraySize)
 					}
@@ -5832,6 +6109,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	savedRetDst := l.returnDst
 	savedRetFlag := l.returnFlag
 	savedInFunc := l.inFunc
+	savedCurFunc := l.curFunc
 	savedTailFunc := l.tailCallFunc
 	savedTailFlag := l.tailCallFlag
 
@@ -5843,6 +6121,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		l.returnFlag = 0
 	}
 	l.inFunc = true
+	l.curFunc = info
 	savedDefers := l.deferredCalls
 	l.deferredCalls = nil
 
@@ -5862,6 +6141,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	l.returnDst = savedRetDst
 	l.returnFlag = savedRetFlag
 	l.inFunc = savedInFunc
+	l.curFunc = savedCurFunc
 	l.tailCallFunc = savedTailFunc
 	l.tailCallFlag = savedTailFlag
 	l.deferredCalls = savedDefers
@@ -5925,10 +6205,11 @@ func (l *Lowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 		if err != nil {
 			return exprResult{}, err
 		}
-		return exprResult{cell: si.ptr, temp: true, elemSize: si.elemSize,
-			elemCount: 255, elemType: si.elemType, elemIntSize: si.elemIntSize,
-			elemSlice: si.elemSlice, elemPtrType: si.elemPtrType,
-			isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+		return exprResult{
+			cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+			exprShape: exprShape{elemSize: si.elemSize, elemType: si.elemType,
+				elemIntSize: si.elemIntSize, elemSlice: si.elemSlice, elemPtrType: si.elemPtrType, isPointer: true},
+		}, nil
 	default:
 		return exprResult{}, fmt.Errorf("unsupported expression: %T", expr)
 	}
@@ -5959,7 +6240,7 @@ func (l *Lowerer) lowerLiteral(e *ast.BasicLit) (exprResult, error) {
 		for j := range n {
 			l.emit(&IRConst{Dst: base + j, Value: byte(val >> (j * 8))}) // #nosec G115
 		}
-		return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
+		return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 	case token.CHAR:
 		s, err := strconv.Unquote(e.Value)
 		if err != nil {
@@ -5993,8 +6274,10 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		if err != nil {
 			return exprResult{}, err
 		}
-		return exprResult{cell: si.ptr, temp: true, elemSize: 1, elemCount: 255,
-			isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+		return exprResult{
+			cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+			exprShape: exprShape{elemSize: 1, isPointer: true},
+		}, nil
 	case *constBinding:
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: b.value})
@@ -6004,24 +6287,30 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		for j := range b.size {
 			l.emit(&IRConst{Dst: base + j, Value: byte(b.value >> (j * 8))}) // #nosec G115
 		}
-		return exprResult{cell: base, temp: true, size: b.size, intSize: b.size}, nil
+		return exprResult{cell: base, temp: true, exprShape: exprShape{size: b.size, intSize: b.size}}, nil
 	case *intBinding:
-		return exprResult{cell: b.base, size: b.size, intSize: b.size}, nil
+		return exprResult{cell: b.base, exprShape: exprShape{size: b.size, intSize: b.size}}, nil
 	case *structBinding:
 		si := b.info
-		return exprResult{cell: si.base, size: si.def.Size, elemSize: 1,
-			elemCount: si.def.Size, typeName: si.def.Name}, nil
+		return exprResult{
+			cell:      si.base,
+			exprShape: exprShape{size: si.def.Size, elemSize: 1, elemCount: si.def.Size, typeName: si.def.Name},
+		}, nil
 	case *arrayBinding:
 		ai := b.info
-		return exprResult{cell: ai.base, size: ai.size, elemSize: ai.elemSize,
-			elemCount: ai.count, elemType: ai.elemType, elemIntSize: ai.elemIntSize,
-			elemSlice: ai.elemSlice, innerElemSize: ai.innerElemSize, innerElemIntSize: ai.innerElemIntSize}, nil
+		return exprResult{
+			cell: ai.base,
+			exprShape: exprShape{size: ai.size, elemSize: ai.elemSize, elemCount: ai.count,
+				elemType: ai.elemType, elemIntSize: ai.elemIntSize, elemSlice: ai.elemSlice,
+				innerElemSize: ai.innerElemSize, innerElemIntSize: ai.innerElemIntSize},
+		}, nil
 	case *sliceBinding:
 		si := b.info
-		return exprResult{cell: si.ptr, elemSize: si.elemSize,
-			elemCount: 255, elemType: si.elemType, elemIntSize: si.elemIntSize,
-			elemSlice: si.elemSlice, elemPtrType: si.elemPtrType,
-			isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+		return exprResult{
+			cell: si.ptr, lenCell: si.len, capCell: si.cap,
+			exprShape: exprShape{elemSize: si.elemSize, elemType: si.elemType,
+				elemIntSize: si.elemIntSize, elemSlice: si.elemSlice, elemPtrType: si.elemPtrType, isPointer: true},
+		}, nil
 	}
 	// Byte var (regular scope) or rec-local frame slot. The lookupVar
 	// callback dispatches between the two; pointer annotations live on
@@ -6031,15 +6320,20 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		return exprResult{}, err
 	}
 	if ptrAI, ok := l.lookupPtrArray(e.Name); ok {
-		return exprResult{cell: cell, elemSize: ptrAI.elemSize,
-			elemCount: ptrAI.count, elemType: ptrAI.elemType, isPointer: true}, nil
+		return exprResult{
+			cell: cell,
+			exprShape: exprShape{elemSize: ptrAI.elemSize, elemCount: ptrAI.count,
+				elemType: ptrAI.elemType, elemIntSize: ptrAI.elemIntSize, isPointer: true},
+		}, nil
 	}
 	if ptrDef, ok := l.lookupPtrType(e.Name); ok {
-		return exprResult{cell: cell, size: ptrDef.Size, elemSize: 1,
-			elemCount: ptrDef.Size, typeName: ptrDef.Name, isPointer: true}, nil
+		return exprResult{
+			cell:      cell,
+			exprShape: exprShape{elemSize: 1, elemCount: ptrDef.Size, typeName: ptrDef.Name, isPointer: true},
+		}, nil
 	}
 	if n := l.lookupPtrIntSize(e.Name); n >= 2 {
-		return exprResult{cell: cell, ptrIntSize: n}, nil
+		return exprResult{cell: cell, exprShape: exprShape{ptrIntSize: n}}, nil
 	}
 	return exprResult{cell: cell}, nil
 }
@@ -6167,8 +6461,10 @@ func (l *Lowerer) loadConsecutiveViaPtr(idx Cell, dsts []Cell) {
 func (l *Lowerer) loadStringHeaderViaPtr(idx Cell) exprResult {
 	si := l.allocSliceInfo()
 	l.loadConsecutiveViaPtr(idx, []Cell{si.ptr, si.len, si.cap})
-	return exprResult{cell: si.ptr, temp: true, elemSize: 1, elemCount: 255,
-		isPointer: true, lenCell: si.len, capCell: si.cap}
+	return exprResult{
+		cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+		exprShape: exprShape{elemSize: 1, isPointer: true},
+	}
 }
 
 // loadMultiByteIntViaPtr loads n bytes from heap[*idx]..heap[*idx+n-1]
@@ -6182,7 +6478,7 @@ func (l *Lowerer) loadMultiByteIntViaPtr(idx Cell, n int) exprResult {
 		dsts[j] = base + Cell(j) // #nosec G115
 	}
 	l.loadConsecutiveViaPtr(idx, dsts)
-	return exprResult{cell: base, temp: true, size: n, intSize: n}
+	return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}
 }
 
 // materializePtrComposite reads n consecutive bytes through a borrowed
@@ -6263,7 +6559,7 @@ func (l *Lowerer) readMultiByteIntFromFlat(arrayBase, startOff Cell,
 	}
 	l.loadConsecutiveViaIndex(flatArr, flatIdx, dsts)
 	l.freeCell(flatIdx)
-	return exprResult{cell: dst, temp: true, size: n, intSize: n}, nil
+	return exprResult{cell: dst, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 }
 
 // writeMultiByteIntToFlat is the write counterpart to
@@ -6404,7 +6700,7 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		}
 		t := l.allocCell()
 		l.emit(&IRConst{Dst: t, Value: byte(slotOf(cell))}) // #nosec G115
-		return exprResult{cell: t, temp: true, ptrIntSize: ptrIntSize}, nil
+		return exprResult{cell: t, temp: true, exprShape: exprShape{ptrIntSize: ptrIntSize}}, nil
 	case *ast.IndexExpr:
 		id, ok := e.X.(*ast.Ident)
 		if !ok {
@@ -6512,7 +6808,13 @@ func (l *Lowerer) lowerDeref(expr ast.Expr) (exprResult, error) {
 	}
 	if n := r.ptrIntSize; n >= 2 {
 		base := l.materializePtrComposite(r.cell, r.temp, n)
-		return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
+		return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
+	}
+	if r.isPointer && r.typeName != "" && r.elemCount > 1 {
+		// *pp where pp is a pointer-to-struct: load all struct cells into a temp.
+		n := r.elemCount
+		base := l.materializePtrComposite(r.cell, r.temp, n)
+		return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, typeName: r.typeName}}, nil
 	}
 	result := l.ptrLoad(r.cell)
 	if r.temp {
@@ -6582,7 +6884,7 @@ func (l *Lowerer) lowerUnaryInt(op token.Token, operand exprResult) (exprResult,
 	if operand.temp {
 		l.freeCellRange(operand.cell, n)
 	}
-	return exprResult{cell: r, temp: true, size: n, intSize: n}, nil
+	return exprResult{cell: r, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 }
 
 func (l *Lowerer) lowerBinary(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprResult, error)) (exprResult, error) {
@@ -7039,8 +7341,10 @@ func (l *Lowerer) lowerStringConcat(e *ast.BinaryExpr) (exprResult, bool, error)
 		}
 	}
 
-	return exprResult{cell: si.ptr, temp: true, elemSize: 1, elemCount: 255,
-		isPointer: true, lenCell: si.len, capCell: si.cap}, true, nil
+	return exprResult{
+		cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+		exprShape: exprShape{elemSize: 1, isPointer: true},
+	}, true, nil
 }
 
 // appendLiteralBytes inlines a string literal into si byte-by-byte at offset si.len.
@@ -7477,7 +7781,7 @@ func (l *Lowerer) lowerBinaryInt(op token.Token, left, right exprResult) (exprRe
 	if right.temp {
 		l.freeCellRange(right.cell, right.cellCount())
 	}
-	return exprResult{cell: r, temp: true, size: n, intSize: n}, nil
+	return exprResult{cell: r, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 }
 
 // emitAddInt computes r = a + b for n-byte integers with carry chain.
@@ -7970,6 +8274,11 @@ func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
 	if r, ok, err := l.lowerCallExprWith(call, l.lowerExpr); ok {
 		return r, err
 	}
+	// []T(s) -- slice-type cast. When the source is already a slice, treat
+	// as identity (go2bf doesn't enforce strict element types).
+	if isSliceType(call.Fun) && len(call.Args) == 1 {
+		return l.lowerExpr(call.Args[0])
+	}
 	funcName, receiver := l.resolveCall(call)
 	if funcName == "" {
 		return exprResult{}, fmt.Errorf("unsupported function call expression")
@@ -7990,36 +8299,33 @@ func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
 	if info.ReturnType.ArraySize > 0 {
 		if info.ReturnType.IsPointer {
 			return exprResult{
-				cell: retCells[0], temp: true, isPointer: true,
-				elemSize: 1, elemCount: info.ReturnType.ArraySize,
+				cell: retCells[0], temp: true,
+				exprShape: exprShape{isPointer: true, elemSize: 1, elemCount: info.ReturnType.ArraySize},
 			}, nil
 		}
 		return exprResult{
-			cell: retCells[0], temp: true, size: info.ReturnType.ArraySize,
-			elemSize: 1, elemCount: info.ReturnType.ArraySize,
+			cell: retCells[0], temp: true,
+			exprShape: exprShape{size: info.ReturnType.ArraySize, elemSize: 1, elemCount: info.ReturnType.ArraySize},
 		}, nil
 	}
 	if info.ReturnType.StructType != "" {
 		if info.ReturnType.IsPointer {
-			return exprResult{cell: retCells[0], temp: true, isPointer: true, typeName: info.ReturnType.StructType}, nil
+			return exprResult{cell: retCells[0], temp: true,
+				exprShape: exprShape{isPointer: true, typeName: info.ReturnType.StructType}}, nil
 		}
 		def := l.result.Structs[info.ReturnType.StructType]
-		return exprResult{cell: retCells[0], temp: true, size: def.Size, typeName: info.ReturnType.StructType}, nil
+		return exprResult{cell: retCells[0], temp: true,
+			exprShape: exprShape{size: def.Size, typeName: info.ReturnType.StructType}}, nil
 	}
 	if n := info.ReturnType.IntSize; n >= 2 {
-		return exprResult{cell: retCells[0], temp: true, size: n, intSize: n}, nil
+		return exprResult{cell: retCells[0], temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 	}
 	if info.ReturnType.IsSlice {
 		return exprResult{
-			cell: retCells[0], temp: true,
-			elemSize:    max(info.ReturnType.SliceElemSize, 1),
-			elemCount:   255,
-			elemType:    info.ReturnType.SliceElemType,
-			elemIntSize: info.ReturnType.SliceElemIntSize,
-			elemSlice:   info.ReturnType.SliceElemSlice,
-			isPointer:   true,
-			lenCell:     retCells[1],
-			capCell:     retCells[2],
+			cell: retCells[0], temp: true, lenCell: retCells[1], capCell: retCells[2],
+			exprShape: exprShape{elemSize: max(info.ReturnType.SliceElemSize, 1),
+				elemType: info.ReturnType.SliceElemType, elemIntSize: info.ReturnType.SliceElemIntSize,
+				elemSlice: info.ReturnType.SliceElemSlice, isPointer: true},
 		}, nil
 	}
 	// Scalar return.
@@ -8072,7 +8378,7 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 			for j := range n {
 				l.emit(&IRConst{Dst: base + j, Value: byte(val >> (j * 8))}) // #nosec G115
 			}
-			return exprResult{cell: base, temp: true, size: n, intSize: n}, true, nil
+			return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, true, nil
 		}
 		r, err := lowerExpr(call.Args[0])
 		if err != nil {
@@ -8085,7 +8391,7 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 					l.freeCell(r.cell + j)
 				}
 			}
-			return exprResult{cell: r.cell, temp: r.temp, size: n, intSize: n}, true, nil
+			return exprResult{cell: r.cell, temp: r.temp, exprShape: exprShape{size: n, intSize: n}}, true, nil
 		}
 		// Zero-extend smaller integer.
 		base := l.allocCells(n)
@@ -8105,7 +8411,7 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 			// For byte (intSize 0), free 1 cell. For wider, free all.
 			l.freeCellRange(r.cell, srcSize)
 		}
-		return exprResult{cell: base, temp: true, size: n, intSize: n}, true, nil
+		return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, true, nil
 	case "len", "cap":
 		if len(call.Args) != 1 {
 			return exprResult{}, true, fmt.Errorf("%s() expects 1 argument", fn.Name)
@@ -8201,7 +8507,7 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 					l.freeCellRange(r.cell, n)
 				}
 			}
-			return exprResult{cell: t, temp: true, size: n, intSize: n}, true, nil
+			return exprResult{cell: t, temp: true, exprShape: exprShape{size: n, intSize: n}}, true, nil
 		}
 		t := l.allocCell()
 		l.emitCopyOrMove(t, r)
@@ -8239,7 +8545,7 @@ func (l *Lowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 	if err != nil {
 		return exprResult{}, err
 	}
-	if base.elemCount == 0 {
+	if base.elemCount == 0 && base.lenCell == 0 {
 		depth := 0
 		for x := ast.Expr(e); ; depth++ {
 			if idx, ok := x.(*ast.IndexExpr); ok {
@@ -8296,8 +8602,10 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 			l.emit(&IRMove{Dst: inner.cap, Src: tmpCap})
 			l.freeCell(tmpCap)
 			l.freeCell(idx)
-			return exprResult{cell: inner.ptr, temp: true, elemSize: 1,
-				elemCount: 255, isPointer: true, lenCell: inner.len, capCell: inner.cap}, nil
+			return exprResult{
+				cell: inner.ptr, temp: true, lenCell: inner.len, capCell: inner.cap,
+				exprShape: exprShape{elemSize: 1, isPointer: true},
+			}, nil
 		}
 		// Multi-byte int element: materialize into a temp by loading N bytes.
 		if base.elemIntSize >= 2 {
@@ -8312,11 +8620,14 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 				}
 			}
 			l.freeCell(idx)
-			return exprResult{cell: dst, temp: true, size: n, intSize: n}, nil
+			return exprResult{cell: dst, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 		}
 		// Multi-byte struct element: return pointer to sub-array.
-		return exprResult{cell: idx, temp: true, size: base.elemSize, elemSize: 1,
-			elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType, isPointer: true}, nil
+		return exprResult{
+			cell: idx, temp: true,
+			exprShape: exprShape{size: base.elemSize, elemSize: 1, elemCount: base.elemSize,
+				elemType: base.elemType, typeName: base.elemType, isPointer: true},
+		}, nil
 	}
 
 	// Flat-offset result: cell holds i*elemSize relative to flatBase.
@@ -8339,9 +8650,10 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 			}
 			l.emit(&IRAdd{Dst: base.cell, Src1: base.cell, Src2: t})
 			l.freeCell(t)
-			return exprResult{cell: base.cell, temp: true, elemSize: 1,
-				elemCount: base.elemSize, elemType: base.elemType,
-				typeName: base.elemType, flatBase: base.flatBase}, nil
+			return exprResult{
+				cell: base.cell, temp: true, flatBase: base.flatBase,
+				exprShape: exprShape{elemSize: 1, elemCount: base.elemSize, elemType: base.elemType, typeName: base.elemType},
+			}, nil
 		}
 		// Scalar access on flat array.
 		totalSize := base.elemCount * base.elemSize
@@ -8358,20 +8670,22 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 
 	// Constant index: direct cell access.
 	if constIdx, ok := l.constValue(indexExpr); ok {
-		if constIdx >= base.elemCount {
+		if base.elemCount > 0 && constIdx >= base.elemCount {
 			return exprResult{}, fmt.Errorf("array index %d out of bounds [0:%d]", constIdx, base.elemCount)
 		}
 		cell := base.cell + constIdx*base.elemSize
 		// Multi-byte int element: return a non-temp uint16/uint32/uint64 view.
 		if base.elemIntSize >= 2 {
-			return exprResult{cell: cell, size: base.elemIntSize, intSize: base.elemIntSize}, nil
+			return exprResult{cell: cell, exprShape: exprShape{size: base.elemIntSize, intSize: base.elemIntSize}}, nil
 		}
 		// `[N]string` (or [N][]byte) element: return as string-shaped header.
 		if base.elemSlice {
-			return exprResult{cell: cell, elemSize: 1, elemCount: 255,
-				isPointer: true, lenCell: cell + 1, capCell: cell + 2}, nil
+			return exprResult{
+				cell: cell, lenCell: cell + 1, capCell: cell + 2,
+				exprShape: exprShape{elemSize: 1, isPointer: true},
+			}, nil
 		}
-		r := exprResult{cell: cell, typeName: base.elemType}
+		r := exprResult{cell: cell, exprShape: exprShape{typeName: base.elemType}}
 		if base.elemSize > 1 {
 			r.size = base.elemSize
 			if base.innerElemSize > 0 {
@@ -8412,8 +8726,10 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 		si := l.allocSliceInfo()
 		l.loadConsecutiveViaIndex(flatArr, flatIdx.cell, []Cell{si.ptr, si.len, si.cap})
 		l.freeCell(flatIdx.cell)
-		return exprResult{cell: si.ptr, temp: true, elemSize: 1, elemCount: 255,
-			isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+		return exprResult{
+			cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+			exprShape: exprShape{elemSize: 1, isPointer: true},
+		}, nil
 	}
 	if base.elemSize > 1 {
 		r, err := l.lowerCompositeVarIndex(ai, indexExpr)
@@ -8551,6 +8867,16 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 }
 
 func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
+	// Unwrap (expr).field so the selector resolution sees the inner form.
+	if p, ok := e.X.(*ast.ParenExpr); ok {
+		return l.lowerSelectorExpr(&ast.SelectorExpr{X: p.X, Sel: e.Sel})
+	}
+	// (*pp).field is equivalent to pp.field (Go auto-derefs pointer
+	// receivers in selector access). Rewrite so the Ident-with-ptrType
+	// path handles it.
+	if star, ok := e.X.(*ast.StarExpr); ok {
+		return l.lowerSelectorExpr(&ast.SelectorExpr{X: star.X, Sel: e.Sel})
+	}
 	// Resolve the base: a variable, a chained selector, or an array element.
 	var base Cell
 	var def *StructDef
@@ -8570,7 +8896,24 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			idx := l.ptrOffset(ptrCell, ptrDef.Offsets[e.Sel.Name])
 			// Array field: return pointer for indexing.
 			if arrSize := ptrDef.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
-				return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPointer: true}, nil
+				elemSize := 1
+				elemCount := arrSize
+				elemIntSize := ptrDef.FieldArrayElemIntSize[e.Sel.Name]
+				elemType := ptrDef.FieldArrayElemType[e.Sel.Name]
+				if elemIntSize >= 2 {
+					elemSize = elemIntSize
+					elemCount = arrSize / elemIntSize
+				} else if elemType != "" {
+					if structDef, ok := l.result.Structs[elemType]; ok {
+						elemSize = structDef.Size
+						elemCount = arrSize / structDef.Size
+					}
+				}
+				return exprResult{
+					cell: idx, temp: true,
+					exprShape: exprShape{elemSize: elemSize, elemCount: elemCount,
+						elemType: elemType, elemIntSize: elemIntSize, isPointer: true},
+				}, nil
 			}
 			// Multi-byte int field: load N cells.
 			if n := ptrDef.FieldIntSizes[e.Sel.Name]; n >= 2 {
@@ -8585,8 +8928,8 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			if nestedType := ptrDef.FieldTypes[e.Sel.Name]; nestedType != "" {
 				nestedDef := l.result.Structs[nestedType]
 				return exprResult{
-					cell: idx, temp: true, isPointer: true,
-					typeName: nestedType, elemSize: 1, elemCount: nestedDef.Size,
+					cell: idx, temp: true,
+					exprShape: exprShape{isPointer: true, typeName: nestedType, elemSize: 1, elemCount: nestedDef.Size},
 				}, nil
 			}
 			result := l.ptrLoad(idx)
@@ -8641,14 +8984,16 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 				}
 				l.loadConsecutiveViaIndex(flatArr, inner.cell, dsts)
 				l.freeCell(inner.cell)
-				return exprResult{cell: base, temp: true, size: n, intSize: n}, nil
+				return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 			}
 			if def.FieldStrings[e.Sel.Name] {
 				si := l.allocSliceInfo()
 				l.loadConsecutiveViaIndex(flatArr, inner.cell, []Cell{si.ptr, si.len, si.cap})
 				l.freeCell(inner.cell)
-				return exprResult{cell: si.ptr, temp: true, elemSize: 1, elemCount: 255,
-					isPointer: true, lenCell: si.len, capCell: si.cap}, nil
+				return exprResult{
+					cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+					exprShape: exprShape{elemSize: 1, isPointer: true},
+				}, nil
 			}
 			result := l.allocCell()
 			l.emitVariableIndexRead(flatArr, inner.cell, result)
@@ -8677,13 +9022,15 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		idx := l.ptrOffset(base, offset)
 		// Array field: return pointer for indexing.
 		if arrSize := def.FieldArraySizes[e.Sel.Name]; arrSize > 0 {
-			return exprResult{cell: idx, temp: true, elemSize: 1, elemCount: arrSize, isPointer: true}, nil
+			return exprResult{cell: idx, temp: true, exprShape: exprShape{elemSize: 1, elemCount: arrSize, isPointer: true}}, nil
 		}
 		// Nested struct field: return pointer with struct type.
 		if fieldType := def.FieldTypes[e.Sel.Name]; fieldType != "" {
 			fieldDef := l.result.Structs[fieldType]
-			return exprResult{cell: idx, temp: true, size: fieldDef.Size, elemSize: 1,
-				elemCount: fieldDef.Size, typeName: fieldType, isPointer: true}, nil
+			return exprResult{
+				cell: idx, temp: true,
+				exprShape: exprShape{size: fieldDef.Size, elemSize: 1, elemCount: fieldDef.Size, typeName: fieldType, isPointer: true},
+			}, nil
 		}
 		// Multi-byte int field: load N cells.
 		if n := def.FieldIntSizes[e.Sel.Name]; n >= 2 {
@@ -8707,6 +9054,23 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		} else if ies := def.FieldInnerSizes[e.Sel.Name]; ies > 0 {
 			r.elemSize = ies
 			r.elemCount = arrSize / ies
+			if iis := def.FieldInnerIntSize[e.Sel.Name]; iis >= 2 {
+				r.innerElemSize = iis
+				r.innerElemIntSize = iis
+			} else if innerType := def.FieldArrayElemType[e.Sel.Name]; innerType != "" {
+				if innerDef, ok := l.result.Structs[innerType]; ok {
+					r.innerElemSize = innerDef.Size
+					r.elemType = innerType
+				}
+			} else {
+				r.innerElemSize = 1
+			}
+		} else if et := def.FieldArrayElemType[e.Sel.Name]; et != "" {
+			if structDef, ok := l.result.Structs[et]; ok {
+				r.elemSize = structDef.Size
+				r.elemCount = arrSize / structDef.Size
+				r.elemType = et
+			}
 		} else {
 			r.elemSize = 1
 			r.elemCount = arrSize
@@ -8720,10 +9084,12 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	} else if intSize := def.FieldIntSizes[e.Sel.Name]; intSize >= 2 {
 		r.size = intSize
 		r.intSize = intSize
-	} else if def.FieldStrings[e.Sel.Name] {
-		// String field: 3-cell slice header at base+offset.
-		r.elemSize = 1
-		r.elemCount = 255
+	} else if es := def.FieldSliceElemSize[e.Sel.Name]; es > 0 {
+		// Slice field (string, []byte, []uintN, []Struct, [][]T): 3-cell header.
+		r.elemSize = es
+		r.elemType = def.FieldSliceElemType[e.Sel.Name]
+		r.elemIntSize = def.FieldSliceElemIntSize[e.Sel.Name]
+		r.elemSlice = def.FieldSliceElemSlice[e.Sel.Name]
 		r.isPointer = true
 		r.lenCell = base + offset + 1
 		r.capCell = base + offset + 2

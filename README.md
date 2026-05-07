@@ -259,6 +259,12 @@ The generated Brainfuck uses a CPU-like execution model:
 
 - Parameters, return values, multiple return values,
   named return values
+- Multi-return tuples of any type combination
+  (`func f() (P, P)`, `func f() ([3]byte, [3]byte)`,
+  `func f() (string, byte)`)
+- Methods on value and pointer receivers
+  (`func (p P) m()`, `func (p *P) m()`)
+- Methods on struct literals (`P{x: 10}.method()`)
 - Tail-call recursion optimization
 - General recursion (via stack-based dispatch)
   including nested recursive calls (e.g., Ackermann function)
@@ -278,10 +284,13 @@ The generated Brainfuck uses a CPU-like execution model:
 ### Structs
 
 - Top-level and function-local type definitions
-- Fields: `byte`, `uintN`, struct, array, or nested array types
+- Fields: `byte`, `uintN`, struct, array, nested array,
+  string, `[]byte`, `[]uintN`, `[]Struct`, `[][]byte` types
+- Nested struct array fields (`[N][M]Inner`)
 - Field access, nested field access (`p.a.x`)
 - Composite literals, copy assignment
-- `p.x++`, `p.x += v`, `a[i].x = v`, `s.vals[i] = v`
+- `p.x++`, `p.x += v`, `a[i].x = v`, `s.vals[i] = v`,
+  `s.ps[i].x = v` (struct slice field write through index)
 - Pass to and return from functions
 - Value and pointer receivers (`func (v T) m()`, `func (p *T) m()`)
 
@@ -330,10 +339,16 @@ The generated Brainfuck uses a CPU-like execution model:
 - `*byte`, `*uintN` pointers: `&x`, `*p`, `*p = v`, `*p++`, `*p--`
 - `&myStruct`, `&myArray`, `&Point{x: 1, y: 2}`
 - `&a[i]`, `&s[i]` -- address of array/slice elements
+- `&p.field` -- address of struct field
 - `ptr.x` read/write for struct pointers (`ptr := &myStruct`)
+- `(*ptr).x` read/write (equivalent via auto-deref)
+- `q := pp` pointer alias (both observe the same target)
+- `q := *pp` full-struct copy through a pointer
 - `ptr[i]` read/write, `ptr[i][j]` read/write for array pointers
 - `ptr[i].x` read/write for array-of-structs pointers
-- `ptr.data[i]` read/write for struct-with-array pointers
+- `ptr.data[i]` read/write for struct-with-array pointers,
+  including multi-byte (`pp.x[i] = uint16(...)`) and struct
+  (`pp.items[i].field`) element types
 - `len(ptr)`, `len(*ptr)`, `cap(ptr)` for array pointers
 - `ptr == nil`, `ptr != nil` comparison
 - Typed pointer parameters: `func f(p *[N]byte)`,

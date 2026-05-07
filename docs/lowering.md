@@ -1,7 +1,7 @@
 # Lowering
 
 The lowerer (`lowerer.go`) converts Go AST into structured IR. This is
-the largest compiler stage, handling all Go language features.
+the largest compiler stage, handling all supported Go language features.
 
 ## Function Inlining
 
@@ -61,6 +61,40 @@ returns a multi-cell result and `emitCopyOrMove` handles the
 cell-by-cell transfer. For flat-offset results (e.g., `p := a[i]`
 on a struct array), `assignResult` materializes the data by reading
 each element from the flat array via `emitVariableIndexRead`.
+
+### Shape Inference
+
+Before evaluating an expression, the lowerer often needs to know what
+*kind* of binding the result would produce -- whether to allocate a
+byte cell, a multi-byte int, a struct, a slice header, or a
+pointer-annotated byte. `exprShape` is the type/layout subset of
+`exprResult` (everything except runtime cells), and is also used
+standalone as a "would-be" descriptor.
+
+The shape entry points compose:
+
+- `shapeOf(expr)` -- infers the shape of any AST expression by
+  switching on the AST kind (`Ident`, `IndexExpr`, `SelectorExpr`,
+  `SliceExpr`, `CallExpr`, `StarExpr`, `ParenExpr`, etc.) and
+  recursing on sub-expressions where applicable.
+- `shapeOfType(typeExpr)` -- shape from a type expression
+  (`[N]byte`, `[]uint16`, `Point`).
+- `shapeOfCall(call)` -- shape from a function call (string casts,
+  `make`, `append`, user functions returning slices).
+- `elementShapeOf(parent)` -- the shape of an element of a slice or
+  array shape; composes via `shapeOf(expr.X)` for `IndexExpr`.
+- `arrayShapeFrom(ai)`, `sliceShapeFrom(si)`, `byteSliceShape()`,
+  `sliceShapeFromArray(ai)` -- constructors that lift bindings or
+  static info into a shape.
+
+`defineFromShape(sc, name, sh)` then dispatches on the shape: matches
+`intSize >= 2`, pointer-to-struct (`isPointer && typeName != ""`),
+slice (`isPointer`), struct array, byte array, struct, or byte default.
+This single dispatch replaces several near-duplicate declare paths.
+
+`declareFromAssign` and `declareFromDecl` both compose
+`defineFromShape(sc, name, shapeOf(rhs))` so `:=` and `var x = rhs`
+allocate the same binding kind.
 
 ### Local Declarations
 
@@ -124,6 +158,31 @@ type Vec struct { data [3]byte; len byte }
 
 `Vec` occupies 4 cells. `v.data[i]` resolves the field offset at
 compile time, then indexes into the array.
+
+`StructDef` carries per-field metadata so the lowerer can drive
+read/write paths from the field name alone:
+
+- `FieldArraySizes[name]` -- total cell count of the array field.
+- `FieldArrayElemIntSize[name]` -- element width for `[N]uintN` fields.
+- `FieldArrayElemType[name]` -- struct type for `[N]Struct` fields and
+  for the *innermost* struct of nested array fields. The analyzer
+  walks to the innermost element type and rescales totals so
+  `[N][M]Inner` accounts for `Inner`'s cell size.
+- `FieldInnerSizes[name]` -- inner-array byte size for nested array
+  fields (`[N][M]T`).
+- `FieldInnerIntSize[name]` -- innermost int width for `[N][M]uintN`.
+
+Slice fields (`string`, `[]byte`, `[]uintN`, `[]Struct`, `[][]T`) live
+in 3-cell headers (`ptr`, `len`, `cap`) at the field offset:
+
+- `FieldStrings[name]` -- true for `string` and `[]byte` (byte-element
+  3-cell slice; the same byte-slice machinery handles both).
+- `FieldSliceElemSize[name]` -- element cell count, set for any slice
+  field. Drives index strides and bound-check semantics.
+- `FieldSliceElemType[name]` -- struct type for `[]Struct` fields.
+- `FieldSliceElemIntSize[name]` -- element width for `[]uintN` fields.
+- `FieldSliceElemSlice[name]` -- true when the element is itself a
+  slice (`[][]T`, `[]string`).
 
 ### Multi-Assignment and Swap
 
@@ -226,7 +285,7 @@ or a flat-offset result with `flatBase` for variable `i`), then
 `indexInto` handles `[j]`.
 
 Up to 3 levels of nesting are supported (`[N][M][K]byte`).
-The `innerElemSize` field in `arrayInfo` and `exprResult` tracks
+The `innerElemSize` field in `arrayInfo` and `exprShape` tracks
 the sub-element size. When `indexInto` returns a composite
 sub-element, it uses `innerElemSize` to set the next level's
 `elemSize` and `elemCount`. Nested struct arrays (`[N][M]Point`)
@@ -234,7 +293,12 @@ propagate `elemType` through all levels.
 
 Struct fields may also contain nested arrays. `FieldInnerSizes`
 in `StructDef` stores the inner element size for nested array
-fields (e.g., `data [2][3]byte` has inner size 3).
+fields (e.g., `data [2][3]byte` has inner size 3). `shapeOf`
+reads this when inferring the shape of `s.data` so a copy
+(`a := s.data`) defines `a` as the same nested array.
+`lowerStructValueTo` recurses through `lowerCompositeLitInto`
+when initializing such a field from a literal, so
+`P{data: [2][3]byte{{...}, {...}}}` lowers correctly.
 
 Variable-index reads and writes use `IRDynLoad`/`IRDynStore`, which
 compute a walk distance (`base + index`) and navigate to the target
@@ -327,7 +391,18 @@ and `elemSlice` from the source. The analyzer stores
 functions returning struct slices. `declareFromAssign`
 detects struct slice range values, `tmp := s[i]`
 patterns, and `row := grid[i]` on 2D arrays or struct
-arrays to allocate appropriately-sized variables.
+arrays to allocate appropriately-sized variables. Slice
+expressions on non-Ident bases (`mk()[1:4]`, `(s)[1:]`)
+fall through `lowerSliceFromSliceExpr` to a generic
+`lowerSliceExpr(se.X)` step that produces a temp source
+header to reslice from.
+
+Slice-type casts `[]T(s)` lower as identity when the source
+is already a slice (go2bf does not enforce strict element
+types across casts); `lowerCallExpr` returns the source's
+`exprResult` directly. `string(bs)` and `[]byte(s)` are
+handled separately via `lowerSliceExpr` for cross-type
+conversion.
 
 ## Strings
 
@@ -521,21 +596,29 @@ shape `exprResult` that mirrors the slice's `elemSize` and
 `declareFromRange` picks up the same case for slice-of-strings
 and slice-of-byte-slices composite-literal sources.
 
-## Multi-return tuples with strings
+## Multi-return tuples
 
-`func f() (string, byte)` and similar shapes thread a
-3-cell slice header through one or more return slots. The
-analyzer's per-field return-type detection recognises `string`
-identifiers and sets `ReturnSizes[i] = 3`, so the call site
-allocates the right total cell count. `lowerReturn`'s multi-
-return loop tries `lowerExpr` first, falls back to
-`lowerSliceExpr` for string/slice literals, and writes 3 cells
-when the result has `lenCell != 0`. `lowerMultiReturnAssign`
-mirrors the pattern on the LHS: when `ReturnSizes[i] == 3`
-the target is taken to be a string variable and its three
-header cells receive the return slot's three cells.
-`declareFromAssign` defines the LHS as a `sliceBinding` for
-the same condition.
+`func f() (T1, T2, ...)` returns multiple values via per-return
+cell slots. `FuncInfo.ReturnSizes` carries each value's cell count
+and `FuncInfo.ReturnTypes` carries per-return composite type info
+(`ReturnInfo`), populated by the `returnTypeInfo` helper. This lets
+multi-return funcs return any combination of byte, multi-byte int,
+struct, array, slice, string, and pointer values.
+
+Receiving side: `declareFromAssign` defines each LHS via
+`defineFromShape(sc, name, returnShape(info.ReturnTypes[i], ...))`
+so the binding kind matches. `lowerMultiReturnAssign` then dispatches
+on the actual binding kind (struct, array, slice, intVar, byte) and
+moves the right cell count from each return slot to the LHS storage,
+rather than guessing from `ReturnSizes` alone.
+
+Returning side: `lowerReturn`'s multi-result loop consults
+`l.curFunc.ReturnTypes[i]` per return value. For struct/array
+returns (non-pointer), it resolves base+size via `resolveStructArg`
+or `lookupArray` and copies cell-by-cell. For string/slice it falls
+back to `lowerSliceExpr` and writes the 3-cell header. The
+`return a/b, a%b` divmod fusion still runs first when both returns
+are byte.
 
 ## Parallel assignment with strings
 
@@ -606,7 +689,21 @@ Mixed access patterns are supported:
   a pointer sub-array, `lowerSelectorExpr` adds the field offset
 - `ptr.data[i]` for struct-with-array pointers: `lowerSelectorExpr`
   returns an `isPointer` result with the field's array metadata,
-  then `indexInto` handles the index
+  then `indexInto` handles the index. The metadata propagation
+  consults `FieldArrayElemIntSize`/`FieldArrayElemType` so multi-
+  byte and struct elements stride at the right width (e.g.
+  `pp.x[1] = uint16(...)` writes 2 cells, not 1).
+- `(*pp).field` and `(expr).field` are unwrapped at the top of
+  `lowerSelectorExpr` and `lowerFieldAssign` so they share the
+  pointer/value field paths.
+- `q := *pp` for `*Struct` materializes all struct cells via the
+  pointer (`r.isPointer && r.typeName != "" && r.elemCount > 1`
+  branch in `lowerDeref`), so the LHS gets a full struct copy
+  rather than the loaded slot index.
+- `s[i].field = v` for a struct slice goes through
+  `assignSliceStructField`: `ptrDynIndex` to the element address,
+  add the field offset, `ptrStore` cell-by-cell. Handles byte,
+  multi-byte int, and slice-typed (string, `[]T`) fields.
 
 Pointer types are tracked both for local assignments (`ptr := &myStruct`)
 and for typed pointer parameters (`func f(p *Point)`, `func f(a *[3]byte)`).
@@ -844,6 +941,12 @@ limit and loads `v = a[i]` at each iteration via
 value from the header. For struct slices, `v` is allocated
 as a struct and loaded via `ptrLoad` (`elemSize` cells per
 iteration).
+
+`lowerRange` rejects range expressions that aren't
+iteration sources -- `for j := range s` where `s` is a
+struct, or `for j := range &p` (pointer expression) --
+with a clear compile error rather than silently using the
+underlying byte as a counter.
 
 ### Switch
 

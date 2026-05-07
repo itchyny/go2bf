@@ -485,6 +485,17 @@ func main() {
 			"", "100 200 300 99\n",
 		},
 		{
+			"range over slice literal of structs",
+			`package main
+type Pt struct{ x, y byte }
+func main() {
+	for _, p := range []Pt{Pt{1, 2}, Pt{3, 4}, Pt{5, 6}} {
+		println(p.x, p.y)
+	}
+}`,
+			"", "1 2\n3 4\n5 6\n",
+		},
+		{
 			"nested for-loops shadow same iter variable",
 			`package main
 func main() {
@@ -1534,6 +1545,18 @@ func main() {
 			"", "7 2\n",
 		},
 		{
+			"multi-return into multi-byte int array element",
+			`package main
+func wide() (uint16, byte) { return 50000, 7 }
+func main() {
+	var a [3]uint16
+	var b [3]byte
+	a[0], b[0] = wide()
+	println(a[0], b[0])
+}`,
+			"", "50000 7\n",
+		},
+		{
 			"nested function calls",
 			`package main
 func inc(x byte) byte { return x + 1 }
@@ -1882,6 +1905,17 @@ func main() {
 	println(a, b, c, d)
 }`,
 			"", "1 2 3 4\n",
+		},
+		{
+			"typeless var with composite literal RHS",
+			`package main
+func main() {
+	var x = []byte{1, 2, 3}
+	var p = []uint16{100, 200, 300}
+	println(len(x), x[0], x[1], x[2])
+	println(len(p), p[0], p[1], p[2])
+}`,
+			"", "3 1 2 3\n3 100 200 300\n",
 		},
 		{
 			"local var shadows predeclared nil",
@@ -4163,7 +4197,7 @@ func main() { println(f(3)) }`,
 			`package main
 type Point struct { x, y byte }
 func (p Point) show() {
-	print(p.x); print(","); print(p.y); print(" ")
+	println(p.x, p.y)
 }
 func f(n byte) byte {
 	if n == 0 { return 0 }
@@ -4173,7 +4207,7 @@ func f(n byte) byte {
 	return r
 }
 func main() { f(3) }`,
-			"", "3,6 2,4 1,2 ",
+			"", "3 6\n2 4\n1 2\n",
 		},
 		{
 			"range with value in recursive function",
@@ -5299,6 +5333,17 @@ func main() {
 			"", "1245",
 		},
 		{
+			"range over string literal",
+			`package main
+func main() {
+	count := byte(0)
+	for _, c := range "hello" {
+		putchar(c)
+	}
+}`,
+			"", "hello",
+		},
+		{
 			"var array zeroed in loop",
 			`package main
 func main() {
@@ -5503,11 +5548,10 @@ func main() {
 		a[i] = [2]byte{i + 1, (i + 1) * 10}
 	}
 	for i := range byte(3) {
-		print(a[i][0]); print(","); print(a[i][1]); print(" ")
+		println(a[i][0], a[i][1])
 	}
-	println()
 }`,
-			"", "1,10 2,20 3,30 \n",
+			"", "1 10\n2 20\n3 30\n",
 		},
 		{
 			"array of arrays const outer var inner",
@@ -5658,11 +5702,10 @@ func main() {
 		pts[i] = Point{i + 1, (i + 1) * 2}
 	}
 	for i := range byte(3) {
-		print(pts[i].x); print(","); print(pts[i].y); print(" ")
+		println(pts[i].x, pts[i].y)
 	}
-	println()
 }`,
-			"", "1,2 2,4 3,6 \n",
+			"", "1 2\n2 4\n3 6\n",
 		},
 		{
 			"array of structs variable index copy",
@@ -6271,11 +6314,10 @@ func main() {
 	s[1].x = 3; s[1].y = 4
 	s[2].x = 5; s[2].y = 6
 	for i := range byte(3) {
-		if i > 0 { print(" ") }
-		print(s[i].x); print(","); print(s[i].y)
+		println(s[i].x, s[i].y)
 	}
 }`,
-			"", "1,2 3,4 5,6",
+			"", "1 2\n3 4\n5 6\n",
 		},
 		{
 			"slice of structs field inc",
@@ -7456,6 +7498,17 @@ func main() {
 			"", "7 3\n",
 		},
 		{
+			"method on struct literal",
+			`package main
+type P struct{ x byte }
+func (p P) double() byte { return p.x * 2 }
+func main() {
+	x := P{x: 10}.double()
+	println(x)
+}`,
+			"", "20\n",
+		},
+		{
 			"struct method returning struct",
 			`package main
 type Point struct { x byte; y byte }
@@ -7902,6 +7955,104 @@ func main() {
 	println(w.a.v, w.b)
 }`,
 			"", "10 20\n",
+		},
+		{
+			"range over array of size-1 struct",
+			`package main
+type P struct { x byte }
+func main() {
+	var a [4]P
+	a[0] = P{x: 1}
+	a[1] = P{x: 2}
+	a[2] = P{x: 3}
+	a[3] = P{x: 4}
+	for _, p := range a {
+		println(p.x)
+	}
+}`,
+			"", "1\n2\n3\n4\n",
+		},
+		{
+			"struct field with struct array",
+			`package main
+type Inner struct { a, b byte }
+type Outer struct { items [3]Inner }
+func main() {
+	var o Outer
+	o.items[0].a = 1
+	o.items[0].b = 2
+	o.items[1].a = 3
+	o.items[2].b = 6
+	println(o.items[0].a, o.items[1].a, o.items[2].b)
+	a := o.items
+	println(a[0].a, a[2].b)
+}`,
+			"", "1 3 6\n1 6\n",
+		},
+		{
+			"struct field with struct array literal init",
+			`package main
+type Inner struct { a, b byte }
+type Outer struct { items [3]Inner }
+func main() {
+	o := Outer{items: [3]Inner{{1, 2}, {3, 4}, {5, 6}}}
+	println(o.items[0].a, o.items[1].b, o.items[2].a)
+}`,
+			"", "1 4 5\n",
+		},
+		{
+			"struct field with nested struct array",
+			`package main
+type Inner struct { a, b byte }
+type Outer struct { grid [2][3]Inner }
+func main() {
+	var o Outer
+	o.grid[0][1].a = 5
+	o.grid[1][2].b = 9
+	println(o.grid[0][1].a, o.grid[1][2].b)
+}`,
+			"", "5 9\n",
+		},
+		{
+			"multi-byte array field via pointer",
+			`package main
+type P struct { x [3]uint16 }
+func mutate(p *P) {
+	p.x[0] = uint16(100)
+	p.x[1] = uint16(40000)
+	p.x[2] = uint16(60000)
+}
+func main() {
+	var p P
+	mutate(&p)
+	println(p.x[0], p.x[1], p.x[2])
+}`,
+			"", "100 40000 60000\n",
+		},
+		{
+			"multi-return struct values",
+			`package main
+type P struct{ x, y byte }
+func twoP() (P, P) { return P{x: 1, y: 2}, P{x: 3, y: 4} }
+func main() {
+	a, b := twoP()
+	println(a.x, a.y, b.x, b.y)
+}`,
+			"", "1 2 3 4\n",
+		},
+		{
+			"multi-return array values",
+			`package main
+func twoArr() ([3]byte, [3]byte) {
+	a := [3]byte{1, 2, 3}
+	b := [3]byte{4, 5, 6}
+	return a, b
+}
+func main() {
+	a, b := twoArr()
+	println(a[0], a[2], b[0], b[2])
+}`,
+			"", "1 3 4 6\n",
 		},
 		// --- uint16 ---
 		{
@@ -8619,6 +8770,172 @@ func main() { println(sum(makeSlice())) }`,
 			"", "34564\n",
 		},
 		{
+			"index into call result",
+			`package main
+func makeSlice() []uint16 { return []uint16{uint16(100), uint16(40000), uint16(60000)} }
+func main() {
+	x := makeSlice()[1]
+	println(x)
+}`,
+			"", "40000\n",
+		},
+		{
+			"index into nested multi-byte array",
+			`package main
+func main() {
+	var a [2][3]uint16
+	a[0][1] = uint16(200)
+	a[1][2] = uint16(60000)
+	x := a[0][1]
+	y := a[1][2]
+	println(x, y)
+}`,
+			"", "200 60000\n",
+		},
+		{
+			"parenthesized index of multi-byte slice",
+			`package main
+func main() {
+	a := []uint16{uint16(100), uint16(40000), uint16(60000)}
+	x := (a[1])
+	y := ((a)[2])
+	println(x, y)
+}`,
+			"", "40000 60000\n",
+		},
+		{
+			"slice through parens",
+			`package main
+func main() {
+	a := []uint16{uint16(100), uint16(200), uint16(300)}
+	t := (a)[1:]
+	println(t[0], t[1])
+}`,
+			"", "200 300\n",
+		},
+		{
+			"slice cast identity",
+			`package main
+func main() {
+	a := []uint16{uint16(100), uint16(200), uint16(300)}
+	t := []uint16(a)
+	println(t[0], t[1], t[2])
+}`,
+			"", "100 200 300\n",
+		},
+		{
+			"slice on call result multi-byte",
+			`package main
+func mk16() []uint16 { return []uint16{uint16(100), uint16(200), uint16(300), uint16(400), uint16(500)} }
+func main() {
+	t := mk16()[1:4]
+	println(t[0], t[1], t[2])
+	sum := uint16(0)
+	for _, v := range t { sum += v }
+	println(sum)
+}`,
+			"", "200 300 400\n900\n",
+		},
+		{
+			"struct field multi-byte array literal init",
+			`package main
+type P struct { x [3]uint16 }
+func main() {
+	p := P{x: [3]uint16{uint16(100), uint16(40000), uint16(60000)}}
+	println(p.x[0], p.x[1], p.x[2])
+}`,
+			"", "100 40000 60000\n",
+		},
+		{
+			"nested multi-byte array literal init",
+			`package main
+func main() {
+	a := [2][3]uint16{{uint16(100), uint16(200), uint16(300)}, {uint16(400), uint16(500), uint16(600)}}
+	println(a[0][1], a[1][2])
+}`,
+			"", "200 600\n",
+		},
+		{
+			"struct field nested array copy and chained index",
+			`package main
+type P struct { arr [3][2]byte }
+func main() {
+	var p P
+	p.arr[0][0] = 1
+	p.arr[1][1] = 4
+	p.arr[2][1] = 6
+	println(p.arr[1][1])
+	a := p.arr
+	println(a[0][0], a[2][1])
+	b := p.arr[1]
+	println(b[0], b[1])
+}`,
+			"", "4\n1 6\n0 4\n",
+		},
+		{
+			"struct field nested array literal init",
+			`package main
+type P struct { arr [3][2]byte }
+func main() {
+	p := P{arr: [3][2]byte{{1, 2}, {3, 4}, {5, 6}}}
+	println(p.arr[0][0], p.arr[1][1], p.arr[2][0])
+}`,
+			"", "1 4 5\n",
+		},
+		{
+			"struct field multi-byte nested array",
+			`package main
+type Q struct { grid [2][3]uint16 }
+func main() {
+	q := Q{}
+	q.grid[0][0] = uint16(100)
+	q.grid[1][2] = uint16(60000)
+	println(q.grid[0][0], q.grid[1][2])
+	a := q.grid
+	println(a[0][0], a[1][2])
+}`,
+			"", "100 60000\n100 60000\n",
+		},
+		{
+			"chained selector struct field copy",
+			`package main
+type Inner struct { a, b byte }
+type Outer struct { inner Inner }
+func main() {
+	o := Outer{inner: Inner{a: 3, b: 5}}
+	i := o.inner
+	println(i.a, i.b)
+}`,
+			"", "3 5\n",
+		},
+		{
+			"address of nested struct field",
+			`package main
+type P struct { x, y byte }
+type Q struct { p P; n byte }
+func main() {
+	q := Q{p: P{x: 3, y: 5}, n: 7}
+	pp := &q.p
+	println(pp.x, pp.y)
+	pn := &q.n
+	*pn = 99
+	println(q.n)
+}`,
+			"", "3 5\n99\n",
+		},
+		{
+			"address of multi-byte array",
+			`package main
+func main() {
+	a := [3]uint16{uint16(100), uint16(200), uint16(300)}
+	pa := &a
+	pa[1] = uint16(500)
+	println(a[0], a[1], a[2])
+	println(pa[0], pa[1], pa[2])
+}`,
+			"", "100 500 300\n100 500 300\n",
+		},
+		{
 			"address of multi-byte array element",
 			`package main
 func main() {
@@ -8929,6 +9246,81 @@ func main() {
 	println(p.age)
 }`,
 			"", "alice\n30\n",
+		},
+		{
+			"byte slice field in struct",
+			`package main
+type P struct {
+	xs []byte
+	n  byte
+}
+func main() {
+	p := P{xs: []byte{1, 2, 3, 4, 5}, n: 7}
+	println(p.xs[0], p.xs[2], p.xs[4], p.n)
+	p.xs = append(p.xs, byte(99))
+	println(p.xs[5], len(p.xs))
+	p.xs[0] = 100
+	println(p.xs[0])
+}`,
+			"", "1 3 5 7\n99 6\n100\n",
+		},
+		{
+			"uint16 slice field in struct",
+			`package main
+type S struct { xs []uint16 }
+func main() {
+	s := S{xs: []uint16{uint16(100), uint16(40000), uint16(60000)}}
+	println(s.xs[0], s.xs[1], s.xs[2])
+	s.xs[1] = uint16(50000)
+	s.xs = append(s.xs, uint16(99))
+	println(s.xs[1], s.xs[3], len(s.xs))
+}`,
+			"", "100 40000 60000\n50000 99 4\n",
+		},
+		{
+			"struct slice field in struct",
+			`package main
+type Q struct{ x byte }
+type S struct { ps []Q }
+func main() {
+	s := S{ps: []Q{{x: 1}, {x: 2}, {x: 3}}}
+	println(s.ps[0].x, s.ps[1].x, s.ps[2].x)
+}`,
+			"", "1 2 3\n",
+		},
+		{
+			"struct slice field write through index",
+			`package main
+type Q struct{ x byte }
+func main() {
+	ps := []Q{{x: 1}, {x: 2}, {x: 3}}
+	ps[1].x = 99
+	println(ps[0].x, ps[1].x, ps[2].x)
+}`,
+			"", "1 99 3\n",
+		},
+		{
+			"slice of slice field in struct",
+			`package main
+type Q struct{ rows [][]byte }
+func main() {
+	q := Q{}
+	q.rows = append(q.rows, []byte{10, 20})
+	q.rows = append(q.rows, []byte{30, 40, 50})
+	println(len(q.rows), q.rows[0][1], q.rows[1][2])
+}`,
+			"", "2 20 50\n",
+		},
+		{
+			"append struct literal to slice",
+			`package main
+type Q struct{ x byte }
+func main() {
+	s := []Q{{x: 1}, {x: 2}}
+	s = append(s, Q{x: 99})
+	println(s[0].x, s[1].x, s[2].x, len(s))
+}`,
+			"", "1 2 99 3\n",
 		},
 		{
 			"string field compare equality",
@@ -9654,6 +10046,46 @@ func main() {
 			"", "20 10\n",
 		},
 		{
+			"pointer alias to struct",
+			`package main
+type P struct{ x, y, z byte }
+func main() {
+	p := P{x: 3, y: 5, z: 7}
+	pp := &p
+	q := pp
+	q.x = 99
+	println(p.x, p.y, p.z)
+	println(q.x, q.y, q.z)
+}`,
+			"", "99 5 7\n99 5 7\n",
+		},
+		{
+			"deref pointer to struct define",
+			`package main
+type P struct{ x, y byte }
+func main() {
+	p := P{x: 3, y: 5}
+	pp := &p
+	q := *pp
+	q.x = 99
+	println(p.x, q.x)
+}`,
+			"", "3 99\n",
+		},
+		{
+			"selector on parenthesized deref",
+			`package main
+type P struct{ x, y byte }
+func main() {
+	p := P{x: 3, y: 5}
+	pp := &p
+	println((*pp).x, (*pp).y)
+	(*pp).x = 99
+	println(p.x)
+}`,
+			"", "3 5\n99\n",
+		},
+		{
 			"pointer to array element",
 			`package main
 func main() {
@@ -10272,6 +10704,26 @@ func main() {
 	putchar(x)
 }`,
 			"cannot use slice as argument to putchar",
+		},
+		{
+			"range over struct",
+			`package main
+type X struct { x, y byte }
+func main() {
+	i := X{4, 5}
+	for j := range i { println(j) }
+}`,
+			"cannot range over struct: i",
+		},
+		{
+			"range over pointer",
+			`package main
+type X struct { x, y byte }
+func main() {
+	i := X{4, 5}
+	for j := range &i { println(j) }
+}`,
+			"cannot range over pointer expression",
 		},
 		{
 			"too many locals in recursive function",

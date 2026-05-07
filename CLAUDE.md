@@ -112,6 +112,17 @@ see annotated BF output with comments showing each IR operation.
 Always update `README.md` and `docs/` when adding or changing
 features and optimizations. Do not forget to update docs.
 
+**Avoiding destructive git operations on uncommitted work**:
+`lowerer.go` and `compiler_test.go` accumulate large uncommitted
+diffs over a session. Never run `git checkout <file>` or
+`git restore <file>` on a working file -- it silently discards every
+unstaged edit with no recovery path (the reflog only tracks commits,
+not working-tree state). If you need to compare against `HEAD`, use
+`git diff` or `git show HEAD:<file>`. If you need a clean copy to
+A/B test, write to a temp path (`cp <file> /tmp/...`) before any
+revert, and prefer `git stash` over checkout for temporary reverts
+since stash is recoverable.
+
 **Exploratory testing**: Write small Go programs that exercise edge
 cases and run them with `go run . run /tmp/test.go`. Compare the
 output with native Go before adding test cases. To convert go2bf
