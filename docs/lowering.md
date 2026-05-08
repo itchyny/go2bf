@@ -88,9 +88,11 @@ The shape entry points compose:
   static info into a shape.
 
 `defineFromShape(sc, name, sh)` then dispatches on the shape: matches
-`intSize >= 2`, pointer-to-struct (`isPointer && typeName != ""`),
-slice (`isPointer`), struct array, byte array, struct, or byte default.
-This single dispatch replaces several near-duplicate declare paths.
+pointer-to-uintN (`isPointer && intSize >= 2`), `intSize >= 2`,
+pointer-to-struct (`isPointer && structType != ""`), pointer-to-array
+(`isPointer && elemCount > 0`), slice (`isPointer`), struct array,
+byte array, struct, or byte default. This single dispatch replaces
+several near-duplicate declare paths.
 
 `declareFromAssign` and `declareFromDecl` both compose
 `defineFromShape(sc, name, shapeOf(rhs))` so `:=` and `var x = rhs`
@@ -159,30 +161,30 @@ type Vec struct { data [3]byte; len byte }
 `Vec` occupies 4 cells. `v.data[i]` resolves the field offset at
 compile time, then indexes into the array.
 
-`StructDef` carries per-field metadata so the lowerer can drive
-read/write paths from the field name alone:
+`StructDef.Field` is a `map[string]FieldInfo` carrying per-field
+metadata so the lowerer can drive read/write paths from the field name
+alone. `FieldInfo`'s shape fields cover all field type combinations:
 
-- `FieldArraySizes[name]` -- total cell count of the array field.
-- `FieldArrayElemIntSize[name]` -- element width for `[N]uintN` fields.
-- `FieldArrayElemType[name]` -- struct type for `[N]Struct` fields and
-  for the *innermost* struct of nested array fields. The analyzer
-  walks to the innermost element type and rescales totals so
-  `[N][M]Inner` accounts for `Inner`'s cell size.
-- `FieldInnerSizes[name]` -- inner-array byte size for nested array
-  fields (`[N][M]T`).
-- `FieldInnerIntSize[name]` -- innermost int width for `[N][M]uintN`.
-
-Slice fields (`string`, `[]byte`, `[]uintN`, `[]Struct`, `[][]T`) live
-in 3-cell headers (`ptr`, `len`, `cap`) at the field offset:
-
-- `FieldStrings[name]` -- true for `string` and `[]byte` (byte-element
+- `Offset` -- cell offset within the struct.
+- `StructType` -- non-empty for struct-typed fields.
+- `IntSize` -- `>=2` for uintN fields.
+- `IsString` -- true for `string` and `[]byte` fields (byte-element
   3-cell slice; the same byte-slice machinery handles both).
-- `FieldSliceElemSize[name]` -- element cell count, set for any slice
-  field. Drives index strides and bound-check semantics.
-- `FieldSliceElemType[name]` -- struct type for `[]Struct` fields.
-- `FieldSliceElemIntSize[name]` -- element width for `[]uintN` fields.
-- `FieldSliceElemSlice[name]` -- true when the element is itself a
-  slice (`[][]T`, `[]string`).
+- `IsSlice` -- true for any slice-typed field.
+- `ElemCount`, `ElemSize`, `ElemType`, `ElemIntSize`, `ElemSlice`
+  -- element layout for array and slice fields (a field is at most
+  one of array/slice, so these names are shared). `ElemCount > 0`
+  marks an array field; total cells is `ElemCount` times the
+  per-element width (`ElemIntSize` / `InnerSize` / looked-up size
+  of `ElemType`). For nested array fields these track the
+  *innermost* element so `[N][M]Inner` accounts for `Inner`'s
+  cell size via `InnerSize`.
+- `InnerSize`, `InnerIntSize` -- inner-array byte size and innermost
+  int width for nested array fields (`[N][M]T`).
+
+The single `analyzeFieldType` helper produces a `FieldInfo` from a
+field's type expression and is shared between the analyzer and the
+lowerer's local-struct decl path.
 
 ### Multi-Assignment and Swap
 
@@ -198,7 +200,7 @@ Method receivers are desugared: `func (p Point) sum() byte` becomes a
 function `Point.sum` with `p` as the first parameter. Pointer
 receivers (`func (p *Point) shift()`) register under the same
 `Point.shift` name and are dispatched the same way; the analyzer
-records `IsPointer=true` and `PtrStructType="Point"` on the first
+records `IsPointer=true` and `StructType="Point"` on the first
 parameter so the inlined body sees it as a struct pointer.
 
 Method calls resolve the receiver's struct type via
@@ -222,7 +224,7 @@ implements both directions:
 - *Pointer caller, value method* (`pp.sum()` where `pp` is `*Point`
   and `sum` has a value receiver): the implicit deref happens later,
   in `inlineCall`'s arg-evaluation loop. When the lowered argument
-  is `isPointer && typeName != "" && !elemSlice` and the parameter
+  is `isPointer && structType != "" && !elemSlice` and the parameter
   is a value-typed struct, the loop reads each cell of the pointed
   struct via `ptrLoad` into a fresh contiguous block and replaces
   the arg with that materialized value. The traversal copies the
@@ -291,11 +293,11 @@ sub-element, it uses `innerElemSize` to set the next level's
 `elemSize` and `elemCount`. Nested struct arrays (`[N][M]Point`)
 propagate `elemType` through all levels.
 
-Struct fields may also contain nested arrays. `FieldInnerSizes`
-in `StructDef` stores the inner element size for nested array
-fields (e.g., `data [2][3]byte` has inner size 3). `shapeOf`
-reads this when inferring the shape of `s.data` so a copy
-(`a := s.data`) defines `a` as the same nested array.
+Struct fields may also contain nested arrays. `FieldInfo.InnerSize`
+stores the inner element size for nested array fields (e.g.,
+`data [2][3]byte` has inner size 3). `shapeOf` reads this when
+inferring the shape of `s.data` so a copy (`a := s.data`) defines
+`a` as the same nested array.
 `lowerStructValueTo` recurses through `lowerCompositeLitInto`
 when initializing such a field from a literal, so
 `P{data: [2][3]byte{{...}, {...}}}` lowers correctly.
@@ -319,7 +321,7 @@ indexed access. For struct slices, `s[i].x` computes
 `ptr + i * elemSize + fieldOffset`. For pointer slices
 (`[]*Point`), `elemPtrType` tracks the pointed-to struct
 type; `s[i]` loads the pointer and tags the result with
-`isPointer` and `typeName` so field access and method calls
+`isPointer` and `structType` so field access and method calls
 dispatch through the pointer-to-struct path.
 
 `lowerSliceExpr` evaluates any slice-producing expression
@@ -387,8 +389,8 @@ or assigned to local struct variables.
 
 Reslicing (`s[i:j]`) propagates `elemSize`, `elemType`,
 and `elemSlice` from the source. The analyzer stores
-`SliceElemSize` and `SliceElemType` in `ReturnInfo` for
-functions returning struct slices. `declareFromAssign`
+`ElemSize` and `ElemType` on the function's `ReturnInfo`
+(`TypeInfo`) for functions returning struct slices. `declareFromAssign`
 detects struct slice range values, `tmp := s[i]`
 patterns, and `row := grid[i]` on 2D arrays or struct
 arrays to allocate appropriately-sized variables. Slice
@@ -495,8 +497,8 @@ bytes pre-stored.
   binding by copying ptr/len/cap, so the eventual deferred
   call sees the value at defer time rather than a stale byte
   cell.
-- String fields in structs -- the analyzer records each
-  string-typed field in `StructDef.FieldStrings` and reserves
+- String fields in structs -- the analyzer marks each
+  string-typed field with `FieldInfo.IsString` and reserves
   3 cells (ptr, len, cap) at the field's offset.
   `lowerStructValueTo` initializes the field by resolving the
   RHS via `resolveStringSlice` and copying the three header
@@ -666,13 +668,13 @@ silently read/write arbitrary stack slots.
 Struct pointers (`ptr := &myStruct` or `ptr := &Point{...}`) are
 tracked in the scope's `ptrType` map. `ptr.x` emits `IRDynLoad`
 at `*ptr + fieldOffset`. Functions returning `*Point` set
-`ReturnType.StructType` with `IsPointer`, so `lowerCallExpr`
+`IsPointer` + `StructType` on the `ReturnInfo`, so `lowerCallExpr`
 tags the result for `ptrType` tracking by the caller.
 
 Array pointers (`ptr := &myArray`) are tracked in `ptrArray`.
 `lowerExpr(ptr)` returns an `exprResult` with `isPointer: true` and
 the array's `elemSize`/`elemCount`. Functions returning `*[N]byte`
-set `ReturnType.IsPointer` and `ReturnType.ArraySize` so that
+set `IsPointer` + `ElemCount` on the `ReturnInfo` so that
 `lowerCallExpr` tags the result as a pointer-to-array. All pointer
 indexing goes through the generic `indexInto`/`writeInto` path,
 which uses `ptrDynIndex` + `ptrLoad`/`ptrStore` for `isPointer`
@@ -690,14 +692,14 @@ Mixed access patterns are supported:
 - `ptr.data[i]` for struct-with-array pointers: `lowerSelectorExpr`
   returns an `isPointer` result with the field's array metadata,
   then `indexInto` handles the index. The metadata propagation
-  consults `FieldArrayElemIntSize`/`FieldArrayElemType` so multi-
-  byte and struct elements stride at the right width (e.g.
+  consults `FieldInfo.ElemIntSize`/`ElemType` so multi-byte and
+  struct elements stride at the right width (e.g.
   `pp.x[1] = uint16(...)` writes 2 cells, not 1).
 - `(*pp).field` and `(expr).field` are unwrapped at the top of
   `lowerSelectorExpr` and `lowerFieldAssign` so they share the
   pointer/value field paths.
 - `q := *pp` for `*Struct` materializes all struct cells via the
-  pointer (`r.isPointer && r.typeName != "" && r.elemCount > 1`
+  pointer (`r.isPointer && r.structType != "" && r.elemCount > 1`
   branch in `lowerDeref`), so the LHS gets a full struct copy
   rather than the loaded slot index.
 - `s[i].field = v` for a struct slice goes through
@@ -837,11 +839,13 @@ recursive functions may crash at runtime.
 
 Typed `*uint16`/`*uint32`/`*uint64` pointer parameters
 are supported. The analyzer records the pointed-to width
-in `ParamInfo.PtrIntSize`, and `inlineCall` registers it
-in the param scope's `ptrIntSize` map so deref reads
-(`*p`), writes (`*p = v`), increment/decrement (`*p++`),
-and compound assignment (`*p += v`) all use the
-multi-byte pointer paths.
+on `ParamInfo` as `IsPointer` + `IntSize` (single
+encoding shared with non-pointer uintN params), and
+`inlineCall` registers it in the param scope's
+`ptrIntSize` map so deref reads (`*p`), writes
+(`*p = v`), increment/decrement (`*p++`), and compound
+assignment (`*p += v`) all use the multi-byte pointer
+paths.
 
 ### Struct fields
 
@@ -890,10 +894,10 @@ Three forms of nested multi-byte composites are supported:
   reads/writes hit the multi-byte path at the inner level.
 - **Struct fields of multi-byte int arrays**
   (`type S struct { vals [N]uintN }`): tracked via
-  `StructDef.FieldArrayElemIntSize`. `arrayFieldInfo`
-  computes total cells as `N*elemBytes` so the struct
-  allocates the full size; `lowerSelectorExpr` propagates
-  the element width onto the field-access result.
+  `FieldInfo.ElemIntSize`. `arrayFieldInfo` computes total
+  cells as `N*elemBytes` so the struct allocates the full
+  size; `lowerSelectorExpr` propagates the element width
+  onto the field-access result.
 - **Range over `[N]Struct{multi-byte fields}`**: the
   array fallback in `lowerRange` uses `rangeBase.elemSize`
   (rather than a hardcoded 1) and reads `elemSize` cells
@@ -1096,8 +1100,9 @@ if result { result = (a[2] == b[2]) }
 Each element is only compared if `result` is still 1 (all previous
 pairs matched). On first mismatch, `result` becomes 0 and remaining
 comparisons are skipped. For `!=`, the final result is inverted
-with `IRNot`. Zero-length arrays (`[0]byte`) are always equal
-(result stays 1).
+with `IRNot`. Zero-length arrays are rejected by the analyzer
+(see `findZeroLengthArray`), so the loop always has at least one
+element to compare.
 
 ## Named Returns
 

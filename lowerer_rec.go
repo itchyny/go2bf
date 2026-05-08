@@ -22,11 +22,12 @@ import (
 
 // recArrayInfo holds metadata for an array variable in a recursive function frame.
 type recArrayInfo struct {
-	size     int    // total cells
-	count    int    // number of elements
-	elemSize int    // cells per element
-	elemType string // struct type name (empty for byte or nested array)
+	elemCount int    // number of elements
+	elemSize  int    // cells per element
+	elemType  string // struct type name (empty for byte or nested array)
 }
+
+func (ri recArrayInfo) size() int { return ri.elemCount * ri.elemSize }
 
 // recContext holds state for lowering a recursive function.
 type recContext struct {
@@ -71,14 +72,17 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		paramSize := 1
 		if i < len(info.ParamTypes) {
 			pt := info.ParamTypes[i]
-			if pt.StructType != "" {
+			if pt.IsPointer {
+				// pointer parameter occupies 1 cell regardless of target type.
+			} else if pt.StructType != "" {
 				paramSize = l.result.Structs[pt.StructType].Size
 				rc.localStructTypes[pt.Name] = pt.StructType
-			} else if pt.ArraySize > 0 {
-				paramSize = pt.ArraySize
+			} else if pt.ElemCount > 0 {
+				arraySize := pt.ElemCount * max(pt.ElemSize, 1)
+				paramSize = arraySize
 				rc.localArrayInfo[pt.Name] = recArrayInfo{
-					size: pt.ArraySize, count: pt.ArrayCount,
-					elemSize: pt.ArrayElemSize, elemType: pt.ArrayElemType,
+					elemCount: pt.ElemCount,
+					elemSize:  pt.ElemSize, elemType: pt.ElemType,
 				}
 			}
 		}
@@ -114,10 +118,10 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	retSize := info.Returns
 	if retSize == 0 {
 		retSize = 0 // void function
-	} else if info.ReturnType.StructType != "" {
-		retSize = l.result.Structs[info.ReturnType.StructType].Size
-	} else if info.ReturnType.ArraySize > 0 {
-		retSize = info.ReturnType.ArraySize
+	} else if info.SingleReturn().StructType != "" {
+		retSize = l.result.Structs[info.SingleReturn().StructType].Size
+	} else if ri := info.SingleReturn(); ri.ElemCount > 0 {
+		retSize = ri.ElemCount * max(ri.ElemSize, 1)
 	}
 	rc.retSize = retSize
 
@@ -134,7 +138,7 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	for i, expr := range argExprs {
 		if i < len(info.ParamTypes) {
 			pt := info.ParamTypes[i]
-			if pt.StructType != "" {
+			if pt.StructType != "" && !pt.IsPointer {
 				base, size, err := l.resolveStructArg(expr)
 				if err != nil {
 					return nil, err
@@ -146,12 +150,12 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 				args[i] = argCells{cells, false}
 				continue
 			}
-			if pt.ArraySize > 0 {
+			if pt.ElemCount > 0 {
 				if id, ok := expr.(*ast.Ident); ok {
 					ai, ok := l.lookupArray(id.Name)
 					if ok {
-						cells := make([]Cell, ai.size)
-						for j := range ai.size {
+						cells := make([]Cell, ai.size())
+						for j := range ai.size() {
 							cells[j] = ai.base + j
 						}
 						args[i] = argCells{cells, false}
@@ -161,10 +165,8 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 				if comp, ok := expr.(*ast.CompositeLit); ok {
 					size := l.arraySize(comp.Type)
 					base := l.allocCells(size)
-					arr := arrayInfo{base: base, size: size, count: size, elemSize: 1}
-					if count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(comp.Type); count > 0 && elemSize > 1 {
-						arr = arrayInfo{base: base, size: size, count: count, elemSize: elemSize, elemType: elemType}
-					}
+					count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(comp.Type)
+					arr := arrayInfo{base: base, elemCount: count, elemSize: elemSize, elemType: elemType}
 					for j := range size {
 						l.emit(&IRZero{Dst: base + j})
 					}
@@ -276,12 +278,12 @@ func hasSliceUsage(body *ast.BlockStmt) bool {
 func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 	seen := make(map[string]bool)
 	register := func(name string, info recArrayInfo) {
-		if seen[name] || info.size <= 1 {
+		if seen[name] || info.size() <= 1 {
 			return
 		}
 		seen[name] = true
 		rc.localMap[name] = rc.frameSize
-		rc.frameSize += info.size
+		rc.frameSize += info.size()
 		rc.localArrayInfo[name] = info
 	}
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -290,9 +292,8 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
 				if comp, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
 					count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(comp.Type)
-					size := count * elemSize
-					if size > 0 {
-						register(id.Name, recArrayInfo{size, count, elemSize, elemType})
+					if count*elemSize > 0 {
+						register(id.Name, recArrayInfo{count, elemSize, elemType})
 					} else if def := l.structDef(comp.Type); def != nil {
 						// Struct composite literal: r := Rect{...}
 						if !seen[id.Name] {
@@ -321,11 +322,14 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 				// a := f(...) where f returns an array.
 				if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
 					if fn, ok := call.Fun.(*ast.Ident); ok {
-						if info, ok := l.result.Funcs[fn.Name]; ok && info.ReturnType.ArraySize > 0 {
-							size := info.ReturnType.ArraySize
-							register(id.Name, recArrayInfo{
-								size: size, count: size, elemSize: 1,
-							})
+						if info, ok := l.result.Funcs[fn.Name]; ok {
+							if ri := info.SingleReturn(); ri.ElemCount > 0 {
+								es := max(ri.ElemSize, 1)
+								register(id.Name, recArrayInfo{
+									elemCount: ri.ElemCount,
+									elemSize:  es, elemType: ri.ElemType,
+								})
+							}
 						}
 					}
 				}
@@ -337,10 +341,9 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 				for _, spec := range gd.Specs {
 					if vs, ok := spec.(*ast.ValueSpec); ok {
 						count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(vs.Type)
-						size := count * elemSize
-						if size > 0 {
+						if count*elemSize > 0 {
 							for _, name := range vs.Names {
-								register(name.Name, recArrayInfo{size, count, elemSize, elemType})
+								register(name.Name, recArrayInfo{count, elemSize, elemType})
 							}
 						} else if def := l.structDef(vs.Type); def != nil {
 							for _, name := range vs.Names {
@@ -520,7 +523,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 	// Re-allocate them at the end of the frame, overriding any single-slot
 	// allocation from collectLocals.
 	if rc.retSize > 1 {
-		retType := info.ReturnType.StructType
+		retType := info.SingleReturn().StructType
 		allocated := make(map[string]bool)
 		for _, cs := range callSites {
 			if !allocated[cs.resultVar] {
@@ -1083,10 +1086,10 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 					off := j
 					val := elt
 					if kv, ok := elt.(*ast.KeyValueExpr); ok {
-						off = def.Offsets[kv.Key.(*ast.Ident).Name]
+						off = def.Field[kv.Key.(*ast.Ident).Name].Offset
 						val = kv.Value
 					} else {
-						off = def.Offsets[def.Fields[j]]
+						off = def.Field[def.Fields[j]].Offset
 					}
 					r, err := rl.lowerExpr(val)
 					if err != nil {
@@ -1422,7 +1425,7 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 	for i, arg := range args {
 		if i < len(info.ParamTypes) {
 			pt := info.ParamTypes[i]
-			if pt.StructType != "" {
+			if pt.StructType != "" && !pt.IsPointer {
 				def := rl.result.Structs[pt.StructType]
 				if id, ok := arg.(*ast.Ident); ok {
 					if _, ok := rl.rc.localStructTypes[id.Name]; ok {
@@ -1445,15 +1448,15 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 					}
 				}
 			}
-			if pt.ArraySize > 0 {
+			if pt.ElemCount > 0 {
 				if id, ok := arg.(*ast.Ident); ok {
 					if ai, ok := rl.rc.localArrayInfo[id.Name]; ok {
 						baseSlot := rl.rc.localMap[id.Name]
-						base := rl.allocCells(ai.size)
-						for j := range ai.size {
+						base := rl.allocCells(ai.size())
+						for j := range ai.size() {
 							rl.emit(&IRLoadFrame{Dst: base + j, Slot: baseSlot + j, FrameSize: rl.rc.frameSize})
 						}
-						vals[i] = argVal{base: base, size: ai.size}
+						vals[i] = argVal{base: base, size: ai.size()}
 						continue
 					}
 				}
@@ -1673,7 +1676,7 @@ func (rl *recLowerer) lowerRecVarInit(name string, rhs ast.Expr) error {
 // or 0 if the variable is a scalar.
 func (rl *recLowerer) compositeSize(name string) int {
 	if info, ok := rl.rc.localArrayInfo[name]; ok {
-		return info.size
+		return info.size()
 	}
 	if structType, ok := rl.rc.localStructTypes[name]; ok {
 		return rl.result.Structs[structType].Size
@@ -1698,7 +1701,7 @@ func (rl *recLowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 	if err != nil {
 		return err
 	}
-	return rl.recWriteInto(baseSlot, info.count, idx.Index, r)
+	return rl.recWriteInto(baseSlot, info.elemCount, idx.Index, r)
 }
 
 func (rl *recLowerer) lowerChainedIndexAssign(outerIdx *ast.IndexExpr, innerIndex, rhs ast.Expr) error {
@@ -1724,7 +1727,7 @@ func (rl *recLowerer) lowerChainedIndexAssign(outerIdx *ast.IndexExpr, innerInde
 		return err
 	}
 	if constJ, ok := rl.constValue(innerIndex); ok {
-		rl.emitIfCascade(info.count, idxI.cell, func(i int) {
+		rl.emitIfCascade(info.elemCount, idxI.cell, func(i int) {
 			rl.emit(&IRStoreFrame{Slot: baseSlot + i*info.elemSize + constJ, Src: r.cell, FrameSize: rl.rc.frameSize})
 		})
 	} else {
@@ -1732,7 +1735,7 @@ func (rl *recLowerer) lowerChainedIndexAssign(outerIdx *ast.IndexExpr, innerInde
 		if err != nil {
 			return err
 		}
-		rl.emitIfCascade(info.count, idxI.cell, func(i int) {
+		rl.emitIfCascade(info.elemCount, idxI.cell, func(i int) {
 			rl.emitFrameIndexWrite(baseSlot+i*info.elemSize, info.elemSize, idxJ.cell, r.cell)
 		})
 		if idxJ.temp {
@@ -1762,7 +1765,7 @@ func (rl *recLowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) erro
 				return fmt.Errorf("array %s element is not a struct", id.Name)
 			}
 			def := rl.result.Structs[info.elemType]
-			offset := def.Offsets[sel.Sel.Name]
+			offset := def.Field[sel.Sel.Name].Offset
 			r, err := rl.lowerExpr(rhs)
 			if err != nil {
 				return err
@@ -1793,11 +1796,11 @@ func (rl *recLowerer) resolveFieldSlot(sel *ast.SelectorExpr) (int, error) {
 		}
 		baseSlot := rl.rc.localMap[x.Name]
 		def := rl.result.Structs[structType]
-		offset, ok := def.Offsets[sel.Sel.Name]
+		fi, ok := def.Field[sel.Sel.Name]
 		if !ok {
 			return 0, fmt.Errorf("unknown field %s", sel.Sel.Name)
 		}
-		return baseSlot + offset, nil
+		return baseSlot + fi.Offset, nil
 	case *ast.SelectorExpr:
 		innerSlot, err := rl.resolveFieldSlot(x)
 		if err != nil {
@@ -1807,11 +1810,11 @@ func (rl *recLowerer) resolveFieldSlot(sel *ast.SelectorExpr) (int, error) {
 		if innerDef == nil {
 			return 0, fmt.Errorf("field %s is not a struct", x.Sel.Name)
 		}
-		offset, ok := innerDef.Offsets[sel.Sel.Name]
+		fi, ok := innerDef.Field[sel.Sel.Name]
 		if !ok {
 			return 0, fmt.Errorf("unknown field %s", sel.Sel.Name)
 		}
-		return innerSlot + offset, nil
+		return innerSlot + fi.Offset, nil
 	default:
 		return 0, fmt.Errorf("unsupported selector target in recursive function")
 	}
@@ -1863,7 +1866,7 @@ func (rl *recLowerer) lowerArrayIncDec(idx *ast.IndexExpr, tok token.Token) erro
 	if err != nil {
 		return err
 	}
-	r, err := rl.recIndexInto(baseSlot, info.count, idx.Index)
+	r, err := rl.recIndexInto(baseSlot, info.elemCount, idx.Index)
 	if err != nil {
 		return err
 	}
@@ -1872,7 +1875,7 @@ func (rl *recLowerer) lowerArrayIncDec(idx *ast.IndexExpr, tok token.Token) erro
 	} else {
 		rl.emit(&IRSubI{Dst: r.cell, Value: 1})
 	}
-	return rl.recWriteInto(baseSlot, info.count, idx.Index, r)
+	return rl.recWriteInto(baseSlot, info.elemCount, idx.Index, r)
 }
 
 // lookupArraySlot returns the base frame slot and array info for an array variable.
@@ -1897,10 +1900,10 @@ func (rl *recLowerer) lowerStructCompositeLit(name, structType string, comp *ast
 		off := j
 		val := elt
 		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			off = def.Offsets[kv.Key.(*ast.Ident).Name]
+			off = def.Field[kv.Key.(*ast.Ident).Name].Offset
 			val = kv.Value
 		} else {
-			off = def.Offsets[def.Fields[j]]
+			off = def.Field[def.Fields[j]].Offset
 		}
 		// Handle nested struct literal.
 		if innerComp, ok := val.(*ast.CompositeLit); ok {
@@ -1909,10 +1912,10 @@ func (rl *recLowerer) lowerStructCompositeLit(name, structType string, comp *ast
 					innerOff := k
 					fval := field
 					if kv, ok := field.(*ast.KeyValueExpr); ok {
-						innerOff = innerDef.Offsets[kv.Key.(*ast.Ident).Name]
+						innerOff = innerDef.Field[kv.Key.(*ast.Ident).Name].Offset
 						fval = kv.Value
 					} else {
-						innerOff = innerDef.Offsets[innerDef.Fields[k]]
+						innerOff = innerDef.Field[innerDef.Fields[k]].Offset
 					}
 					r, err := rl.lowerExpr(fval)
 					if err != nil {
@@ -1943,7 +1946,7 @@ func (rl *recLowerer) lowerArrayCompositeLit(name string, comp *ast.CompositeLit
 	if err != nil {
 		return err
 	}
-	size := info.size
+	size := info.size()
 	rl.zeroFrameSlots(baseSlot, size)
 	// Store element values.
 	for j, elt := range comp.Elts {
@@ -1972,10 +1975,10 @@ func (rl *recLowerer) lowerArrayCompositeLit(name string, comp *ast.CompositeLit
 					off := k
 					fval := field
 					if kv, ok := field.(*ast.KeyValueExpr); ok {
-						off = def.Offsets[kv.Key.(*ast.Ident).Name]
+						off = def.Field[kv.Key.(*ast.Ident).Name].Offset
 						fval = kv.Value
 					} else {
-						off = def.Offsets[def.Fields[k]]
+						off = def.Field[def.Fields[k]].Offset
 					}
 					r, err := rl.lowerExpr(fval)
 					if err != nil {
@@ -2123,7 +2126,7 @@ func (rl *recLowerer) emitFrameIndexWrite(baseSlot, size int, idxCell, val Cell)
 
 // emitFrameFieldWrite stores val to a[idx].field using an if-cascade.
 func (rl *recLowerer) emitFrameFieldWrite(baseSlot int, info recArrayInfo, fieldOffset int, idxCell, val Cell) {
-	rl.emitIfCascade(info.count, idxCell, func(j int) {
+	rl.emitIfCascade(info.elemCount, idxCell, func(j int) {
 		rl.emit(&IRStoreFrame{Slot: baseSlot + j*info.elemSize + fieldOffset, Src: val, FrameSize: rl.rc.frameSize})
 	})
 }
@@ -2305,7 +2308,7 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	var limit exprResult
 	if hasVal {
 		t := rl.allocCell()
-		rl.emit(&IRConst{Dst: t, Value: byte(arrInfo.count)}) // #nosec G115
+		rl.emit(&IRConst{Dst: t, Value: byte(arrInfo.elemCount)}) // #nosec G115
 		limit = exprResult{cell: t, temp: true}
 	} else {
 		var err error
@@ -2330,7 +2333,7 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	// Load range value variable each iteration: v = array[key]
 	if hasVal {
 		rl.emit(&IRZero{Dst: valCell})
-		rl.emitFrameIndexRead(arrBaseSlot, arrInfo.count, cell, valCell)
+		rl.emitFrameIndexRead(arrBaseSlot, arrInfo.elemCount, cell, valCell)
 	}
 	if err := rl.lowerLoopBody(s.Body.List); err != nil {
 		return err
@@ -2436,10 +2439,10 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 						var off int
 						var ve ast.Expr
 						if kv, ok := elt.(*ast.KeyValueExpr); ok {
-							off = def.Offsets[kv.Key.(*ast.Ident).Name]
+							off = def.Field[kv.Key.(*ast.Ident).Name].Offset
 							ve = kv.Value
 						} else {
-							off = def.Offsets[def.Fields[j]]
+							off = def.Field[def.Fields[j]].Offset
 							ve = elt
 						}
 						r, err := rl.lowerExpr(ve)
@@ -2606,7 +2609,7 @@ func (rl *recLowerer) lowerRecCompositeCompare(e *ast.BinaryExpr) (exprResult, b
 			return 0, 0, false
 		}
 		if ai, ok := rl.rc.localArrayInfo[id.Name]; ok {
-			return rl.rc.localMap[id.Name], ai.size, true
+			return rl.rc.localMap[id.Name], ai.size(), true
 		}
 		if st, ok := rl.rc.localStructTypes[id.Name]; ok {
 			def := rl.result.Structs[st]
@@ -2681,7 +2684,7 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 		if id, ok := e.Args[0].(*ast.Ident); ok {
 			if ai, ok := rl.rc.localArrayInfo[id.Name]; ok {
 				t := rl.allocCell()
-				rl.emit(&IRConst{Dst: t, Value: byte(ai.count)}) // #nosec G115
+				rl.emit(&IRConst{Dst: t, Value: byte(ai.elemCount)}) // #nosec G115
 				return exprResult{cell: t, temp: true}, nil
 			}
 		}
@@ -2762,7 +2765,7 @@ func (rl *recLowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 			if err != nil {
 				return exprResult{}, err
 			}
-			rl.emitIfCascade(info.count, idxI.cell, func(i int) {
+			rl.emitIfCascade(info.elemCount, idxI.cell, func(i int) {
 				rl.emitFrameIndexRead(baseSlot+i*info.elemSize, info.elemSize, idxJ.cell, result)
 			})
 			if idxJ.temp {
@@ -2789,7 +2792,7 @@ func (rl *recLowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 		}
 		return exprResult{}, fmt.Errorf("variable index on composite array not supported in recursive functions")
 	}
-	return rl.recIndexInto(baseSlot, info.count, e.Index)
+	return rl.recIndexInto(baseSlot, info.elemCount, e.Index)
 }
 
 // emitFrameCompositeRead emits an if-cascade to load a scalar from a composite
@@ -2797,7 +2800,7 @@ func (rl *recLowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 // For each possible index i, checks if idxCell == i and loads from
 // baseSlot + i*elemSize + offset.
 func (rl *recLowerer) emitFrameCompositeRead(baseSlot int, info recArrayInfo, idxCell Cell, offset int, result Cell) {
-	rl.emitIfCascade(info.count, idxCell, func(i int) {
+	rl.emitIfCascade(info.elemCount, idxCell, func(i int) {
 		rl.emit(&IRLoadFrame{Dst: result, Slot: baseSlot + i*info.elemSize + offset, FrameSize: rl.rc.frameSize})
 	})
 }
@@ -2819,7 +2822,7 @@ func (rl *recLowerer) resolveRecFieldDef(e *ast.SelectorExpr) *StructDef {
 	if parentDef == nil {
 		return nil
 	}
-	fieldType := parentDef.FieldTypes[e.Sel.Name]
+	fieldType := parentDef.Field[e.Sel.Name].StructType
 	if fieldType == "" {
 		return nil
 	}
@@ -2838,7 +2841,7 @@ func (rl *recLowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error)
 			return exprResult{}, err
 		}
 		def := rl.result.Structs[info.elemType]
-		offset := def.Offsets[e.Sel.Name]
+		offset := def.Field[e.Sel.Name].Offset
 		return rl.recFieldIndexInto(baseSlot, info, offset, idx.Index)
 	}
 	// Resolve the base: identifier or chained selector (nested struct).
@@ -2871,13 +2874,13 @@ func (rl *recLowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error)
 	if def == nil {
 		return exprResult{}, fmt.Errorf("unsupported selector in recursive function")
 	}
-	offset, ok := def.Offsets[e.Sel.Name]
+	fi, ok := def.Field[e.Sel.Name]
 	if !ok {
 		return exprResult{}, fmt.Errorf("unknown field %s in struct %s", e.Sel.Name, def.Name)
 	}
-	slot := baseSlot + offset
+	slot := baseSlot + fi.Offset
 	// If the field is a nested struct, return the base slot for chained access.
-	if _, isStruct := def.FieldTypes[e.Sel.Name]; isStruct {
+	if fi.StructType != "" {
 		return exprResult{cell: slot}, nil
 	}
 	cell := rl.allocCell()

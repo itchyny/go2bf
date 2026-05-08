@@ -2094,6 +2094,17 @@ func main() {
 }`,
 			"", "3 6\n",
 		},
+		{
+			"tail recursive struct array literal arg",
+			`package main
+type Point struct { x byte; y byte }
+func f(n byte, a [2]Point) byte {
+	if n == 0 { return a[0].x + a[1].y }
+	return f(n-1, [2]Point{Point{1, 2}, Point{3, 4}})
+}
+func main() { println(f(2, [2]Point{Point{1, 2}, Point{3, 4}})) }`,
+			"", "5\n",
+		},
 		// --- General recursion ---
 		{
 			"general rec base case",
@@ -3992,6 +4003,17 @@ func main() { println(f([3]byte{1, 2, 3}, 2)) }`,
 			"", "12\n",
 		},
 		{
+			"struct-array literal arg in recursive function",
+			`package main
+type P struct { x, y byte }
+func f(a [2]P, n byte) byte {
+	if n == 0 { return a[0].x + a[1].y }
+	return f(a, n - 1)
+}
+func main() { print(f([2]P{{1, 2}, {3, 4}}, 2)) }`,
+			"", "5",
+		},
+		{
 			"void recursive function",
 			`package main
 func f(n byte) byte {
@@ -4130,19 +4152,6 @@ func f(n byte) byte {
 }
 func main() { println(f(3)) }`,
 			"", "18\n",
-		},
-		{
-			"zero length array in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	a := [0]byte{}
-	_ = a
-	r := f(n - 1)
-	return r + n
-}
-func main() { println(f(3)) }`,
-			"", "6\n",
 		},
 		{
 			"array inc dec in recursive function",
@@ -5058,26 +5067,6 @@ func main() {
 	}
 }`,
 			"", "255 0 1 0 255 0 1 0",
-		},
-		{
-			"zero length array",
-			`package main
-func main() {
-	a := [0]byte{}
-	_ = a
-	print("Y")
-}`,
-			"", "Y",
-		},
-		{
-			"zero length array equality",
-			`package main
-func main() {
-	a := [0]byte{}
-	b := [0]byte{}
-	if a == b { print("Y") } else { print("N") }
-}`,
-			"", "Y",
 		},
 		{
 			"zero value array literal",
@@ -6331,6 +6320,32 @@ func main() {
 	println(s[0].x, s[0].y, s[1].x, s[1].y)
 }`,
 			"", "11 20 30 45\n",
+		},
+		{
+			"slice of structs uint16 field write",
+			`package main
+type Item struct { count uint16; tag byte }
+func main() {
+	s := make([]Item, 2)
+	s[0].count = uint16(1000); s[0].tag = 7
+	s[1].count = uint16(50000); s[1].tag = 8
+	println(s[0].count, s[0].tag)
+	println(s[1].count, s[1].tag)
+}`,
+			"", "1000 7\n50000 8\n",
+		},
+		{
+			"slice of structs string field write",
+			`package main
+type Entry struct { name string; v byte }
+func main() {
+	s := make([]Entry, 2)
+	s[0].name = "foo"; s[0].v = 10
+	s[1].name = "bar"; s[1].v = 20
+	print(s[0].name); print(" "); println(s[0].v)
+	print(s[1].name); print(" "); println(s[1].v)
+}`,
+			"", "foo 10\nbar 20\n",
 		},
 		{
 			"slice of structs array field",
@@ -7634,6 +7649,31 @@ func main() {
 			"", "YN",
 		},
 		{
+			"struct equality with array uint16 and nested array fields",
+			`package main
+type S struct { a [3]byte; b byte }
+type T struct { v uint16; tag byte }
+type N struct { g [2][3]byte; k byte }
+func main() {
+	s1 := S{a: [3]byte{1, 2, 3}, b: 4}
+	s2 := S{a: [3]byte{1, 2, 3}, b: 4}
+	s3 := S{a: [3]byte{1, 2, 9}, b: 4}
+	t1 := T{v: uint16(1000), tag: 7}
+	t2 := T{v: uint16(1000), tag: 7}
+	t3 := T{v: uint16(2000), tag: 7}
+	n1 := N{g: [2][3]byte{{1,2,3},{4,5,6}}, k: 7}
+	n2 := N{g: [2][3]byte{{1,2,3},{4,5,6}}, k: 7}
+	n3 := N{g: [2][3]byte{{1,2,3},{9,5,6}}, k: 7}
+	if s1 == s2 { print("Y") } else { print("N") }
+	if s1 == s3 { print("Y") } else { print("N") }
+	if t1 == t2 { print("Y") } else { print("N") }
+	if t1 == t3 { print("Y") } else { print("N") }
+	if n1 == n2 { print("Y") } else { print("N") }
+	if n1 == n3 { print("Y") } else { print("N") }
+}`,
+			"", "YNYNYN",
+		},
+		{
 			"nested struct copy from variable",
 			`package main
 type Point struct { x byte; y byte }
@@ -8745,6 +8785,22 @@ func main() {
 			"", "100 2000 60000\n",
 		},
 		{
+			"uint16 array return",
+			`package main
+func f() [3]uint16 {
+	var a [3]uint16
+	a[0] = uint16(100)
+	a[1] = uint16(1000)
+	a[2] = uint16(30000)
+	return a
+}
+func main() {
+	a := f()
+	println(a[0], a[1], a[2])
+}`,
+			"", "100 1000 30000\n",
+		},
+		{
 			"uint32 slice with append and range",
 			`package main
 func main() {
@@ -8791,6 +8847,40 @@ func main() {
 	println(x, y)
 }`,
 			"", "200 60000\n",
+		},
+		{
+			"nested multi-byte array variable index both levels",
+			`package main
+func main() {
+	var a [2][3]uint16
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 3; j++ {
+			a[i][j] = uint16(i)*uint16(10) + uint16(j)
+		}
+	}
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 3; j++ {
+			if i*3+j > 0 { print(" ") }
+			print(a[i][j])
+		}
+	}
+	println()
+}`,
+			"", "0 1 2 10 11 12\n",
+		},
+		{
+			"nested multi-byte array outer var inner const",
+			`package main
+func main() {
+	var a [3][2]uint16
+	a[0][0] = uint16(11); a[0][1] = uint16(22)
+	a[1][0] = uint16(33); a[1][1] = uint16(44)
+	a[2][0] = uint16(55); a[2][1] = uint16(66)
+	for i := byte(0); i < 3; i++ {
+		println(a[i][0], a[i][1])
+	}
+}`,
+			"", "11 22\n33 44\n55 66\n",
 		},
 		{
 			"parenthesized index of multi-byte slice",
@@ -9207,6 +9297,17 @@ func main() {
 	println(t)
 }`,
 			"", "104 hi\n",
+		},
+		{
+			"string and byte-slice conversion of literals and concat",
+			`package main
+func main() {
+	t := []byte("hello"); t[0] = 'X'; println(t)
+	u := string("world"); println(u)
+	a := "foo"; b := "bar"
+	v := []byte(a + b); v[0] = 'Y'; println(v)
+}`,
+			"", "Xello\nworld\nYoobar\n",
 		},
 		{
 			"string compare with literal operand",
@@ -9844,6 +9945,20 @@ func main() {
 	}
 }`,
 			"", "hi\n2\ngo\n2\nby\n2\n",
+		},
+		{
+			"array of byte slices element assign",
+			`package main
+func main() {
+	var a [3][]byte
+	a[0] = []byte{'h', 'i'}
+	a[1] = []byte{'b', 'y', 'e'}
+	a[2] = []byte{'!', '!'}
+	for i := byte(0); i < 3; i++ {
+		println(string(a[i]))
+	}
+}`,
+			"", "hi\nbye\n!!\n",
 		},
 		{
 			"nested struct equality with string field",
@@ -10634,6 +10749,33 @@ func TestCompileError(t *testing.T) {
 			`package main
 func f() {}`,
 			"no main function found",
+		},
+		{
+			"zero-length array local var",
+			`package main
+func main() { var a [0]byte; _ = a }`,
+			"input.go:2:21: zero-length arrays are not supported",
+		},
+		{
+			"zero-length array struct field",
+			`package main
+type T struct { pad [0]byte; v byte }
+func main() { _ = T{v: 1} }`,
+			"input.go:2:21: zero-length arrays are not supported",
+		},
+		{
+			"zero-length array return",
+			`package main
+func f() [0]byte { return [0]byte{} }
+func main() { _ = f() }`,
+			"input.go:2:10: zero-length arrays are not supported",
+		},
+		{
+			"zero-length array via const",
+			`package main
+const N = 0
+func main() { var a [N]byte; _ = a }`,
+			"input.go:3:21: zero-length arrays are not supported",
 		},
 		{
 			"integer overflow",

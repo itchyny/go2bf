@@ -30,63 +30,168 @@ type FuncInfo struct {
 	Returns     int             // total return cell count across all return values
 	ReturnSizes []int           // per-return-value cell counts (nil for all-byte)
 	ReturnNames []string        // named return variable names (nil if unnamed)
-	ReturnType  ReturnInfo      // composite return type info (single-return funcs only)
-	ReturnTypes []ReturnInfo    // per-return composite type info (multi-return funcs)
+	ReturnTypes []ReturnInfo    // per-return composite type info
 	Body        *ast.BlockStmt  // function body AST
 	Calls       map[string]bool // names of user-defined functions called
 	IsRecursive bool            // true if function is (mutually) recursive
 	IsTailRec   bool            // true if all recursive calls are tail calls
 }
 
-// ParamInfo holds a function parameter's name and optional composite type.
-type ParamInfo struct {
-	Name             string
-	ArraySize        int        // >0 if the parameter is an array (total cells)
-	ArrayCount       int        // >0 for arrays: number of elements
-	ArrayElemSize    int        // >0 for arrays: cells per element
-	ArrayElemType    string     // non-empty for arrays of structs
-	ArrayElemIntSize int        // >1 for arrays of multi-byte integers
-	ArrayElemSlice   bool       // true for arrays of slices ([N]string, [N][]byte)
-	StructType       string     // non-empty if the parameter is a struct type
-	IsSlice          bool       // true if []byte or []StructType
-	IsPointer        bool       // true if *byte, *[N]byte, *uintN, or *StructType
-	IntSize          int        // >1 for multi-byte integers (2, 4, or 8)
-	PtrArrayInfo     *ParamInfo // non-nil for *[N]byte -- inner array info
-	PtrStructType    string     // non-empty for *StructType
-	PtrIntSize       int        // >1 for *uintN -- pointed-to integer width
+// TypeInfo describes a Go type at the analyzer level. The same shape
+// is used for parameters and return values; ParamInfo just adds a Name.
+//
+// Pointer types use IsPointer in combination with the target's other
+// fields: *uintN sets IntSize, *Struct sets StructType, *[N]T sets
+// the Elem* fields. Slices set IsSlice plus the Elem* fields.
+type TypeInfo struct {
+	IntSize     int    // >1 for uintN (or *uintN target if IsPointer)
+	StructType  string // struct name (or *Struct target if IsPointer)
+	IsSlice     bool   // slice header type
+	IsPointer   bool   // pointer type
+	ElemCount   int    // element count for [N]T (>0 marks array)
+	ElemSize    int    // cell width of one element (arrays, slices)
+	ElemType    string // struct type of array/slice elements
+	ElemIntSize int    // >1 for arrays/slices of multi-byte ints
+	ElemSlice   bool   // true if elements are themselves slices
 }
 
-// ReturnInfo describes a function's return type.
-type ReturnInfo struct {
-	ArraySize        int    // >0 if returning a [N]byte or *[N]byte
-	StructType       string // non-empty if returning a struct
-	IsSlice          bool   // true if returning a slice
-	IsPointer        bool   // true if returning a pointer (*[N]byte)
-	SliceElemSize    int    // cells per slice element (1 for byte)
-	SliceElemType    string // struct type name for slice elements
-	SliceElemIntSize int    // >1 for slices of multi-byte integers
-	SliceElemSlice   bool   // true for slice of slices ([]string, [][]byte)
-	IntSize          int    // >1 for multi-byte integer returns (2, 4, or 8)
+// ParamInfo holds a function parameter's name and type info.
+type ParamInfo struct {
+	Name string
+	TypeInfo
+}
+
+// SingleReturn returns the composite type info for a single-return
+// function, or a zero ReturnInfo for void/multi-return functions.
+// Single-return is the common case where many lowerer paths want to
+// look at the function's return shape directly.
+func (info *FuncInfo) SingleReturn() ReturnInfo {
+	if len(info.ReturnTypes) == 1 {
+		return info.ReturnTypes[0]
+	}
+	return ReturnInfo{}
+}
+
+// ReturnInfo describes a function's return type. Same shape as TypeInfo.
+type ReturnInfo = TypeInfo
+
+// FieldInfo holds per-field metadata: cell offset and shape info
+// describing whether the field is a byte, multi-byte int, struct,
+// array (flat or nested), slice, or string. A field is at most one
+// of struct/int/array/slice, so the Elem* names are shared between
+// array and slice fields.
+type FieldInfo struct {
+	Offset       int    // cell offset within the struct
+	StructType   string // non-empty for struct-typed fields
+	IntSize      int    // >1 for uintN fields (2, 4, or 8)
+	IsString     bool   // true for string or []byte fields (3-cell header, byte elements)
+	IsSlice      bool   // true for any slice-typed field
+	ElemCount    int    // >0 for array fields: outer element count of [N]T
+	ElemSize     int    // cell width of one element (slices; >0 for any slice field)
+	ElemType     string // struct type of array/slice elements (also innermost struct of nested array)
+	ElemIntSize  int    // int width of element ([N]uintN or []uintN)
+	ElemSlice    bool   // true for [][]T or []string slice fields
+	InnerSize    int    // for nested array fields ([N][M]T), inner array cell count
+	InnerIntSize int    // for [N][M]uintN, innermost int width
 }
 
 // StructDef holds a struct type definition.
 type StructDef struct {
-	Name                  string
-	Fields                []string          // field names in order
-	Offsets               map[string]int    // field name -> offset
-	FieldTypes            map[string]string // field name -> struct type name (empty for byte)
-	FieldArraySizes       map[string]int    // field name -> array size (0 for non-array)
-	FieldInnerSizes       map[string]int    // field name -> inner element size for nested array fields
-	FieldInnerIntSize     map[string]int    // field name -> innermost int width for [N][M]uintN nested array fields
-	FieldArrayElemIntSize map[string]int    // field name -> element width for multi-byte int array fields
-	FieldArrayElemType    map[string]string // field name -> struct type name of array elements (for [N]Item)
-	FieldIntSizes         map[string]int    // field name -> integer size (2, 4, or 8)
-	FieldStrings          map[string]bool   // field name -> true if string or []byte (3-cell header, byte elements)
-	FieldSliceElemSize    map[string]int    // field name -> slice element cells (>0 for any slice field)
-	FieldSliceElemType    map[string]string // field name -> slice element struct type ([]Struct fields)
-	FieldSliceElemIntSize map[string]int    // field name -> slice element int width ([]uintN fields)
-	FieldSliceElemSlice   map[string]bool   // field name -> true if slice element is itself a slice ([][]T fields)
-	Size                  int               // total number of cells
+	Name   string
+	Fields []string             // field names in order
+	Field  map[string]FieldInfo // per-field metadata (offset + shape)
+	Size   int                  // total number of cells
+}
+
+// analyzeFieldType derives the FieldInfo for a struct field's type
+// expression and returns its cell size. Used by both the analyzer and
+// the lowerer's local-struct-decl path.
+func analyzeFieldType(typ ast.Expr, structs map[string]*StructDef) (FieldInfo, int) {
+	var fi FieldInfo
+	if id, ok := typ.(*ast.Ident); ok {
+		if nested, ok := structs[id.Name]; ok {
+			fi.StructType = id.Name
+			return fi, nested.Size
+		}
+		if n := intIdentSize(id.Name); n > 0 {
+			fi.IntSize = n
+			return fi, n
+		}
+		if id.Name == "string" {
+			fi.IsString = true
+			fi.IsSlice = true
+			fi.ElemSize = 1
+			return fi, 3
+		}
+		return fi, 1
+	}
+	if at, ok := typ.(*ast.ArrayType); ok && at.Len == nil {
+		// Slice field: 3-cell header.
+		fi.IsSlice = true
+		fi.ElemSize = 1
+		if eltID, ok := at.Elt.(*ast.Ident); ok {
+			if eltID.Name == "byte" {
+				fi.IsString = true
+			} else if eltID.Name == "string" {
+				fi.ElemSize = 3
+				fi.ElemSlice = true
+			} else if n := intIdentSize(eltID.Name); n > 0 {
+				fi.ElemSize = n
+				fi.ElemIntSize = n
+			} else if structDef, ok := structs[eltID.Name]; ok {
+				fi.ElemSize = structDef.Size
+				fi.ElemType = eltID.Name
+			}
+		} else if eltAt, ok := at.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
+			fi.ElemSize = 3
+			fi.ElemSlice = true
+		}
+		return fi, 3
+	}
+	if at, ok := typ.(*ast.ArrayType); ok && at.Len != nil {
+		arrSize, ies, iis := arrayFieldInfo(typ)
+		if arrSize > 0 {
+			fi.ElemCount = arrayTypeSize(typ)
+			innermost := at.Elt
+			for nat, ok := innermost.(*ast.ArrayType); ok && nat.Len != nil; nat, ok = innermost.(*ast.ArrayType) {
+				innermost = nat.Elt
+			}
+			if eltID, ok := innermost.(*ast.Ident); ok {
+				if n := intIdentSize(eltID.Name); n > 0 && innermost == at.Elt {
+					fi.ElemIntSize = n
+				} else if structDef, ok := structs[eltID.Name]; ok {
+					fi.ElemType = eltID.Name
+					// arrayFieldInfo treated struct as 1 byte; rescale total cells.
+					arrSize *= structDef.Size
+					ies *= structDef.Size
+				}
+			}
+			fi.InnerSize = ies
+			fi.InnerIntSize = iis
+			return fi, arrSize
+		}
+	}
+	return fi, 1
+}
+
+// findZeroLengthArray walks `typ` (recursing through nested arrays and
+// pointer indirection) and returns the position of the first `[0]T` it
+// finds, if any. `consts` is consulted so `const N = 0; [N]T` is caught
+// alongside the literal form.
+func findZeroLengthArray(typ ast.Expr, consts map[string]byte) (token.Pos, bool) {
+	for {
+		switch t := typ.(type) {
+		case *ast.ArrayType:
+			if t.Len != nil && arrayTypeSizePart(t.Len, consts) == 0 {
+				return t.Pos(), true
+			}
+			typ = t.Elt
+		case *ast.StarExpr:
+			typ = t.X
+		default:
+			return 0, false
+		}
+	}
 }
 
 // arrayFieldInfo returns (totalSize, innerElemSize, innerIntSize) for an
@@ -136,7 +241,7 @@ func returnTypeInfo(typ ast.Expr, structs map[string]*StructDef) (int, ReturnInf
 		}
 		if t.Name == "string" {
 			info.IsSlice = true
-			info.SliceElemSize = 1
+			info.ElemSize = 1
 			return 3, info
 		}
 		if def, ok := structs[t.Name]; ok {
@@ -147,38 +252,62 @@ func returnTypeInfo(typ ast.Expr, structs map[string]*StructDef) (int, ReturnInf
 		if t.Len == nil {
 			// Slice type: 3-cell header.
 			info.IsSlice = true
-			info.SliceElemSize = 1
+			info.ElemSize = 1
 			if id, ok := t.Elt.(*ast.Ident); ok {
 				if def, ok := structs[id.Name]; ok {
-					info.SliceElemSize = def.Size
-					info.SliceElemType = id.Name
+					info.ElemSize = def.Size
+					info.ElemType = id.Name
 				} else if n := intIdentSize(id.Name); n > 0 {
-					info.SliceElemSize = n
-					info.SliceElemIntSize = n
+					info.ElemSize = n
+					info.ElemIntSize = n
 				} else if id.Name == "string" {
-					info.SliceElemSize = 3
-					info.SliceElemSlice = true
+					info.ElemSize = 3
+					info.ElemSlice = true
 				}
 			}
 			if eltAt, ok := t.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
-				info.SliceElemSize = 3
-				info.SliceElemSlice = true
+				info.ElemSize = 3
+				info.ElemSlice = true
 			}
 			if size := arrayTypeSize(t.Elt); size > 0 {
-				info.SliceElemSize = size
+				info.ElemSize = size
 			}
 			return 3, info
 		}
 		// Array type [N]T.
-		if size := arrayTypeSize(t); size > 0 {
-			info.ArraySize = size
-			return size, info
+		if count := arrayTypeSize(t); count > 0 {
+			elemSize, elemType, elemIntSize := 1, "", 0
+			if id, ok := t.Elt.(*ast.Ident); ok {
+				if def, ok := structs[id.Name]; ok {
+					elemSize = def.Size
+					elemType = id.Name
+				} else if n := intIdentSize(id.Name); n > 0 {
+					elemSize = n
+					elemIntSize = n
+				}
+			}
+			info.ElemCount = count
+			info.ElemSize = elemSize
+			info.ElemType = elemType
+			info.ElemIntSize = elemIntSize
+			return count * elemSize, info
 		}
 	case *ast.StarExpr:
-		if size := arrayTypeSize(t.X); size > 0 {
-			info.ArraySize = size
-			info.IsPointer = true
-			return 1, info
+		if at, ok := t.X.(*ast.ArrayType); ok {
+			if count := arrayTypeSize(t.X); count > 0 {
+				elemSize, elemType := 1, ""
+				if id, ok := at.Elt.(*ast.Ident); ok {
+					if def, ok := structs[id.Name]; ok {
+						elemSize = def.Size
+						elemType = id.Name
+					}
+				}
+				info.ElemCount = count
+				info.ElemSize = elemSize
+				info.ElemType = elemType
+				info.IsPointer = true
+				return 1, info
+			}
 		}
 		if id, ok := t.X.(*ast.Ident); ok {
 			if _, ok := structs[id.Name]; ok {
@@ -320,131 +449,20 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 						continue
 					}
 					def := &StructDef{
-						Name:                  ts.Name.Name,
-						Offsets:               make(map[string]int),
-						FieldTypes:            make(map[string]string),
-						FieldArraySizes:       make(map[string]int),
-						FieldInnerSizes:       make(map[string]int),
-						FieldInnerIntSize:     make(map[string]int),
-						FieldArrayElemIntSize: make(map[string]int),
-						FieldArrayElemType:    make(map[string]string),
-						FieldIntSizes:         make(map[string]int),
-						FieldStrings:          make(map[string]bool),
-						FieldSliceElemSize:    make(map[string]int),
-						FieldSliceElemType:    make(map[string]string),
-						FieldSliceElemIntSize: make(map[string]int),
-						FieldSliceElemSlice:   make(map[string]bool),
+						Name:  ts.Name.Name,
+						Field: make(map[string]FieldInfo),
 					}
 					offset := 0
 					for _, field := range st.Fields.List {
-						fieldSize := 1 // default: byte
-						fieldType := ""
-						fieldArraySize := 0
-						fieldArrayElemIntSize := 0
-						fieldArrayElemType := ""
-						fieldIsString := false
-						fieldSliceElemSize := 0
-						fieldSliceElemType := ""
-						fieldSliceElemIntSize := 0
-						fieldSliceElemSlice := false
-						if id, ok := field.Type.(*ast.Ident); ok {
-							if nested, ok := result.Structs[id.Name]; ok {
-								fieldSize = nested.Size
-								fieldType = id.Name
-							} else if n := intIdentSize(id.Name); n > 0 {
-								fieldSize = n
-							} else if id.Name == "string" {
-								fieldSize = 3 // ptr, len, cap
-								fieldIsString = true
-								fieldSliceElemSize = 1
-							}
-						} else if at, ok := field.Type.(*ast.ArrayType); ok && at.Len == nil {
-							// Slice field: 3-cell header (ptr, len, cap).
-							fieldSize = 3
-							fieldSliceElemSize = 1
-							if eltID, ok := at.Elt.(*ast.Ident); ok {
-								if eltID.Name == "byte" {
-									fieldIsString = true
-								} else if eltID.Name == "string" {
-									fieldSliceElemSize = 3
-									fieldSliceElemSlice = true
-								} else if n := intIdentSize(eltID.Name); n > 0 {
-									fieldSliceElemSize = n
-									fieldSliceElemIntSize = n
-								} else if structDef, ok := result.Structs[eltID.Name]; ok {
-									fieldSliceElemSize = structDef.Size
-									fieldSliceElemType = eltID.Name
-								}
-							} else if eltAt, ok := at.Elt.(*ast.ArrayType); ok && eltAt.Len == nil {
-								// `[][]T` -- element is itself a slice header.
-								fieldSliceElemSize = 3
-								fieldSliceElemSlice = true
-							}
-						} else if at, ok := field.Type.(*ast.ArrayType); ok && at.Len != nil {
-							arrSize, ies, iis := arrayFieldInfo(field.Type)
-							if arrSize > 0 {
-								fieldSize = arrSize
-								fieldArraySize = arrSize
-								// Detect [N]uintN, [N]Struct element type, plus
-								// [N][M]Struct innermost-struct via walk to ident.
-								innermost := at.Elt
-								for nat, ok := innermost.(*ast.ArrayType); ok && nat.Len != nil; nat, ok = innermost.(*ast.ArrayType) {
-									innermost = nat.Elt
-								}
-								if eltID, ok := innermost.(*ast.Ident); ok {
-									if n := intIdentSize(eltID.Name); n > 0 && innermost == at.Elt {
-										fieldArrayElemIntSize = n
-									} else if structDef, ok := result.Structs[eltID.Name]; ok {
-										fieldArrayElemType = eltID.Name
-										// arrayFieldInfo treated struct as 1 byte;
-										// rescale by struct size.
-										fieldSize = arrSize * structDef.Size
-										fieldArraySize = arrSize * structDef.Size
-										ies *= structDef.Size
-									}
-								}
-								if ies > 0 {
-									for _, name := range field.Names {
-										def.FieldInnerSizes[name.Name] = ies
-										if iis > 0 {
-											def.FieldInnerIntSize[name.Name] = iis
-										}
-									}
-								}
-							}
+						if pos, ok := findZeroLengthArray(field.Type, result.ByteConsts); ok {
+							return nil, fmt.Errorf("%s: zero-length arrays are not supported", fset.Position(pos))
 						}
+						fi, fieldSize := analyzeFieldType(field.Type, result.Structs)
 						for _, name := range field.Names {
 							def.Fields = append(def.Fields, name.Name)
-							def.Offsets[name.Name] = offset
-							if fieldType != "" {
-								def.FieldTypes[name.Name] = fieldType
-							}
-							if fieldArraySize > 0 {
-								def.FieldArraySizes[name.Name] = fieldArraySize
-							}
-							if fieldArrayElemIntSize > 0 {
-								def.FieldArrayElemIntSize[name.Name] = fieldArrayElemIntSize
-							}
-							if fieldArrayElemType != "" {
-								def.FieldArrayElemType[name.Name] = fieldArrayElemType
-							}
-							if fieldIsString {
-								def.FieldStrings[name.Name] = true
-							} else if fieldSliceElemSize == 0 && fieldSize >= 2 && fieldType == "" && fieldArraySize == 0 {
-								def.FieldIntSizes[name.Name] = fieldSize
-							}
-							if fieldSliceElemSize > 0 {
-								def.FieldSliceElemSize[name.Name] = fieldSliceElemSize
-								if fieldSliceElemType != "" {
-									def.FieldSliceElemType[name.Name] = fieldSliceElemType
-								}
-								if fieldSliceElemIntSize > 0 {
-									def.FieldSliceElemIntSize[name.Name] = fieldSliceElemIntSize
-								}
-								if fieldSliceElemSlice {
-									def.FieldSliceElemSlice[name.Name] = true
-								}
-							}
+							info := fi
+							info.Offset = offset
+							def.Field[name.Name] = info
 							offset += fieldSize
 						}
 					}
@@ -487,7 +505,8 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			// Prepend receiver as first parameter for methods.
 			if fn.Recv != nil && len(fn.Recv.List) == 1 {
 				recvField := fn.Recv.List[0]
-				var structType, ptrStructType string
+				var structType string
+				var isPointer bool
 				if recvType, ok := recvField.Type.(*ast.Ident); ok {
 					if _, ok := result.Structs[recvType.Name]; ok {
 						structType = recvType.Name
@@ -495,17 +514,19 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 				} else if star, ok := recvField.Type.(*ast.StarExpr); ok {
 					if recvType, ok := star.X.(*ast.Ident); ok {
 						if _, ok := result.Structs[recvType.Name]; ok {
-							ptrStructType = recvType.Name
+							structType = recvType.Name
+							isPointer = true
 						}
 					}
 				}
 				for _, name := range recvField.Names {
 					info.Params = append(info.Params, name.Name)
 					info.ParamTypes = append(info.ParamTypes, ParamInfo{
-						Name:          name.Name,
-						StructType:    structType,
-						IsPointer:     ptrStructType != "",
-						PtrStructType: ptrStructType,
+						Name: name.Name,
+						TypeInfo: TypeInfo{
+							StructType: structType,
+							IsPointer:  isPointer,
+						},
 					})
 				}
 			}
@@ -513,6 +534,9 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			// Extract parameter names and types.
 			if fn.Type.Params != nil {
 				for _, field := range fn.Type.Params.List {
+					if pos, ok := findZeroLengthArray(field.Type, result.ByteConsts); ok {
+						return nil, fmt.Errorf("%s: zero-length arrays are not supported", fset.Position(pos))
+					}
 					var pi ParamInfo
 					if at, ok := field.Type.(*ast.ArrayType); ok {
 						if at.Len == nil {
@@ -542,12 +566,11 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							} else if innerSize := arrayTypeSize(at.Elt); innerSize > 0 {
 								elemSize = innerSize
 							}
-							pi.ArraySize = count * elemSize
-							pi.ArrayCount = count
-							pi.ArrayElemSize = elemSize
-							pi.ArrayElemType = elemType
-							pi.ArrayElemIntSize = elemIntSize
-							pi.ArrayElemSlice = elemSlice
+							pi.ElemCount = count
+							pi.ElemSize = elemSize
+							pi.ElemType = elemType
+							pi.ElemIntSize = elemIntSize
+							pi.ElemSlice = elemSlice
 						}
 					} else if id, ok := field.Type.(*ast.Ident); ok {
 						if _, ok := result.Structs[id.Name]; ok {
@@ -556,13 +579,13 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							pi.IntSize = n
 						} else if id.Name == "string" {
 							pi.IsSlice = true
-							pi.ArrayElemSize = 1
+							pi.ElemSize = 1
 						}
 					} else if star, ok := field.Type.(*ast.StarExpr); ok {
 						pi.IsPointer = true
 						if id, ok := star.X.(*ast.Ident); ok {
 							if n := intIdentSize(id.Name); n > 0 {
-								pi.PtrIntSize = n
+								pi.IntSize = n
 							}
 						}
 						if at, ok := star.X.(*ast.ArrayType); ok {
@@ -576,16 +599,13 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 										elemType = eid.Name
 									}
 								}
-								pi.PtrArrayInfo = &ParamInfo{
-									ArraySize:     count * elemSize,
-									ArrayCount:    count,
-									ArrayElemSize: elemSize,
-									ArrayElemType: elemType,
-								}
+								pi.ElemCount = count
+								pi.ElemSize = elemSize
+								pi.ElemType = elemType
 							}
 						} else if id, ok := star.X.(*ast.Ident); ok {
 							if _, ok := result.Structs[id.Name]; ok {
-								pi.PtrStructType = id.Name
+								pi.StructType = id.Name
 							}
 						}
 					}
@@ -600,6 +620,9 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			// Count return values and detect composite return types.
 			if fn.Type.Results != nil {
 				for _, field := range fn.Type.Results.List {
+					if pos, ok := findZeroLengthArray(field.Type, result.ByteConsts); ok {
+						return nil, fmt.Errorf("%s: zero-length arrays are not supported", fset.Position(pos))
+					}
 					retSize, retInfo := returnTypeInfo(field.Type, result.Structs)
 					count := 1
 					if len(field.Names) > 0 {
@@ -614,10 +637,6 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					}
 					info.Returns += count * retSize
 				}
-				// Single-return: surface the composite info on ReturnType.
-				if len(info.ReturnSizes) == 1 && len(fn.Type.Results.List) == 1 {
-					info.ReturnType = info.ReturnTypes[0]
-				}
 			}
 
 			result.Funcs[funcName] = info
@@ -628,9 +647,19 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 		return nil, fmt.Errorf("no main function found")
 	}
 
-	// Build call graph: find calls to user-defined functions.
+	// Build call graph (and reject zero-length arrays inside function bodies).
 	for _, info := range result.Funcs {
+		var rejErr error
 		ast.Inspect(info.Body, func(n ast.Node) bool {
+			if rejErr != nil {
+				return false
+			}
+			if at, ok := n.(*ast.ArrayType); ok && at.Len != nil &&
+				arrayTypeSizePart(at.Len, result.ByteConsts) == 0 {
+				rejErr = fmt.Errorf("%s: zero-length arrays are not supported",
+					fset.Position(at.Pos()))
+				return false
+			}
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -644,6 +673,9 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			}
 			return true
 		})
+		if rejErr != nil {
+			return nil, rejErr
+		}
 	}
 
 	// Detect recursion and tail-call recursion.
