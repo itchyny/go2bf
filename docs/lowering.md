@@ -81,6 +81,9 @@ The shape entry points compose:
   (`[N]byte`, `[]uint16`, `Point`).
 - `shapeOfCall(call)` -- shape from a function call (string casts,
   `make`, `append`, user functions returning slices).
+- `shapeOfField(fi)` -- shape from a `FieldInfo`; used by `shapeOf`'s
+  `SelectorExpr` case and by `lowerSelectorExpr`'s value-base path so
+  shape inference and field reads share the same dispatch.
 - `elementShapeOf(parent)` -- the shape of an element of a slice or
   array shape; composes via `shapeOf(expr.X)` for `IndexExpr`.
 - `arrayShapeFrom(ai)`, `sliceShapeFrom(si)`, `byteSliceShape()`,
@@ -706,6 +709,22 @@ Mixed access patterns are supported:
   `assignSliceStructField`: `ptrDynIndex` to the element address,
   add the field offset, `ptrStore` cell-by-cell. Handles byte,
   multi-byte int, and slice-typed (string, `[]T`) fields.
+- Pointer-typed struct fields (`type W struct { p *T }`) take 1 cell
+  holding the pointee's slot index. `analyzeFieldType` sets both
+  `FieldInfo.IsPointer` and `FieldInfo.StructType` so the lowerer
+  can distinguish `p *T` from an inline `p T` field. Reading
+  `out.p` loads the slot via `ptrLoad` (when the parent base is a
+  pointer) or returns the cell with `isPointer: true, structType: T`
+  (when the parent is a value), and chained `out.p.v` traverses
+  through the pointer normally. The size-1 struct shortcut in
+  `lowerSelectorExpr`'s `IndexExpr` case (used for one-cell struct
+  elements like `[]W` where `W = struct{ p *T }`) honors the same
+  field metadata so `s[i].p.v` works. The struct-literal initializer
+  in `lowerStructValueTo` copies the slot index for pointer fields
+  rather than recursing as if they were inline structs. `&w.p` is
+  not taken (Go's auto-addressing for pointer-receiver methods is
+  satisfied by `w.p` already being a pointer); `isPointerReceiver`
+  detects this case so `prependReceiver` doesn't wrap.
 
 Pointer types are tracked both for local assignments (`ptr := &myStruct`)
 and for typed pointer parameters (`func f(p *Point)`, `func f(a *[3]byte)`).
@@ -1011,9 +1030,32 @@ eliminates all return-flag guards in that function, since
 
 ### Break and Continue
 
-Implemented via flag cells. `break` sets a break flag that guards each
-subsequent iteration. `continue` sets a continue flag that skips the
-rest of the loop body.
+Each loop allocates two flag cells: `loopSkipFlag` (set by either
+`break` or `continue`, skips the rest of the body via the
+`emitSkipGuard` mechanism above) and `loopBreakFlag` (set only by
+`break`, gates the loop's post + condition under `!loopBreakFlag` and
+zeros the loop's `condCell` so the loop exits). At the top of each
+iteration both flags reset to 0; after the body, `loopSkipFlag` is
+cleared so `continue` doesn't bleed into post/cond.
+
+`break label` and `continue label` walk an explicit `loopFrames`
+stack on the lowerer. Each `for`/`range` push a frame holding its
+`(label, skipFlag, breakFlag)` and pop on exit; the label is
+captured by `lowerLabeledStmt` into `pendingLabel`, consumed by the
+next loop. `emitLabeledBranch` then walks the frames from innermost
+outward, setting `skipFlag` + `breakFlag` on every loop up to (and,
+for `break`, including) the labeled one. This way each enclosing
+loop's post/cond block sees its own `loopBreakFlag = 1` and exits
+cleanly; control unwinds one nest at a time without any non-local
+jump. `continue label` differs only in that the labeled loop's own
+`breakFlag` stays 0, so its post/cond runs and it iterates to the
+next round.
+
+The recursive lowerer (`lowerer_rec.go`) embeds `*Lowerer`, so both
+lowerers share the `loopFrames` stack and `emitLabeledBranch`. The
+recursive `lowerFor`/`lowerRange` push/pop the same way, with their
+own dedicated `lowerLabeledStmt` so the inner statement is dispatched
+through `recLowerer.lowerStmt` rather than the embedded base.
 
 ## Defer
 

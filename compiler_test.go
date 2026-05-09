@@ -581,6 +581,34 @@ func main() {
 }`,
 			"", "013467",
 		},
+		{
+			"labeled break",
+			`package main
+func main() {
+outer:
+	for i := byte(0); i < 4; i++ {
+		for j := byte(0); j < 4; j++ {
+			if i*j > 3 { break outer }
+			print(i, j)
+		}
+	}
+}`,
+			"", "00010203101112132021",
+		},
+		{
+			"labeled continue",
+			`package main
+func main() {
+outer:
+	for i := byte(0); i < 4; i++ {
+		for j := byte(0); j < 4; j++ {
+			if j == 2 { continue outer }
+			print(i, j)
+		}
+	}
+}`,
+			"", "0001101120213031",
+		},
 		// --- Return ---
 		{
 			"return in main",
@@ -1746,6 +1774,17 @@ func main() {
 			"", "5 6 7\n",
 		},
 		{
+			"multi return spread into another call",
+			`package main
+func splitNum() (byte, byte) { return 17, 5 }
+func divmod(x, y byte) (byte, byte) { return x / y, x % y }
+func main() {
+	q, r := divmod(splitNum())
+	println(q, r)
+}`,
+			"", "3 2\n",
+		},
+		{
 			"expression statement call",
 			`package main
 func emit(c byte) byte { putchar(c); return 0 }
@@ -2159,6 +2198,17 @@ func factorial(n byte) byte {
 }
 func main() { putchar(factorial(5)) }`,
 			"", "x", // 5! = 120 = 'x'
+		},
+		{
+			"general rec named return with bare return",
+			`package main
+func sum(n byte) (r byte) {
+	if n == 0 { return }
+	r = n + sum(n - 1)
+	return
+}
+func main() { println(sum(10)) }`,
+			"", "55\n",
 		},
 		{
 			"print in recursive function",
@@ -7832,6 +7882,30 @@ func main() { println(makePoint(1, 2).scale(3).sum()) }`,
 			"", "9\n",
 		},
 		{
+			"chained pointer-returning method calls",
+			`package main
+type Stack struct { v [5]byte; n byte }
+func (s *Stack) push(x byte) *Stack { s.v[s.n] = x; s.n++; return s }
+func (s *Stack) pop() byte { s.n--; return s.v[s.n] }
+func main() {
+	s := &Stack{}
+	s.push(1).push(2).push(3)
+	println(s.pop(), s.pop(), s.pop())
+}`,
+			"", "3 2 1\n",
+		},
+		{
+			"explicit address-of in method call receiver",
+			`package main
+type Box struct { v byte }
+func (b *Box) square() byte { return b.v * b.v }
+func main() {
+	b := Box{v: 6}
+	println((&b).square())
+}`,
+			"", "36\n",
+		},
+		{
 			"method call on function return as statement",
 			`package main
 type W struct { n byte }
@@ -9390,6 +9464,17 @@ func main() {
 			"", "1 2 3\n",
 		},
 		{
+			"slice field copy bind",
+			`package main
+type S struct { vals []uint16 }
+func main() {
+	s := S{vals: []uint16{uint16(100), uint16(200)}}
+	t := s.vals
+	println(len(t), t[0], t[1])
+}`,
+			"", "2 100 200\n",
+		},
+		{
 			"struct slice field write through index",
 			`package main
 type Q struct{ x byte }
@@ -10250,6 +10335,68 @@ func main() {
 	print(p.x + p.y)
 }`,
 			"", "10 30",
+		},
+		{
+			"pointer-typed struct field read and write",
+			`package main
+type Inner struct { v byte }
+type Outer struct { id byte; p *Inner; tag byte }
+func main() {
+	in := Inner{v: 42}
+	out := Outer{id: 7, p: &in, tag: 99}
+	println(out.id, out.tag)
+	println(out.p.v)
+	out.p.v = 100
+	println(in.v, out.p.v)
+}`,
+			"", "7 99\n42\n100 100\n",
+		},
+		{
+			"pointer-typed struct field in slice element",
+			`package main
+type N struct { v byte }
+type W struct { p *N; tag byte }
+func main() {
+	a := N{v: 10}
+	b := N{v: 20}
+	s := []W{W{p: &a, tag: 1}, W{p: &b, tag: 2}}
+	println(s[0].p.v, s[0].tag)
+	println(s[1].p.v, s[1].tag)
+	s[0].p.v = 99
+	println(a.v)
+}`,
+			"", "10 1\n20 2\n99\n",
+		},
+		{
+			"pointer-typed struct field in array element",
+			`package main
+type N struct { v byte }
+type W struct { p *N }
+func main() {
+	a := N{v: 1}
+	b := N{v: 2}
+	arr := [2]W{W{p: &a}, W{p: &b}}
+	for _, w := range arr {
+		print(w.p.v); print(" ")
+	}
+	println()
+}`,
+			"", "1 2 \n",
+		},
+		{
+			"method call through pointer-typed struct field",
+			`package main
+type N struct { v byte }
+func (n *N) inc() { n.v++ }
+type W struct { p *N }
+func main() {
+	x := N{v: 10}
+	w := W{p: &x}
+	w.p.inc()
+	w.p.inc()
+	println(x.v)
+}`,
+			"", "12\n",
 		},
 		{
 			"nested struct field via pointer",
@@ -11457,6 +11604,16 @@ func f(n byte) byte {
 }
 func main() { print(f(1)) }`,
 			"slices in recursive functions are not supported",
+		},
+		{
+			"slice parameter in recursive function",
+			`package main
+func gen(n byte, acc []byte) []byte {
+	if n == 0 { return acc }
+	return gen(n - 1, append(acc, n))
+}
+func main() { _ = gen(3, []byte{}) }`,
+			"slice parameter acc in recursive function gen is not supported",
 		},
 		{
 			"slice nesting too deep",

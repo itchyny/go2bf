@@ -82,10 +82,11 @@ type ReturnInfo = TypeInfo
 // array and slice fields.
 type FieldInfo struct {
 	Offset       int    // cell offset within the struct
-	StructType   string // non-empty for struct-typed fields
+	StructType   string // non-empty for struct-typed fields (or pointer of struct)
 	IntSize      int    // >1 for uintN fields (2, 4, or 8)
 	IsString     bool   // true for string or []byte fields (3-cell header, byte elements)
 	IsSlice      bool   // true for any slice-typed field
+	IsPointer    bool   // true for pointer-typed fields
 	ElemCount    int    // >0 for array fields: outer element count of [N]T
 	ElemSize     int    // cell width of one element (slices; >0 for any slice field)
 	ElemType     string // struct type of array/slice elements (also innermost struct of nested array)
@@ -169,6 +170,16 @@ func analyzeFieldType(typ ast.Expr, structs map[string]*StructDef) (FieldInfo, i
 			fi.InnerSize = ies
 			fi.InnerIntSize = iis
 			return fi, arrSize
+		}
+	}
+	// Pointer-to-struct field (`*T`): 1 cell holding the slot index.
+	if star, ok := typ.(*ast.StarExpr); ok {
+		if id, ok := star.X.(*ast.Ident); ok {
+			if _, ok := structs[id.Name]; ok {
+				fi.IsPointer = true
+				fi.StructType = id.Name
+				return fi, 1
+			}
 		}
 	}
 	return fi, 1

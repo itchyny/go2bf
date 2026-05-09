@@ -251,9 +251,10 @@ The generated Brainfuck uses a CPU-like execution model:
 ### Control flow
 
 - `if`, `else if`, `else` statements
-- `for` loops with `break` and `continue`
+- `for` loops with `break` and `continue`, including labeled
+  `break` and `continue` to escape or resume an outer loop
 - `switch` statement on `byte`, `uintN` values (including
-   multiple values per case, `default`, and `fallthrough`)
+  multiple values per case, `default`, and `fallthrough`)
 
 ### Functions
 
@@ -262,9 +263,14 @@ The generated Brainfuck uses a CPU-like execution model:
 - Multi-return tuples of any type combination
   (`func f() (P, P)`, `func f() ([3]byte, [3]byte)`,
   `func f() (string, byte)`)
+- Multi-return spread into another call: `f(g())` when
+  `g`'s returns match `f`'s parameters positionally
 - Methods on value and pointer receivers
   (`func (p P) m()`, `func (p *P) m()`)
 - Methods on struct literals (`P{x: 10}.method()`)
+- Method chaining including pointer-returning methods
+  (`s.push(1).push(2).pop()`) and explicit address-of
+  receivers (`(&b).method()`)
 - Tail-call recursion optimization
 - General recursion (via stack-based dispatch)
   including nested recursive calls (e.g., Ackermann function)
@@ -284,7 +290,7 @@ The generated Brainfuck uses a CPU-like execution model:
 ### Structs
 
 - Top-level and function-local type definitions
-- Fields: `byte`, `uintN`, struct, array, nested array,
+- Fields: `byte`, `uintN`, struct, `*Struct`, array, nested array,
   string, `[]byte`, `[]uintN`, `[]Struct`, `[][]byte` types
 - Nested struct array fields (`[N][M]Inner`)
 - Field access, nested field access (`p.a.x`)
@@ -349,6 +355,8 @@ The generated Brainfuck uses a CPU-like execution model:
 - `ptr.data[i]` read/write for struct-with-array pointers,
   including multi-byte (`pp.x[i] = uint16(...)`) and struct
   (`pp.items[i].field`) element types
+- Pointer-typed struct fields (`type Outer struct { p *Inner }`):
+  `out.p.v` read/write follows the field's pointer to the target
 - `len(ptr)`, `len(*ptr)`, `cap(ptr)` for array pointers
 - `ptr == nil`, `ptr != nil` comparison
 - Typed pointer parameters: `func f(p *[N]byte)`,

@@ -241,6 +241,14 @@ guarded blocks, `lowerLoopBody` pre-loads all referenced variables
 from the frame before the guarded loop, then stores and reloads
 between each guarded statement.
 
+`break label` and `continue label` are also supported in recursive
+functions. The recursive lowerer pushes a frame onto the same
+`loopFrames` stack used by the regular lowerer (it embeds `*Lowerer`),
+so `emitLabeledBranch` walks across both regular and recursive frames
+uniformly. `recLowerer.lowerLabeledStmt` exists only so the inner
+loop is dispatched via `recLowerer.lowerStmt` rather than the embedded
+base lowerer.
+
 ## Phase Temps
 
 Recursive dispatch uses phase temp cells (tape positions 25-39) instead
@@ -310,4 +318,5 @@ recursive functions. Key differences from regular lowering:
 
 - Recursive calls inside `for` loops are not supported.
 - Pointers are not supported in recursive functions.
-- Slices are not supported in recursive functions.
+- Slices are not supported in recursive functions, including
+  slice parameters, slice return types, and slice locals.

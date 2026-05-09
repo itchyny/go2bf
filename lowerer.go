@@ -37,6 +37,8 @@ type Lowerer struct {
 	loopSkipFlag  Cell // 1 after break or continue (skip remaining body stmts)
 	loopBreakFlag Cell // 1 after break (skip post/condition, exit loop)
 	loopDepth     int  // nesting depth of for/range loops
+	loopFrames    []loopFrame
+	pendingLabel  string // label captured from *ast.LabeledStmt, consumed by next for/range
 
 	// Heap allocator for slices.
 	heapPtr Cell // cell holding the next free stack slot index
@@ -51,6 +53,15 @@ type Lowerer struct {
 	// that many innermost matches for `name`, so a self-reference like
 	// `x := uint16(x) * 100` resolves the RHS `x` to the outer binding.
 	shadowing map[string]int
+}
+
+// loopFrame records an enclosing for/range loop's break/continue flags
+// so that `break label` / `continue label` can target an outer loop by
+// walking the frame stack.
+type loopFrame struct {
+	label     string
+	skipFlag  Cell
+	breakFlag Cell
 }
 
 // scope holds variable bindings for the current lexical scope.
@@ -1810,44 +1821,10 @@ func (l *Lowerer) shapeOf(expr ast.Expr, sc scope) exprShape {
 			}
 		}
 	case *ast.SelectorExpr:
-		// t := p.name where p.name is a string-typed struct field.
-		if l.isStringSelector(expr) {
-			return byteSliceShape()
-		}
 		if structID, ok := expr.X.(*ast.Ident); ok {
 			if si, ok := l.lookupStruct(structID.Name); ok {
-				field := expr.Sel.Name
-				// Nested struct field: t := o.inner where inner is a struct.
-				if fieldType := si.def.Field[field].StructType; fieldType != "" {
-					return exprShape{structType: fieldType}
-				}
-				// Multi-byte int field.
-				if n := si.def.Field[field].IntSize; n >= 2 {
-					return exprShape{intSize: n}
-				}
-				// Array field: `[N]uintN`, `[N]Point`, `[N][M]uintN`, etc.
-				if elemCount := si.def.Field[field].ElemCount; elemCount > 0 {
-					elemIntSize := si.def.Field[field].ElemIntSize
-					elemType := si.def.Field[field].ElemType
-					inner := si.def.Field[field].InnerSize
-					innerInt := si.def.Field[field].InnerIntSize
-					elemSize := 1
-					innerElemSize := 0
-					if elemIntSize >= 2 {
-						elemSize = elemIntSize
-					} else if elemType != "" {
-						if def, ok := l.result.Structs[elemType]; ok {
-							elemSize = def.Size
-						}
-					} else if inner > 0 {
-						elemSize = inner
-						innerElemSize = max(innerInt, 1)
-					}
-					return exprShape{
-						elemCount: elemCount, elemSize: elemSize,
-						elemType: elemType, elemIntSize: elemIntSize,
-						innerElemSize: innerElemSize, innerElemIntSize: innerInt,
-					}
+				if fi, ok := si.def.Field[expr.Sel.Name]; ok {
+					return l.shapeOfField(fi)
 				}
 			}
 		}
@@ -1964,6 +1941,62 @@ func (l *Lowerer) defineFromTypeExpr(sc scope, name string, typeExpr ast.Expr) {
 	l.defineFromShape(sc, name, l.shapeOfType(typeExpr))
 }
 
+// shapeOfField returns the runtime shape of a struct field described by fi.
+// Cell-relative values (cell, lenCell, capCell) are not set; callers that
+// need them fill in based on the field's base address.
+func (l *Lowerer) shapeOfField(fi FieldInfo) exprShape {
+	var sh exprShape
+	switch {
+	case fi.ElemCount > 0:
+		sh.elemCount = fi.ElemCount
+		switch {
+		case fi.ElemIntSize >= 2:
+			sh.elemSize = fi.ElemIntSize
+			sh.elemIntSize = fi.ElemIntSize
+		case fi.InnerSize > 0:
+			sh.elemSize = fi.InnerSize
+			if fi.InnerIntSize >= 2 {
+				sh.innerElemSize = fi.InnerIntSize
+				sh.innerElemIntSize = fi.InnerIntSize
+			} else if fi.ElemType != "" {
+				if innerDef, ok := l.result.Structs[fi.ElemType]; ok {
+					sh.innerElemSize = innerDef.Size
+					sh.elemType = fi.ElemType
+				}
+			} else {
+				sh.innerElemSize = 1
+			}
+		case fi.ElemType != "":
+			if sd, ok := l.result.Structs[fi.ElemType]; ok {
+				sh.elemSize = sd.Size
+				sh.elemType = fi.ElemType
+			}
+		default:
+			sh.elemSize = 1
+		}
+		sh.size = sh.elemCount * sh.elemSize
+	case fi.IsPointer && fi.StructType != "":
+		sh.size = 1
+		sh.isPointer = true
+		sh.structType = fi.StructType
+	case fi.StructType != "":
+		sd := l.result.Structs[fi.StructType]
+		sh.size = sd.Size
+		sh.structType = fi.StructType
+	case fi.IntSize >= 2:
+		sh.size = fi.IntSize
+		sh.intSize = fi.IntSize
+	case fi.ElemSize > 0:
+		// Slice field (string, []byte, []uintN, []Struct, [][]T): 3-cell header.
+		sh.elemSize = fi.ElemSize
+		sh.elemType = fi.ElemType
+		sh.elemIntSize = fi.ElemIntSize
+		sh.elemSlice = fi.ElemSlice
+		sh.isPointer = true
+	}
+	return sh
+}
+
 // lowerStructLit handles p := Point{x: 1, y: 2}.
 func (l *Lowerer) lowerStructLit(name string, comp *ast.CompositeLit, def *StructDef) error {
 	si, ok := l.lookupStruct(name)
@@ -1990,6 +2023,15 @@ func (l *Lowerer) lowerStructValueTo(base Cell, def *StructDef, valExpr ast.Expr
 				fieldName = def.Fields[j]
 				off = def.Field[fieldName].Offset
 				ve = elt
+			}
+			// Pointer-to-struct field: copy the 1-cell slot index.
+			if fi := def.Field[fieldName]; fi.IsPointer && fi.StructType != "" {
+				r, err := l.lowerExpr(ve)
+				if err != nil {
+					return err
+				}
+				l.emitCopyOrMove(base+off, r)
+				continue
 			}
 			// Nested struct field: recurse.
 			if nestedType := def.Field[fieldName].StructType; nestedType != "" {
@@ -2562,6 +2604,8 @@ func (l *Lowerer) lowerStmt(stmt ast.Stmt) error {
 		return l.lowerRange(s)
 	case *ast.BranchStmt:
 		return l.lowerBranch(s)
+	case *ast.LabeledStmt:
+		return l.lowerLabeledStmt(s)
 	case *ast.BlockStmt:
 		l.pushScope()
 		err := l.lowerStmts(s.List)
@@ -2629,9 +2673,32 @@ func (l *Lowerer) prependReceiver(receiver ast.Expr, info *FuncInfo, args []ast.
 // isPointerReceiver reports whether the receiver expression already evaluates
 // to a struct pointer (so &-wrapping should be skipped).
 func (l *Lowerer) isPointerReceiver(receiver ast.Expr) bool {
-	if id, ok := receiver.(*ast.Ident); ok {
-		if _, ok := l.lookupPtrType(id.Name); ok {
+	switch x := receiver.(type) {
+	case *ast.Ident:
+		if _, ok := l.lookupPtrType(x.Name); ok {
 			return true
+		}
+	case *ast.UnaryExpr:
+		// Already an explicit `&x`.
+		return x.Op == token.AND
+	case *ast.ParenExpr:
+		return l.isPointerReceiver(x.X)
+	case *ast.CallExpr:
+		// Method chaining: `s.push(...).push(...)`. The inner call returns
+		// *T directly, so no &-wrapping is needed.
+		funcName, _ := l.resolveCall(x)
+		if info, ok := l.result.Funcs[funcName]; ok {
+			ri := info.SingleReturn()
+			return ri.IsPointer && ri.StructType != ""
+		}
+	case *ast.SelectorExpr:
+		// `w.p.method()` where p is a pointer-typed struct field: w.p is
+		// already a pointer, no &-wrapping needed.
+		parentType := l.resolveExprTypeName(x.X)
+		if def, ok := l.result.Structs[parentType]; ok {
+			if fi, ok := def.Field[x.Sel.Name]; ok && fi.IsPointer {
+				return true
+			}
 		}
 	}
 	return false
@@ -2703,6 +2770,11 @@ func (l *Lowerer) resolveExprTypeName(expr ast.Expr) string {
 	case *ast.StarExpr:
 		// (*p).method() -- equivalent to p.method() for pointer-to-struct.
 		return l.resolveExprTypeName(x.X)
+	case *ast.UnaryExpr:
+		// (&x).method() -- equivalent to x.method() for pointer-receiver methods.
+		if x.Op == token.AND {
+			return l.resolveExprTypeName(x.X)
+		}
 	}
 	return ""
 }
@@ -4992,6 +5064,11 @@ func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 	outerBreak := l.loopBreakFlag
 	l.loopSkipFlag = l.allocCell()
 	l.loopBreakFlag = l.allocCell()
+	label := l.pendingLabel
+	l.pendingLabel = ""
+	l.loopFrames = append(l.loopFrames, loopFrame{
+		label: label, skipFlag: l.loopSkipFlag, breakFlag: l.loopBreakFlag,
+	})
 
 	saved := l.nodes
 	l.nodes = nil
@@ -5059,6 +5136,7 @@ func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 	l.freeCell(l.loopSkipFlag)
 	l.loopSkipFlag = outerSkip
 	l.loopBreakFlag = outerBreak
+	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
 	l.freeCell(condCell)
 	return nil
 }
@@ -5209,6 +5287,11 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	outerBreak := l.loopBreakFlag
 	l.loopSkipFlag = l.allocCell()
 	l.loopBreakFlag = l.allocCell()
+	label := l.pendingLabel
+	l.pendingLabel = ""
+	l.loopFrames = append(l.loopFrames, loopFrame{
+		label: label, skipFlag: l.loopSkipFlag, breakFlag: l.loopBreakFlag,
+	})
 
 	saved := l.nodes
 	l.nodes = nil
@@ -5301,6 +5384,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.freeCell(l.loopSkipFlag)
 	l.loopSkipFlag = outerSkip
 	l.loopBreakFlag = outerBreak
+	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
 	l.freeCell(condCell)
 	if limit.temp {
 		l.freeCellRange(limit.cell, max(limit.intSize, 1))
@@ -5316,6 +5400,9 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 	switch s.Tok {
 	case token.BREAK:
+		if s.Label != nil {
+			return l.emitLabeledBranch(s.Label.Name, true)
+		}
 		if l.loopSkipFlag == 0 {
 			return fmt.Errorf("break outside loop")
 		}
@@ -5323,6 +5410,9 @@ func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 		l.emit(&IRConst{Dst: l.loopBreakFlag, Value: 1})
 		return nil
 	case token.CONTINUE:
+		if s.Label != nil {
+			return l.emitLabeledBranch(s.Label.Name, false)
+		}
 		if l.loopSkipFlag == 0 {
 			return fmt.Errorf("continue outside loop")
 		}
@@ -5331,6 +5421,49 @@ func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 	default:
 		return fmt.Errorf("unsupported branch statement: %s", s.Tok)
 	}
+}
+
+// emitLabeledBranch implements `break label` (isBreak=true) or
+// `continue label`. All loops between the innermost and the labeled one
+// are exited (skipFlag + breakFlag); the labeled loop itself gets its
+// skipFlag set, plus breakFlag for break (so it exits) but not for
+// continue (so it iterates).
+func (l *Lowerer) emitLabeledBranch(label string, isBreak bool) error {
+	idx := -1
+	for i := len(l.loopFrames) - 1; i >= 0; i-- {
+		if l.loopFrames[i].label == label {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("label %s not found on enclosing loop", label)
+	}
+	for j := len(l.loopFrames) - 1; j > idx; j-- {
+		l.emit(&IRConst{Dst: l.loopFrames[j].skipFlag, Value: 1})
+		l.emit(&IRConst{Dst: l.loopFrames[j].breakFlag, Value: 1})
+	}
+	l.emit(&IRConst{Dst: l.loopFrames[idx].skipFlag, Value: 1})
+	if isBreak {
+		l.emit(&IRConst{Dst: l.loopFrames[idx].breakFlag, Value: 1})
+	}
+	return nil
+}
+
+// lowerLabeledStmt records the label for the next for/range to consume,
+// then lowers the inner statement. Non-loop labeled statements are not
+// supported (no goto, no labeled blocks).
+func (l *Lowerer) lowerLabeledStmt(s *ast.LabeledStmt) error {
+	switch s.Stmt.(type) {
+	case *ast.ForStmt, *ast.RangeStmt:
+	default:
+		return fmt.Errorf("label %s on non-loop statement is not supported", s.Label.Name)
+	}
+	saved := l.pendingLabel
+	l.pendingLabel = s.Label.Name
+	err := l.lowerStmt(s.Stmt)
+	l.pendingLabel = saved
+	return err
 }
 
 func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
@@ -5771,7 +5904,73 @@ func (l *Lowerer) returnCellCount(info *FuncInfo) int {
 	return info.Returns
 }
 
+// spreadInnerCall handles `f(g())` where g returns N values matching f's
+// params. It lowers the inner call once, then maps each return slot to an
+// outer-arg exprResult (or sliceInfo for slice params). Returns (nil, nil,
+// false, nil) if the spread doesn't apply (e.g. arity/shape mismatch).
+func (l *Lowerer) spreadInnerCall(outer *FuncInfo, call *ast.CallExpr) ([]exprResult, map[int]sliceInfo, bool, error) {
+	innerName, recv := l.resolveCall(call)
+	innerInfo, ok := l.result.Funcs[innerName]
+	if !ok || len(innerInfo.ReturnTypes) != len(outer.Params) {
+		return nil, nil, false, nil
+	}
+	// Lower the inner call. Method receivers get prepended exactly like a
+	// direct call would handle them.
+	innerArgs := l.prependReceiver(recv, innerInfo, call.Args)
+	retCells, err := l.inlineCall(innerInfo, innerArgs)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	args := make([]exprResult, len(outer.Params))
+	sliceArgs := map[int]sliceInfo{}
+	off := 0
+	for i, ri := range innerInfo.ReturnTypes {
+		n := innerInfo.ReturnSizes[i]
+		if ri.IsSlice {
+			sliceArgs[i] = sliceInfo{
+				ptr: retCells[off], len: retCells[off+1], cap: retCells[off+2],
+				elemSize:    max(ri.ElemSize, 1),
+				elemType:    ri.ElemType,
+				elemSlice:   ri.ElemSlice,
+				elemIntSize: ri.ElemIntSize,
+			}
+		} else {
+			shape := exprShape{size: n}
+			if ri.IntSize >= 2 {
+				shape.intSize = ri.IntSize
+			}
+			if ri.StructType != "" {
+				shape.structType = ri.StructType
+			}
+			if ri.IsPointer {
+				shape.isPointer = true
+			}
+			args[i] = exprResult{cell: retCells[off], temp: true, exprShape: shape}
+		}
+		off += n
+	}
+	return args, sliceArgs, true, nil
+}
+
 func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error) {
+	// Multi-return spread: f(g()) where g returns N values matching f's params.
+	// Pre-lower the inner call into per-return exprResults; the rest of inlineCall
+	// proceeds with those args as if they had been evaluated normally.
+	var spreadArgs []exprResult
+	var spreadSliceArgs map[int]sliceInfo
+	if len(argExprs) == 1 && len(info.Params) > 1 {
+		if call, ok := argExprs[0].(*ast.CallExpr); ok {
+			a, sa, ok, err := l.spreadInnerCall(info, call)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				spreadArgs = a
+				spreadSliceArgs = sa
+				argExprs = make([]ast.Expr, len(info.Params)) // length-only, indices unused
+			}
+		}
+	}
 	if len(argExprs) != len(info.Params) {
 		return nil, fmt.Errorf("function %s expects %d arguments, got %d", info.Name, len(info.Params), len(argExprs))
 	}
@@ -5780,82 +5979,96 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 			if pt.IntSize >= 2 {
 				return nil, fmt.Errorf("multi-byte integer parameters are not supported in recursive function %s", info.Name)
 			}
+			if pt.IsSlice {
+				return nil, fmt.Errorf("slice parameter %s in recursive function %s is not supported", pt.Name, info.Name)
+			}
 		}
 		if info.SingleReturn().IntSize >= 2 {
 			return nil, fmt.Errorf("multi-byte integer return values are not supported in recursive function %s", info.Name)
+		}
+		for _, ri := range info.ReturnTypes {
+			if ri.IsSlice {
+				return nil, fmt.Errorf("slice return type in recursive function %s is not supported", info.Name)
+			}
 		}
 	}
 	if info.IsRecursive && !info.IsTailRec {
 		return l.lowerGeneralRecursion(info, argExprs)
 	}
 
-	// Evaluate all arguments before pushScope.
-	args := make([]exprResult, len(argExprs))
-	sliceArgs := map[int]sliceInfo{}
-	for i, expr := range argExprs {
-		// Slice argument: evaluate to sliceInfo for later param copy.
-		if i < len(info.ParamTypes) && info.ParamTypes[i].IsSlice {
-			tmp, err := l.lowerSliceExpr(expr)
+	// Evaluate all arguments before pushScope. In the multi-return spread
+	// case, spreadInnerCall already produced args + sliceArgs from the
+	// inner call's return cells, so the eval loop is skipped.
+	args := spreadArgs
+	sliceArgs := spreadSliceArgs
+	if args == nil {
+		args = make([]exprResult, len(argExprs))
+		sliceArgs = map[int]sliceInfo{}
+		for i, expr := range argExprs {
+			// Slice argument: evaluate to sliceInfo for later param copy.
+			if i < len(info.ParamTypes) && info.ParamTypes[i].IsSlice {
+				tmp, err := l.lowerSliceExpr(expr)
+				if err != nil {
+					return nil, err
+				}
+				sliceArgs[i] = tmp
+				continue
+			}
+			// Composite literal: lower into temp cells (lowerExpr doesn't handle these).
+			if comp, ok := expr.(*ast.CompositeLit); ok {
+				if def := l.structDef(comp.Type); def != nil {
+					base := l.allocCells(def.Size)
+					for j := range def.Size {
+						l.emit(&IRZero{Dst: base + j})
+					}
+					if err := l.lowerStructValueTo(base, def, comp); err != nil {
+						return nil, err
+					}
+					args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: def.Size}}
+					continue
+				}
+				size := l.arraySize(comp.Type)
+				if size > 0 {
+					base := l.allocCells(size)
+					ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(comp.Type)
+					arr := arrayInfo{base: base, elemCount: ec, elemSize: es, elemType: et,
+						elemIntSize: eis, elemSlice: esl, innerElemSize: ies, innerElemIntSize: ieis}
+					if err := l.lowerCompositeLitInto(arr, comp); err != nil {
+						return nil, err
+					}
+					args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: size}}
+					continue
+				}
+			}
+			r, err := l.lowerExpr(expr)
 			if err != nil {
 				return nil, err
 			}
-			sliceArgs[i] = tmp
-			continue
-		}
-		// Composite literal: lower into temp cells (lowerExpr doesn't handle these).
-		if comp, ok := expr.(*ast.CompositeLit); ok {
-			if def := l.structDef(comp.Type); def != nil {
-				base := l.allocCells(def.Size)
-				for j := range def.Size {
-					l.emit(&IRZero{Dst: base + j})
-				}
-				if err := l.lowerStructValueTo(base, def, comp); err != nil {
-					return nil, err
-				}
-				args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: def.Size}}
-				continue
+			// Pointer-based composite: materialize into contiguous temp cells, unless
+			// the parameter itself wants a pointer (e.g. `setName(pg, ...)` where
+			// `setName` takes `*Greeter`). In the pointer-param case the byte cell
+			// holding the slot index is exactly what the callee expects.
+			paramWantsPointer := i < len(info.ParamTypes) && info.ParamTypes[i].IsPointer
+			if r.isPointer && r.elemCount >= 1 && r.structType != "" && !r.elemSlice && !paramWantsPointer {
+				base := l.materializePtrComposite(r.cell, r.temp, r.elemCount)
+				r = exprResult{cell: base, temp: true, exprShape: exprShape{size: r.elemCount, structType: r.structType}}
 			}
-			size := l.arraySize(comp.Type)
-			if size > 0 {
-				base := l.allocCells(size)
-				ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(comp.Type)
-				arr := arrayInfo{base: base, elemCount: ec, elemSize: es, elemType: et,
-					elemIntSize: eis, elemSlice: esl, innerElemSize: ies, innerElemIntSize: ieis}
-				if err := l.lowerCompositeLitInto(arr, comp); err != nil {
-					return nil, err
+			// Flat-offset result: materialize into contiguous temp cells.
+			if r.flatBase != 0 {
+				totalSize := r.elemCount * r.elemSize
+				flatArr := arrayInfo{base: r.flatBase, elemCount: totalSize, elemSize: 1}
+				n := r.elemCount
+				base := l.allocCells(n)
+				dsts := make([]Cell, n)
+				for j := range n {
+					dsts[j] = base + Cell(j) // #nosec G115
 				}
-				args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: size}}
-				continue
+				l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
+				l.freeCell(r.cell)
+				r = exprResult{cell: base, temp: true, exprShape: exprShape{size: n}}
 			}
+			args[i] = r
 		}
-		r, err := l.lowerExpr(expr)
-		if err != nil {
-			return nil, err
-		}
-		// Pointer-based composite: materialize into contiguous temp cells, unless
-		// the parameter itself wants a pointer (e.g. `setName(pg, ...)` where
-		// `setName` takes `*Greeter`). In the pointer-param case the byte cell
-		// holding the slot index is exactly what the callee expects.
-		paramWantsPointer := i < len(info.ParamTypes) && info.ParamTypes[i].IsPointer
-		if r.isPointer && r.elemCount >= 1 && r.structType != "" && !r.elemSlice && !paramWantsPointer {
-			base := l.materializePtrComposite(r.cell, r.temp, r.elemCount)
-			r = exprResult{cell: base, temp: true, exprShape: exprShape{size: r.elemCount, structType: r.structType}}
-		}
-		// Flat-offset result: materialize into contiguous temp cells.
-		if r.flatBase != 0 {
-			totalSize := r.elemCount * r.elemSize
-			flatArr := arrayInfo{base: r.flatBase, elemCount: totalSize, elemSize: 1}
-			n := r.elemCount
-			base := l.allocCells(n)
-			dsts := make([]Cell, n)
-			for j := range n {
-				dsts[j] = base + Cell(j) // #nosec G115
-			}
-			l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
-			l.freeCell(r.cell)
-			r = exprResult{cell: base, temp: true, exprShape: exprShape{size: n}}
-		}
-		args[i] = r
 	}
 
 	// Push a new scope for the function.
@@ -8777,6 +8990,61 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 	return nil
 }
 
+// loadFieldViaPtr reads field `fi` at offset within a struct reached
+// through a pointer. `idx` is a temp cell holding the field's heap slot
+// (caller already added the field offset). The returned exprResult is
+// shaped according to the field's type. `idx` is consumed/freed.
+func (l *Lowerer) loadFieldViaPtr(idx Cell, fi FieldInfo) exprResult {
+	// Array field: return the pointer for indexing, with element shape so
+	// `pp.arr[i]` strides at the right width for uintN / struct elements.
+	if fi.ElemCount > 0 {
+		elemSize := 1
+		if fi.ElemIntSize >= 2 {
+			elemSize = fi.ElemIntSize
+		} else if fi.ElemType != "" {
+			if sd, ok := l.result.Structs[fi.ElemType]; ok {
+				elemSize = sd.Size
+			}
+		}
+		return exprResult{
+			cell: idx, temp: true,
+			exprShape: exprShape{elemSize: elemSize, elemCount: fi.ElemCount,
+				elemType: fi.ElemType, elemIntSize: fi.ElemIntSize, isPointer: true},
+		}
+	}
+	// Pointer-typed struct field (`p *T`): load the slot index so further
+	// selectors traverse the pointee.
+	if fi.IsPointer && fi.StructType != "" {
+		result := l.ptrLoad(idx)
+		l.freeCell(idx)
+		return exprResult{
+			cell: result, temp: true,
+			exprShape: exprShape{isPointer: true, structType: fi.StructType},
+		}
+	}
+	// Nested struct field: hand back a pointer-to-struct view so the caller
+	// can keep walking selectors (pb.q.v) or write through it.
+	if fi.StructType != "" {
+		nestedDef := l.result.Structs[fi.StructType]
+		return exprResult{
+			cell: idx, temp: true,
+			exprShape: exprShape{
+				size: nestedDef.Size, elemSize: 1, elemCount: nestedDef.Size,
+				structType: fi.StructType, isPointer: true,
+			},
+		}
+	}
+	if fi.IntSize >= 2 {
+		return l.loadMultiByteIntViaPtr(idx, fi.IntSize)
+	}
+	if fi.IsString {
+		return l.loadStringHeaderViaPtr(idx)
+	}
+	result := l.ptrLoad(idx)
+	l.freeCell(idx)
+	return exprResult{cell: result, temp: true}
+}
+
 func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	// Unwrap (expr).field so the selector resolution sees the inner form.
 	if p, ok := e.X.(*ast.ParenExpr); ok {
@@ -8799,50 +9067,14 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			base = si.base
 			def = si.def
 		} else if ptrDef, ok := l.lookupPtrType(x.Name); ok {
-			// Pointer-to-struct: ptr.x -> load at *ptr + offset
+			// Pointer-to-struct: ptr.x -> *ptr + fieldOffset, then dispatch.
 			ptrCell, err := l.lookupVar(x.Name)
 			if err != nil {
 				return exprResult{}, err
 			}
-			idx := l.ptrOffset(ptrCell, ptrDef.Field[e.Sel.Name].Offset)
-			// Array field: return pointer for indexing.
-			if elemCount := ptrDef.Field[e.Sel.Name].ElemCount; elemCount > 0 {
-				elemSize := 1
-				elemIntSize := ptrDef.Field[e.Sel.Name].ElemIntSize
-				elemType := ptrDef.Field[e.Sel.Name].ElemType
-				if elemIntSize >= 2 {
-					elemSize = elemIntSize
-				} else if elemType != "" {
-					if structDef, ok := l.result.Structs[elemType]; ok {
-						elemSize = structDef.Size
-					}
-				}
-				return exprResult{
-					cell: idx, temp: true,
-					exprShape: exprShape{elemSize: elemSize, elemCount: elemCount,
-						elemType: elemType, elemIntSize: elemIntSize, isPointer: true},
-				}, nil
-			}
-			// Multi-byte int field: load N cells.
-			if n := ptrDef.Field[e.Sel.Name].IntSize; n >= 2 {
-				return l.loadMultiByteIntViaPtr(idx, n), nil
-			}
-			// String field: load 3 cells (ptr, len, cap) into a fresh sliceInfo.
-			if ptrDef.Field[e.Sel.Name].IsString {
-				return l.loadStringHeaderViaPtr(idx), nil
-			}
-			// Nested struct field: hand back a pointer-to-struct view so the
-			// caller can keep walking selectors (pb.q.v) or write through it.
-			if nestedType := ptrDef.Field[e.Sel.Name].StructType; nestedType != "" {
-				nestedDef := l.result.Structs[nestedType]
-				return exprResult{
-					cell: idx, temp: true,
-					exprShape: exprShape{isPointer: true, structType: nestedType, elemSize: 1, elemCount: nestedDef.Size},
-				}, nil
-			}
-			result := l.ptrLoad(idx)
-			l.freeCell(idx)
-			return exprResult{cell: result, temp: true}, nil
+			fi := ptrDef.Field[e.Sel.Name]
+			idx := l.ptrOffset(ptrCell, fi.Offset)
+			return l.loadFieldViaPtr(idx, fi), nil
 		} else {
 			return exprResult{}, fmt.Errorf("undefined struct: %s", x.Name)
 		}
@@ -8870,8 +9102,17 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		// Size-1 struct from a slice/array index: inner.cell is a temp
 		// holding the only byte. The single field IS that byte.
 		if !inner.isPointer && inner.flatBase == 0 && def.Size == 1 {
-			if _, ok := def.Field[e.Sel.Name]; !ok {
+			fi, ok := def.Field[e.Sel.Name]
+			if !ok {
 				return exprResult{}, fmt.Errorf("unknown field %s in struct %s", e.Sel.Name, def.Name)
+			}
+			// Pointer-to-struct field: the byte holds a slot index, return it
+			// as a pointer-shaped result so chained selectors traverse it.
+			if fi.IsPointer && fi.StructType != "" {
+				return exprResult{
+					cell: inner.cell, temp: inner.temp,
+					exprShape: exprShape{isPointer: true, structType: fi.StructType},
+				}, nil
 			}
 			return exprResult{cell: inner.cell, temp: inner.temp}, nil
 		}
@@ -8927,79 +9168,24 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	if !ok {
 		return exprResult{}, fmt.Errorf("unknown field %s in struct %s", e.Sel.Name, def.Name)
 	}
-	offset := fi.Offset
 	if baseIsPointer {
-		idx := l.ptrOffset(base, offset)
-		// Array field: return pointer for indexing.
-		if elemCount := def.Field[e.Sel.Name].ElemCount; elemCount > 0 {
-			return exprResult{cell: idx, temp: true, exprShape: exprShape{elemSize: 1, elemCount: elemCount, isPointer: true}}, nil
-		}
-		// Nested struct field: return pointer with struct type.
-		if fieldType := def.Field[e.Sel.Name].StructType; fieldType != "" {
-			fieldDef := l.result.Structs[fieldType]
-			return exprResult{
-				cell: idx, temp: true,
-				exprShape: exprShape{size: fieldDef.Size, elemSize: 1, elemCount: fieldDef.Size, structType: fieldType, isPointer: true},
-			}, nil
-		}
-		// Multi-byte int field: load N cells.
-		if n := def.Field[e.Sel.Name].IntSize; n >= 2 {
-			return l.loadMultiByteIntViaPtr(idx, n), nil
-		}
-		// String field: load 3 cells (ptr, len, cap) into a fresh sliceInfo.
-		if def.Field[e.Sel.Name].IsString {
-			return l.loadStringHeaderViaPtr(idx), nil
-		}
-		result := l.ptrLoad(idx)
-		l.freeCell(idx)
-		return exprResult{cell: result, temp: true}, nil
+		idx := l.ptrOffset(base, fi.Offset)
+		return l.loadFieldViaPtr(idx, fi), nil
 	}
-	r := exprResult{cell: base + offset}
-	if elemCount := def.Field[e.Sel.Name].ElemCount; elemCount > 0 {
-		r.elemCount = elemCount
-		if eis := def.Field[e.Sel.Name].ElemIntSize; eis >= 2 {
-			r.elemSize = eis
-			r.elemIntSize = eis
-		} else if ies := def.Field[e.Sel.Name].InnerSize; ies > 0 {
-			r.elemSize = ies
-			if iis := def.Field[e.Sel.Name].InnerIntSize; iis >= 2 {
-				r.innerElemSize = iis
-				r.innerElemIntSize = iis
-			} else if innerType := def.Field[e.Sel.Name].ElemType; innerType != "" {
-				if innerDef, ok := l.result.Structs[innerType]; ok {
-					r.innerElemSize = innerDef.Size
-					r.elemType = innerType
-				}
-			} else {
-				r.innerElemSize = 1
-			}
-		} else if et := def.Field[e.Sel.Name].ElemType; et != "" {
-			if structDef, ok := l.result.Structs[et]; ok {
-				r.elemSize = structDef.Size
-				r.elemType = et
-			}
-		} else {
-			r.elemSize = 1
-		}
-		r.size = r.elemCount * r.elemSize
-	} else if fieldType := def.Field[e.Sel.Name].StructType; fieldType != "" {
-		fieldDef := l.result.Structs[fieldType]
-		r.size = fieldDef.Size
+	cell := base + Cell(fi.Offset) // #nosec G115
+	r := exprResult{cell: cell, exprShape: l.shapeOfField(fi)}
+	switch {
+	case fi.StructType != "" && !fi.IsPointer:
+		// Inline nested struct: also expose byte-addressable view so callers
+		// that copy cell-by-cell know the size. shapeOfField leaves these
+		// unset because shapeOf needs a clean structType for defineFromShape.
+		sd := l.result.Structs[fi.StructType]
 		r.elemSize = 1
-		r.elemCount = fieldDef.Size
-		r.structType = fieldType
-	} else if intSize := def.Field[e.Sel.Name].IntSize; intSize >= 2 {
-		r.size = intSize
-		r.intSize = intSize
-	} else if es := def.Field[e.Sel.Name].ElemSize; es > 0 {
-		// Slice field (string, []byte, []uintN, []Struct, [][]T): 3-cell header.
-		r.elemSize = es
-		r.elemType = def.Field[e.Sel.Name].ElemType
-		r.elemIntSize = def.Field[e.Sel.Name].ElemIntSize
-		r.elemSlice = def.Field[e.Sel.Name].ElemSlice
-		r.isPointer = true
-		r.lenCell = base + offset + 1
-		r.capCell = base + offset + 2
+		r.elemCount = sd.Size
+	case fi.ElemSize > 0 && fi.ElemCount == 0 && !(fi.IsPointer && fi.StructType != ""):
+		// Slice field: lenCell/capCell are at base+offset+1, +2.
+		r.lenCell = cell + 1
+		r.capCell = cell + 2
 	}
 	return r, nil
 }

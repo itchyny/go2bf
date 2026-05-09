@@ -110,6 +110,16 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	if hasSliceUsage(info.Body) {
 		return nil, fmt.Errorf("slices in recursive functions are not supported")
 	}
+	for _, pt := range info.ParamTypes {
+		if pt.IsSlice {
+			return nil, fmt.Errorf("slice parameter %s in recursive function %s is not supported", pt.Name, info.Name)
+		}
+	}
+	for _, ri := range info.ReturnTypes {
+		if ri.IsSlice {
+			return nil, fmt.Errorf("slice return type in recursive function %s is not supported", info.Name)
+		}
+	}
 
 	// Allocate active and retval in the PHASE TEMP area (direct tape positions,
 	// not stack slots). This avoids cache/storeToStack issues in the dispatch loop.
@@ -602,8 +612,11 @@ type recCallSite struct {
 // into call sites. Returns (callSites, tailStmts, ok). If the statement pattern
 // is not recognized, ok is false. condVar is passed through to call sites.
 func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStmts []ast.Stmt, condVar string) ([]recCallSite, []ast.Stmt, bool) {
-	// Assignment: a := f(n-1)
-	if assign, ok := stmt.(*ast.AssignStmt); ok && len(calls) == 1 {
+	// Direct assignment: a := f(n-1) where the entire RHS is the call.
+	// (For `a := expr-containing-call`, the next branch wraps the call in a
+	// temp and rewrites the RHS; this branch must only match the bare form.)
+	if assign, ok := stmt.(*ast.AssignStmt); ok && len(calls) == 1 &&
+		len(assign.Rhs) == 1 && assign.Rhs[0] == calls[0] {
 		id, ok := assign.Lhs[0].(*ast.Ident)
 		if !ok {
 			return nil, nil, false
@@ -1348,6 +1361,8 @@ func (rl *recLowerer) lowerStmt(stmt ast.Stmt) error {
 		return rl.lowerRange(s)
 	case *ast.BranchStmt:
 		return rl.lowerBranch(s)
+	case *ast.LabeledStmt:
+		return rl.lowerLabeledStmt(s)
 	case *ast.ReturnStmt:
 		return rl.lowerReturn(s)
 	case *ast.DeferStmt:
@@ -2205,6 +2220,19 @@ func (rl *recLowerer) lowerSwitch(s *ast.SwitchStmt) error {
 	return nil
 }
 
+func (rl *recLowerer) lowerLabeledStmt(s *ast.LabeledStmt) error {
+	switch s.Stmt.(type) {
+	case *ast.ForStmt, *ast.RangeStmt:
+	default:
+		return fmt.Errorf("label %s on non-loop statement is not supported", s.Label.Name)
+	}
+	saved := rl.pendingLabel
+	rl.pendingLabel = s.Label.Name
+	err := rl.lowerStmt(s.Stmt)
+	rl.pendingLabel = saved
+	return err
+}
+
 func (rl *recLowerer) lowerFor(s *ast.ForStmt) error {
 	if s.Init != nil {
 		if err := rl.lowerStmt(s.Init); err != nil {
@@ -2223,6 +2251,11 @@ func (rl *recLowerer) lowerFor(s *ast.ForStmt) error {
 	outerBreak := rl.loopBreakFlag
 	rl.loopSkipFlag = rl.allocCell()
 	rl.loopBreakFlag = rl.allocCell()
+	label := rl.pendingLabel
+	rl.pendingLabel = ""
+	rl.loopFrames = append(rl.loopFrames, loopFrame{
+		label: label, skipFlag: rl.loopSkipFlag, breakFlag: rl.loopBreakFlag,
+	})
 	saved := rl.nodes
 	rl.nodes = nil
 	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
@@ -2263,6 +2296,7 @@ func (rl *recLowerer) lowerFor(s *ast.ForStmt) error {
 	rl.freeCell(rl.loopBreakFlag)
 	rl.loopSkipFlag = outerSkip
 	rl.loopBreakFlag = outerBreak
+	rl.loopFrames = rl.loopFrames[:len(rl.loopFrames)-1]
 	rl.freeCell(condCell)
 	return nil
 }
@@ -2326,6 +2360,11 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	outerBreak := rl.loopBreakFlag
 	rl.loopSkipFlag = rl.allocCell()
 	rl.loopBreakFlag = rl.allocCell()
+	label := rl.pendingLabel
+	rl.pendingLabel = ""
+	rl.loopFrames = append(rl.loopFrames, loopFrame{
+		label: label, skipFlag: rl.loopSkipFlag, breakFlag: rl.loopBreakFlag,
+	})
 	saved := rl.nodes
 	rl.nodes = nil
 	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
@@ -2361,6 +2400,7 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	rl.freeCell(rl.loopBreakFlag)
 	rl.loopSkipFlag = outerSkip
 	rl.loopBreakFlag = outerBreak
+	rl.loopFrames = rl.loopFrames[:len(rl.loopFrames)-1]
 	if limit.temp {
 		rl.freeCell(limit.cell)
 	}
