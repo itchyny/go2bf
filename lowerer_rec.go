@@ -29,23 +29,31 @@ type recArrayInfo struct {
 
 func (ri recArrayInfo) size() int { return ri.elemCount * ri.elemSize }
 
+// recLocalInfo holds slot index plus per-local type metadata for a variable
+// in a recursive function frame. A single map[name]recLocalInfo replaces
+// what used to be parallel slot/type maps, mirroring the analyzer's
+// StructDef.Field map[string]FieldInfo pattern.
+type recLocalInfo struct {
+	slot       int
+	structType string
+	arrayInfo  recArrayInfo
+}
+
 // recContext holds state for lowering a recursive function.
 type recContext struct {
-	funcName         string
-	frameSize        int
-	slotPhase        int // always 0
-	slotRet          int // always 1
-	paramBase        int // always 2
-	localBase        int
-	localMap         map[string]int // variable name -> slot index
-	phases           []*IRBlock
-	activeReg        Cell                    // register cell for dispatch loop control
-	retReg           Cell                    // base register cell for passing return values
-	retSize          int                     // number of return cells (1 for byte, N for struct/array)
-	noRetFlag        Cell                    // phase temp: 1 if no return happened in this phase, 0 after return
-	returnNames      []string                // named return value names (empty if unnamed)
-	localStructTypes map[string]string       // variable name -> struct type name
-	localArrayInfo   map[string]recArrayInfo // variable name -> array metadata
+	funcName    string
+	frameSize   int
+	slotPhase   int // always 0
+	slotRet     int // always 1
+	paramBase   int // always 2
+	localBase   int
+	locals      map[string]recLocalInfo // name -> slot + type metadata (incl. synthetic temps)
+	phases      []*IRBlock
+	activeReg   Cell     // register cell for dispatch loop control
+	retReg      Cell     // base register cell for passing return values
+	retSize     int      // number of return cells (1 for byte, N for struct/array)
+	noRetFlag   Cell     // phase temp: 1 if no return happened in this phase, 0 after return
+	returnNames []string // named return value names (empty if unnamed)
 
 	deferCaptureSlots []int // pre-allocated frame slots for defer captures
 	deferCaptureIdx   int   // index into deferCaptureSlots during lowering
@@ -57,48 +65,46 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	// Compute frame layout.
 	localNames := collectLocals(info.Body, info.Params)
 	rc := &recContext{
-		funcName:         info.Name,
-		slotPhase:        0,
-		slotRet:          1,
-		paramBase:        2,
-		localBase:        2 + len(info.Params),
-		localMap:         make(map[string]int),
-		localStructTypes: make(map[string]string),
-		localArrayInfo:   make(map[string]recArrayInfo),
+		funcName:  info.Name,
+		slotPhase: 0,
+		slotRet:   1,
+		paramBase: 2,
+		localBase: 2 + len(info.Params),
+		locals:    make(map[string]recLocalInfo),
 	}
 	paramSlot := rc.paramBase
 	for i, name := range info.Params {
-		rc.localMap[name] = paramSlot
 		paramSize := 1
+		paramInfo := recLocalInfo{slot: paramSlot}
 		if i < len(info.ParamTypes) {
 			pt := info.ParamTypes[i]
 			if pt.IsPointer {
 				// pointer parameter occupies 1 cell regardless of target type.
 			} else if pt.StructType != "" {
 				paramSize = l.result.Structs[pt.StructType].Size
-				rc.localStructTypes[pt.Name] = pt.StructType
+				paramInfo.structType = pt.StructType
 			} else if pt.ElemCount > 0 {
-				arraySize := pt.ElemCount * max(pt.ElemSize, 1)
-				paramSize = arraySize
-				rc.localArrayInfo[pt.Name] = recArrayInfo{
+				paramSize = pt.ElemCount * max(pt.ElemSize, 1)
+				paramInfo.arrayInfo = recArrayInfo{
 					elemCount: pt.ElemCount,
 					elemSize:  pt.ElemSize, elemType: pt.ElemType,
 				}
 			}
 		}
+		rc.locals[name] = paramInfo
 		paramSlot += paramSize
 	}
 	rc.localBase = paramSlot
 	for i, name := range localNames {
-		rc.localMap[name] = rc.localBase + i
+		rc.locals[name] = recLocalInfo{slot: rc.localBase + i}
 	}
 	rc.frameSize = rc.localBase + len(localNames)
 
 	// Named return values are mapped to frame slots like locals.
 	rc.returnNames = info.ReturnNames
 	for _, name := range info.ReturnNames {
-		if _, exists := rc.localMap[name]; !exists {
-			rc.localMap[name] = rc.frameSize
+		if _, exists := rc.locals[name]; !exists {
+			rc.locals[name] = recLocalInfo{slot: rc.frameSize}
 			rc.frameSize++
 		}
 	}
@@ -287,14 +293,21 @@ func hasSliceUsage(body *ast.BlockStmt) bool {
 // and reallocates their frame slots to hold multiple cells.
 func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 	seen := make(map[string]bool)
-	register := func(name string, info recArrayInfo) {
+	registerArray := func(name string, info recArrayInfo) {
 		if seen[name] || info.size() <= 1 {
 			return
 		}
 		seen[name] = true
-		rc.localMap[name] = rc.frameSize
+		rc.locals[name] = recLocalInfo{slot: rc.frameSize, arrayInfo: info}
 		rc.frameSize += info.size()
-		rc.localArrayInfo[name] = info
+	}
+	registerStruct := func(name, structType string, size int) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		rc.locals[name] = recLocalInfo{slot: rc.frameSize, structType: structType}
+		rc.frameSize += size
 	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		// a := [N]byte{...} or a := f(...)
@@ -303,28 +316,19 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 				if comp, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
 					count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(comp.Type)
 					if count*elemSize > 0 {
-						register(id.Name, recArrayInfo{count, elemSize, elemType})
+						registerArray(id.Name, recArrayInfo{count, elemSize, elemType})
 					} else if def := l.structDef(comp.Type); def != nil {
-						// Struct composite literal: r := Rect{...}
-						if !seen[id.Name] {
-							seen[id.Name] = true
-							rc.localMap[id.Name] = rc.frameSize
-							rc.frameSize += def.Size
-							rc.localStructTypes[id.Name] = def.Name
-						}
+						registerStruct(id.Name, def.Name, def.Size)
 					}
 				}
 				// b := a where a is an array or struct variable.
 				if rhsID, ok := assign.Rhs[0].(*ast.Ident); ok {
-					if srcInfo, ok := rc.localArrayInfo[rhsID.Name]; ok {
-						register(id.Name, srcInfo)
-					} else if srcType, ok := rc.localStructTypes[rhsID.Name]; ok {
-						if def, ok := l.result.Structs[srcType]; ok {
-							if !seen[id.Name] {
-								seen[id.Name] = true
-								rc.localMap[id.Name] = rc.frameSize
-								rc.frameSize += def.Size
-								rc.localStructTypes[id.Name] = srcType
+					if src, ok := rc.locals[rhsID.Name]; ok {
+						if src.arrayInfo.size() > 1 {
+							registerArray(id.Name, src.arrayInfo)
+						} else if src.structType != "" {
+							if def, ok := l.result.Structs[src.structType]; ok {
+								registerStruct(id.Name, src.structType, def.Size)
 							}
 						}
 					}
@@ -335,7 +339,7 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 						if info, ok := l.result.Funcs[fn.Name]; ok {
 							if ri := info.SingleReturn(); ri.ElemCount > 0 {
 								es := max(ri.ElemSize, 1)
-								register(id.Name, recArrayInfo{
+								registerArray(id.Name, recArrayInfo{
 									elemCount: ri.ElemCount,
 									elemSize:  es, elemType: ri.ElemType,
 								})
@@ -353,16 +357,11 @@ func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
 						count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(vs.Type)
 						if count*elemSize > 0 {
 							for _, name := range vs.Names {
-								register(name.Name, recArrayInfo{count, elemSize, elemType})
+								registerArray(name.Name, recArrayInfo{count, elemSize, elemType})
 							}
 						} else if def := l.structDef(vs.Type); def != nil {
 							for _, name := range vs.Names {
-								if !seen[name.Name] {
-									seen[name.Name] = true
-									rc.localMap[name.Name] = rc.frameSize
-									rc.frameSize += def.Size
-									rc.localStructTypes[name.Name] = def.Name
-								}
+								registerStruct(name.Name, def.Name, def.Size)
 							}
 						}
 					}
@@ -484,8 +483,8 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 					Tok: token.DEFINE,
 					Rhs: []ast.Expr{sw.Tag},
 				})
-				if _, exists := rc.localMap["$switch"]; !exists {
-					rc.localMap["$switch"] = rc.frameSize
+				if _, exists := rc.locals["$switch"]; !exists {
+					rc.locals["$switch"] = recLocalInfo{slot: rc.frameSize}
 					rc.frameSize++
 				}
 			}
@@ -536,14 +535,16 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 		retType := info.SingleReturn().StructType
 		allocated := make(map[string]bool)
 		for _, cs := range callSites {
+			info := rc.locals[cs.resultVar] // preserve any metadata set by collectArrayLocals
 			if !allocated[cs.resultVar] {
-				rc.localMap[cs.resultVar] = rc.frameSize
+				info.slot = rc.frameSize
 				rc.frameSize += rc.retSize
 				allocated[cs.resultVar] = true
 			}
 			if retType != "" {
-				rc.localStructTypes[cs.resultVar] = retType
+				info.structType = retType
 			}
+			rc.locals[cs.resultVar] = info
 		}
 	}
 
@@ -561,7 +562,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 			return err
 		}
 		// Prepend: load retReg into the result variable of callSite[i-1].
-		prevSlot := rc.localMap[callSites[i-1].resultVar]
+		prevSlot := rc.locals[callSites[i-1].resultVar].slot
 		var loadRet []IRNode
 		for j := range rc.retSize {
 			loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg + j, FrameSize: rc.frameSize})
@@ -582,7 +583,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 		return err
 	}
 	// Prepend: load retReg into last result variable.
-	prevSlot := rc.localMap[lastCallSite.resultVar]
+	prevSlot := rc.locals[lastCallSite.resultVar].slot
 	var loadRet []IRNode
 	for j := range rc.retSize {
 		loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg + j, FrameSize: rc.frameSize})
@@ -656,8 +657,8 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 	// Return with direct recursive call: return f(n-1)
 	if ret, ok := stmt.(*ast.ReturnStmt); ok && len(ret.Results) == 1 {
 		if call, isCall := ret.Results[0].(*ast.CallExpr); isCall && len(calls) == 1 && call == calls[0] {
-			if _, exists := rc.localMap["$tailret"]; !exists {
-				rc.localMap["$tailret"] = rc.frameSize
+			if _, exists := rc.locals["$tailret"]; !exists {
+				rc.locals["$tailret"] = recLocalInfo{slot: rc.frameSize}
 				rc.frameSize++
 			}
 			return []recCallSite{{
@@ -692,8 +693,8 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 	// Void recursive call: f(n-1) as a bare statement.
 	if expr, ok := stmt.(*ast.ExprStmt); ok {
 		if _, isCall := expr.X.(*ast.CallExpr); isCall && len(calls) == 1 {
-			if _, exists := rc.localMap["$void"]; !exists {
-				rc.localMap["$void"] = rc.frameSize
+			if _, exists := rc.locals["$void"]; !exists {
+				rc.locals["$void"] = recLocalInfo{slot: rc.frameSize}
 				rc.frameSize++
 			}
 			return []recCallSite{{
@@ -820,8 +821,8 @@ func flattenIfElseRec(ifStmt *ast.IfStmt, restStmts []ast.Stmt) ([]ast.Stmt, err
 func flattenIfBothRec(ifStmt *ast.IfStmt, rc *recContext, preStmts, restStmts []ast.Stmt) ([]recCallSite, []ast.Stmt, error) {
 	// Allocate frame variable for the condition.
 	condVar := fmt.Sprintf("$ifcond_%d", rc.frameSize)
-	if _, exists := rc.localMap[condVar]; !exists {
-		rc.localMap[condVar] = rc.frameSize
+	if _, exists := rc.locals[condVar]; !exists {
+		rc.locals[condVar] = recLocalInfo{slot: rc.frameSize}
 		rc.frameSize++
 	}
 
@@ -956,8 +957,8 @@ func extractRecCalls(expr ast.Expr, rc *recContext) ([]extractedCall, ast.Expr) 
 				}
 				tmpName := fmt.Sprintf("$recursive_%d", counter)
 				counter++
-				if _, exists := rc.localMap[tmpName]; !exists {
-					rc.localMap[tmpName] = rc.frameSize
+				if _, exists := rc.locals[tmpName]; !exists {
+					rc.locals[tmpName] = recLocalInfo{slot: rc.frameSize}
 					rc.frameSize++
 				}
 				extracted = append(extracted, extractedCall{
@@ -1077,7 +1078,7 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 		// Check for composite argument (struct or array variable).
 		if id, ok := expr.(*ast.Ident); ok {
 			if size := rl.compositeSize(id.Name); size > 0 {
-				slot := rc.localMap[id.Name]
+				slot := rc.locals[id.Name].slot
 				cells := make([]Cell, size)
 				for j := range size {
 					cells[j] = l.allocCell()
@@ -1164,7 +1165,7 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 	// by just advancing the phase without pushing a child frame.
 	if call.condVar != "" {
 		// Load condVar from the frame. It may have been set in an earlier phase.
-		condSlot := rc.localMap[call.condVar]
+		condSlot := rc.locals[call.condVar].slot
 		condCell, ok := rl.loadedMap[condSlot]
 		if !ok {
 			condCell = l.allocCell()
@@ -1231,15 +1232,14 @@ func (rl *recLowerer) lookupVar(name string) (Cell, error) {
 	if name == "_" {
 		return rl.allocCell(), nil
 	}
-	slot, ok := rl.rc.localMap[name]
+	info, ok := rl.rc.locals[name]
 	if !ok {
 		return 0, fmt.Errorf("undefined variable in recursive function: %s", name)
 	}
-	// Check if already loaded.
+	slot := info.slot
 	if reg, ok := rl.loadedMap[slot]; ok {
 		return reg, nil
 	}
-	// Load from frame into a register.
 	reg := rl.allocCell()
 	rl.emit(&IRLoadFrame{Dst: reg, Slot: slot, FrameSize: rl.rc.frameSize})
 	rl.loadedMap[slot] = reg
@@ -1417,8 +1417,8 @@ func (rl *recLowerer) resolveRecCall(call *ast.CallExpr) (string, ast.Expr) {
 	}
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 		if id, ok := sel.X.(*ast.Ident); ok {
-			if structType, ok := rl.rc.localStructTypes[id.Name]; ok {
-				return structType + "." + sel.Sel.Name, sel.X
+			if info, ok := rl.rc.locals[id.Name]; ok && info.structType != "" {
+				return info.structType + "." + sel.Sel.Name, sel.X
 			}
 		}
 	}
@@ -1443,8 +1443,8 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 			if pt.StructType != "" && !pt.IsPointer {
 				def := rl.result.Structs[pt.StructType]
 				if id, ok := arg.(*ast.Ident); ok {
-					if _, ok := rl.rc.localStructTypes[id.Name]; ok {
-						baseSlot := rl.rc.localMap[id.Name]
+					if info, ok := rl.rc.locals[id.Name]; ok && info.structType != "" {
+						baseSlot := info.slot
 						// Allocate consecutive cells, skipping highway markers.
 						base := rl.nextCell
 						rl.nextCell += def.Size
@@ -1465,11 +1465,11 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 			}
 			if pt.ElemCount > 0 {
 				if id, ok := arg.(*ast.Ident); ok {
-					if ai, ok := rl.rc.localArrayInfo[id.Name]; ok {
-						baseSlot := rl.rc.localMap[id.Name]
+					if li, ok := rl.rc.locals[id.Name]; ok && li.arrayInfo.size() > 0 {
+						ai := li.arrayInfo
 						base := rl.allocCells(ai.size())
 						for j := range ai.size() {
-							rl.emit(&IRLoadFrame{Dst: base + j, Slot: baseSlot + j, FrameSize: rl.rc.frameSize})
+							rl.emit(&IRLoadFrame{Dst: base + j, Slot: li.slot + j, FrameSize: rl.rc.frameSize})
 						}
 						vals[i] = argVal{base: base, size: ai.size()}
 						continue
@@ -1547,7 +1547,7 @@ func (rl *recLowerer) lowerDecl(s *ast.DeclStmt) error {
 		}
 		for i, name := range vs.Names {
 			if size := rl.compositeSize(name.Name); size > 0 {
-				rl.zeroFrameSlots(rl.rc.localMap[name.Name], size)
+				rl.zeroFrameSlots(rl.rc.locals[name.Name].slot, size)
 				continue
 			}
 			cell, err := rl.lookupVar(name.Name)
@@ -1655,11 +1655,12 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 func (rl *recLowerer) lowerRecVarInit(name string, rhs ast.Expr) error {
 	// Composite literal: a = [N]byte{...} or p = Point{...}
 	if comp, ok := rhs.(*ast.CompositeLit); ok {
-		if _, ok := rl.rc.localArrayInfo[name]; ok {
+		li := rl.rc.locals[name]
+		if li.arrayInfo.size() > 0 {
 			return rl.lowerArrayCompositeLit(name, comp)
 		}
-		if structType, ok := rl.rc.localStructTypes[name]; ok {
-			return rl.lowerStructCompositeLit(name, structType, comp)
+		if li.structType != "" {
+			return rl.lowerStructCompositeLit(name, li.structType, comp)
 		}
 		if rl.arraySize(comp.Type) == 0 {
 			if _, ok := comp.Type.(*ast.ArrayType); ok {
@@ -1670,7 +1671,7 @@ func (rl *recLowerer) lowerRecVarInit(name string, rhs ast.Expr) error {
 	// Composite variable copy: b = a where a is array or struct.
 	if rhsID, ok := rhs.(*ast.Ident); ok {
 		if size := rl.compositeSize(rhsID.Name); size > 0 {
-			rl.copyFrameSlots(rl.rc.localMap[rhsID.Name], rl.rc.localMap[name], size)
+			rl.copyFrameSlots(rl.rc.locals[rhsID.Name].slot, rl.rc.locals[name].slot, size)
 			return nil
 		}
 	}
@@ -1690,11 +1691,12 @@ func (rl *recLowerer) lowerRecVarInit(name string, rhs ast.Expr) error {
 // compositeSize returns the total frame slot size for a composite variable,
 // or 0 if the variable is a scalar.
 func (rl *recLowerer) compositeSize(name string) int {
-	if info, ok := rl.rc.localArrayInfo[name]; ok {
-		return info.size()
+	li := rl.rc.locals[name]
+	if li.arrayInfo.size() > 0 {
+		return li.arrayInfo.size()
 	}
-	if structType, ok := rl.rc.localStructTypes[name]; ok {
-		return rl.result.Structs[structType].Size
+	if li.structType != "" {
+		return rl.result.Structs[li.structType].Size
 	}
 	return 0
 }
@@ -1805,12 +1807,12 @@ func (rl *recLowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) erro
 func (rl *recLowerer) resolveFieldSlot(sel *ast.SelectorExpr) (int, error) {
 	switch x := sel.X.(type) {
 	case *ast.Ident:
-		structType, ok := rl.rc.localStructTypes[x.Name]
-		if !ok {
+		li, ok := rl.rc.locals[x.Name]
+		if !ok || li.structType == "" {
 			return 0, fmt.Errorf("variable %s is not a struct in recursive function", x.Name)
 		}
-		baseSlot := rl.rc.localMap[x.Name]
-		def := rl.result.Structs[structType]
+		baseSlot := li.slot
+		def := rl.result.Structs[li.structType]
 		fi, ok := def.Field[sel.Sel.Name]
 		if !ok {
 			return 0, fmt.Errorf("unknown field %s", sel.Sel.Name)
@@ -1895,19 +1897,18 @@ func (rl *recLowerer) lowerArrayIncDec(idx *ast.IndexExpr, tok token.Token) erro
 
 // lookupArraySlot returns the base frame slot and array info for an array variable.
 func (rl *recLowerer) lookupArraySlot(name string) (int, recArrayInfo, error) {
-	slot, ok := rl.rc.localMap[name]
+	li, ok := rl.rc.locals[name]
 	if !ok {
 		return 0, recArrayInfo{}, fmt.Errorf("undefined variable in recursive function: %s", name)
 	}
-	info, ok := rl.rc.localArrayInfo[name]
-	if !ok {
+	if li.arrayInfo.size() == 0 {
 		return 0, recArrayInfo{}, fmt.Errorf("variable %s is not an array in recursive function", name)
 	}
-	return slot, info, nil
+	return li.slot, li.arrayInfo, nil
 }
 
 func (rl *recLowerer) lowerStructCompositeLit(name, structType string, comp *ast.CompositeLit) error {
-	baseSlot := rl.rc.localMap[name]
+	baseSlot := rl.rc.locals[name].slot
 	def := rl.result.Structs[structType]
 	rl.zeroFrameSlots(baseSlot, def.Size)
 	// Store field values.
@@ -2437,7 +2438,7 @@ func (rl *recLowerer) preloadVars(stmts []ast.Stmt) {
 	for _, stmt := range stmts {
 		ast.Inspect(stmt, func(n ast.Node) bool {
 			if id, ok := n.(*ast.Ident); ok {
-				if _, exists := rl.rc.localMap[id.Name]; exists {
+				if _, exists := rl.rc.locals[id.Name]; exists {
 					_, _ = rl.lookupVar(id.Name)
 				}
 			}
@@ -2462,10 +2463,11 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 			result := s.Results[0]
 			if id, ok := result.(*ast.Ident); ok {
 				// Variable: load each cell from frame to retReg area.
-				slot, ok := rl.rc.localMap[id.Name]
+				li, ok := rl.rc.locals[id.Name]
 				if !ok {
 					return fmt.Errorf("undefined variable: %s", id.Name)
 				}
+				slot := li.slot
 				for j := range rl.rc.retSize {
 					cell := rl.allocCell()
 					rl.emit(&IRLoadFrame{Dst: cell, Slot: slot + j, FrameSize: rl.rc.frameSize})
@@ -2524,13 +2526,13 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 		// frame first (they may have been modified), then load from frame
 		// (if-bodies may have modified the frame via IRStoreFrame).
 		for _, name := range rl.rc.returnNames {
-			slot := rl.rc.localMap[name]
+			slot := rl.rc.locals[name].slot
 			if reg, ok := rl.loadedMap[slot]; ok {
 				rl.emit(&IRStoreFrame{Slot: slot, Src: reg, FrameSize: rl.rc.frameSize})
 			}
 		}
 		for i, name := range rl.rc.returnNames {
-			slot := rl.rc.localMap[name]
+			slot := rl.rc.locals[name].slot
 			cell := rl.allocCell()
 			rl.emit(&IRLoadFrame{Dst: cell, Slot: slot, FrameSize: rl.rc.frameSize})
 			rl.emit(&IRMove{Dst: rl.rc.retReg + i, Src: cell})
@@ -2548,7 +2550,7 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 }
 
 func (rl *recLowerer) lowerDefer(s *ast.DeferStmt) error {
-	// Capture non-string arguments into frame slots (not in localMap,
+	// Capture non-string arguments into frame slots (not in rc.locals,
 	// so storeAllLocals won't overwrite them).
 	type capturedSlot struct {
 		slot int
@@ -2648,12 +2650,16 @@ func (rl *recLowerer) lowerRecCompositeCompare(e *ast.BinaryExpr) (exprResult, b
 		if !ok {
 			return 0, 0, false
 		}
-		if ai, ok := rl.rc.localArrayInfo[id.Name]; ok {
-			return rl.rc.localMap[id.Name], ai.size(), true
+		li, ok := rl.rc.locals[id.Name]
+		if !ok {
+			return 0, 0, false
 		}
-		if st, ok := rl.rc.localStructTypes[id.Name]; ok {
-			def := rl.result.Structs[st]
-			return rl.rc.localMap[id.Name], def.Size, true
+		if li.arrayInfo.size() > 0 {
+			return li.slot, li.arrayInfo.size(), true
+		}
+		if li.structType != "" {
+			def := rl.result.Structs[li.structType]
+			return li.slot, def.Size, true
 		}
 		return 0, 0, false
 	}
@@ -2722,9 +2728,9 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 	// Handle len() for frame-based arrays.
 	if fn, ok := e.Fun.(*ast.Ident); ok && (fn.Name == "len" || fn.Name == "cap") && len(e.Args) == 1 {
 		if id, ok := e.Args[0].(*ast.Ident); ok {
-			if ai, ok := rl.rc.localArrayInfo[id.Name]; ok {
+			if li, ok := rl.rc.locals[id.Name]; ok && li.arrayInfo.size() > 0 {
 				t := rl.allocCell()
-				rl.emit(&IRConst{Dst: t, Value: byte(ai.elemCount)}) // #nosec G115
+				rl.emit(&IRConst{Dst: t, Value: byte(li.arrayInfo.elemCount)}) // #nosec G115
 				return exprResult{cell: t, temp: true}, nil
 			}
 		}
@@ -2735,8 +2741,8 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 	// Handle method calls: p.sum() -> Point.sum(p)
 	if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
 		if id, ok := sel.X.(*ast.Ident); ok {
-			if structType, ok := rl.rc.localStructTypes[id.Name]; ok {
-				funcName := structType + "." + sel.Sel.Name
+			if li, ok := rl.rc.locals[id.Name]; ok && li.structType != "" {
+				funcName := li.structType + "." + sel.Sel.Name
 				info, ok := rl.result.Funcs[funcName]
 				if !ok {
 					return exprResult{}, fmt.Errorf("undefined method: %s", funcName)
@@ -2846,16 +2852,16 @@ func (rl *recLowerer) emitFrameCompositeRead(baseSlot int, info recArrayInfo, id
 }
 
 // resolveRecFieldDef resolves the struct definition for a field in a selector,
-// using the recursive function's localStructTypes.
+// using the recursive function's locals map.
 func (rl *recLowerer) resolveRecFieldDef(e *ast.SelectorExpr) *StructDef {
 	var parentDef *StructDef
 	switch x := e.X.(type) {
 	case *ast.Ident:
-		structType, ok := rl.rc.localStructTypes[x.Name]
-		if !ok {
+		li, ok := rl.rc.locals[x.Name]
+		if !ok || li.structType == "" {
 			return nil
 		}
-		parentDef = rl.result.Structs[structType]
+		parentDef = rl.result.Structs[li.structType]
 	case *ast.SelectorExpr:
 		parentDef = rl.resolveRecFieldDef(x)
 	}
@@ -2889,12 +2895,12 @@ func (rl *recLowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error)
 	var def *StructDef
 	switch x := e.X.(type) {
 	case *ast.Ident:
-		structType, ok := rl.rc.localStructTypes[x.Name]
-		if !ok {
+		li, ok := rl.rc.locals[x.Name]
+		if !ok || li.structType == "" {
 			return exprResult{}, fmt.Errorf("variable %s is not a struct in recursive function", x.Name)
 		}
-		baseSlot = rl.rc.localMap[x.Name]
-		def = rl.result.Structs[structType]
+		baseSlot = li.slot
+		def = rl.result.Structs[li.structType]
 	case *ast.SelectorExpr:
 		// Chained: r.min.x -> resolve r.min first to get base slot.
 		inner, err := rl.lowerSelectorExpr(x)

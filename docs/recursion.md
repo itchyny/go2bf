@@ -291,9 +291,9 @@ by `lowerIndexExpr`, `lowerArrayAssign`, `lowerArrayIncDec`,
 `lowerSelectorExpr`, and `lowerFieldAssign`.
 
 The `compositeSize(name)` helper resolves the total frame slot count
-for a variable, checking `localArrayInfo` and `localStructTypes`.
-It is used by `lowerRecVarInit` and `lowerDecl` to avoid duplicated
-map lookups.
+for a variable by checking the `arrayInfo` and `structType` fields on
+its `recLocalInfo` entry in `recContext.locals`. It is used by
+`lowerRecVarInit` and `lowerDecl` to avoid duplicated map lookups.
 
 ## Supported Features
 
