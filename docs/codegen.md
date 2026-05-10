@@ -242,10 +242,12 @@ saves 15 moves. This gives 1-3% total output size reduction.
 
 ## Near Temp Allocation
 
-Arithmetic primitives (`genAdd`, `genSub`, `genMul`, `genNot`,
-`genOrder`) allocate algorithm temps for their inner loops. By
-default, temps are allocated sequentially from low positions (3, 6,
-9, ...), which are near the registers (1-7).
+Arithmetic and comparison primitives (`genAdd`, `genSub`, `genMul`,
+`genNot`, `genOrder`, `genEqual`, and the operand-preserving copy
+inside `IRCmp` setup) plus `genStoreFrame` allocate algorithm temps
+for their inner loops. By default, temps are allocated sequentially
+from low positions (3, 6, 9, ...), which are near the registers
+(1-7).
 
 In recursive dispatch phases, operands are phase temps at positions
 25-39. The default allocation places temps 20+ positions away,
@@ -253,9 +255,12 @@ making each loop iteration expensive. `allocNear` detects phase
 temp operands and picks the closest free algorithm temp (typically
 21-23), reducing inner loop distance from ~20 to ~4.
 
-This is not applied to the dispatch loop itself (`genDispatch`),
-where temps are used in the outer while loop alongside the BF
-pointer's home area -- low positions are faster there.
+This is not applied to the dispatch loop itself (`genDispatch`) or
+to `emitIfElse`. Both hold temps live across nested user code that
+may include `IRDivMod`, which calls `allocConsecutive(6)` to get
+six adjacent algo cells. `allocNear` would fragment the pool and
+break the consecutive allocation; sequential `alloc` keeps a
+contiguous run available.
 
 ## Flush-Only Before If
 

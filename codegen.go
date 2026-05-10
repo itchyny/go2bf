@@ -786,8 +786,12 @@ func (g *Generator) genNode(node IRNode) {
 		if !isReg(consumedCell) {
 			g.cache.flushCell(consumedCell)
 		} else {
-			t := g.temps.alloc()
-			ct := g.temps.alloc()
+			src := r2
+			if n.Op == CmpGt || n.Op == CmpLeq {
+				src = r1
+			}
+			t := g.temps.allocNear(src)
+			ct := g.temps.allocNear(src, t)
 			switch n.Op {
 			case CmpGt, CmpLeq:
 				g.copy(t, r1, ct)
@@ -1135,8 +1139,8 @@ func (g *Generator) genBitwise(dst, src1, src2 int, op bitwiseOp) {
 // genEqual sets dst = (a == b) if eq is true, or (a != b) if false.
 // Copies a, subtracts b, checks if result is zero. Consumes b.
 func (g *Generator) genEqual(dst, a, b int, eq bool) {
-	t := g.temps.alloc()
-	ct := g.temps.alloc()
+	t := g.temps.allocNear(dst, a, b)
+	ct := g.temps.allocNear(a, t)
 	defer g.temps.free(t)
 	defer g.temps.free(ct)
 	g.copy(t, a, ct) // t = a (preserve a)
@@ -1442,7 +1446,7 @@ func (g *Generator) genLoadFrame(dst, slot, frameSize int) {
 // After loop, restores src from tmp and restores the breadcrumb guard.
 func (g *Generator) genStoreFrame(slot, src, frameSize int) {
 	g.comment("store frame #%d r%d", slot, src)
-	tmp := g.temps.alloc()
+	tmp := g.temps.allocNear(src)
 	defer g.temps.free(tmp)
 	g.clear(tmp)
 	// Scan to stack end, back up to target slot's guard.
