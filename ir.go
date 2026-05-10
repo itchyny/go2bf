@@ -1,8 +1,9 @@
 package main
 
 // Cell is an abstract tape cell identifier used in the IR.
-// Cells 0..numFixed-1 are reserved for codegen scratch work.
-// Cells numFixed+ are allocated by the lowerer for variables and temps.
+// Cells 0..sentinelFwd are reserved for codegen scratch work.
+// Cells sentinelFwd+1 and beyond are allocated by the lowerer for
+// variables and temps (stack slots).
 type Cell = int
 
 // IRNode is a node in the structured IR.

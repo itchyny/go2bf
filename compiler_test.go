@@ -2211,6 +2211,24 @@ func main() { println(sum(10)) }`,
 			"", "55\n",
 		},
 		{
+			"many locals in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 := n, n, n, n, n, n, n, n, n, n
+	b0, b1, b2, b3, b4, b5, b6, b7, b8, b9 := n, n, n, n, n, n, n, n, n, n
+	c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 := n, n, n, n, n, n, n, n, n, n
+	d0, d1, d2, d3, d4, d5, d6, d7, d8, d9 := n, n, n, n, n, n, n, n, n, n
+	s := f(n - 1)
+	return s + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 +
+		b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 +
+		c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 +
+		d0 + d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9
+}
+func main() { print(f(2)) }`,
+			"", "120", // f(0)=0; f(1)=0+1*40=40; f(2)=40+2*40=120
+		},
+		{
 			"print in recursive function",
 			`package main
 func f(n byte) byte {
@@ -2676,6 +2694,24 @@ func f(n byte) byte {
 }
 func main() { print(f(2)) }`,
 			"", "10", // f(0)=1, f(1)=10 (1+1+...=10), f(2)=10
+		},
+		{
+			"labeled break in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	a := f(n - 1)
+outer:
+	for i := byte(0); i < 4; i++ {
+		for j := byte(0); j < 4; j++ {
+			if i*j > 3 { break outer }
+			print(i, j)
+		}
+	}
+	return a
+}
+func main() { f(1) }`,
+			"", "00010203101112132021",
 		},
 		{
 			"range with value in recursive function",
@@ -11019,11 +11055,19 @@ func main() {
 			`package main
 func f(n byte) byte {
 	if n == 0 { return 0 }
-	a := n; b := n; c := n; d := n
-	e := n; g := n; h := n; i := n
-	j := n
+	a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 := n, n, n, n, n, n, n, n, n, n
+	b0, b1, b2, b3, b4, b5, b6, b7, b8, b9 := n, n, n, n, n, n, n, n, n, n
+	c0, c1, c2, c3, c4, c5, c6, c7, c8, c9 := n, n, n, n, n, n, n, n, n, n
+	d0, d1, d2, d3, d4, d5, d6, d7, d8, d9 := n, n, n, n, n, n, n, n, n, n
+	e0, e1, e2, e3, e4, e5, e6, e7, e8, e9 := n, n, n, n, n, n, n, n, n, n
+	g0, g1, g2, g3, g4, g5, g6, g7, g8, g9 := n, n, n, n, n, n, n, n, n, n
 	s := f(n - 1)
-	return s + a + b + c + d + e + g + h + i + j
+	return s + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 +
+		b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9 +
+		c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 +
+		d0 + d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9 +
+		e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7 + e8 + e9 +
+		g0 + g1 + g2 + g3 + g4 + g5 + g6 + g7 + g8 + g9 
 }
 func main() { putchar(f(1)) }`,
 			"too many local variables in recursive function",

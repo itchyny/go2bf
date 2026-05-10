@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -243,7 +244,7 @@ func Lower(result *AnalysisResult) (*Program, error) {
 	l := &Lowerer{
 		result:    result,
 		fset:      result.fset,
-		nextCell:  numFixed,
+		nextCell:  Cell(sentinelFwd + 1),
 		shadowing: map[string]int{},
 	}
 
@@ -301,6 +302,13 @@ func Lower(result *AnalysisResult) (*Program, error) {
 
 // Cell allocation.
 
+// errTooManyLocalsInRec signals that a recursive function's per-phase
+// allocation exceeded the phase-temp pool. The compile driver detects
+// this via errors.Is and retries with a larger pool.
+var errTooManyLocalsInRec = errors.New(
+	"too many local variables in recursive function",
+)
+
 func (l *Lowerer) allocCell() Cell {
 	if n := len(l.freeCells); n > 0 {
 		c := l.freeCells[n-1]
@@ -314,10 +322,13 @@ func (l *Lowerer) allocCell() Cell {
 		c = l.nextCell
 		l.nextCell++
 	}
-	// In recursive phase lowering, cells 27-39 are phase temps. If we run out,
-	// report an error - the function has too many local variables for a single phase.
+	// In recursive phase lowering, phase temps live at positions
+	// [phaseTempBase, sentinelFwd) skipping highway markers. Allocating
+	// past the forward sentinel signals the per-phase pool overflowed;
+	// the compile driver will retry with a bumped sentinelFwd until it
+	// fits or hits the stride cap.
 	if l.recFrameSize > 0 && c >= sentinelFwd {
-		l.recAllocErr = fmt.Errorf("too many local variables in recursive function")
+		l.recAllocErr = errTooManyLocalsInRec
 	}
 	return c
 }
@@ -325,6 +336,18 @@ func (l *Lowerer) allocCell() Cell {
 func (l *Lowerer) allocCells(n int) Cell {
 	base := l.nextCell
 	l.nextCell += n
+	if l.recFrameSize > 0 {
+		for j := range n {
+			if base+j > 0 && (base+j)%highwayStride == 0 && base+j < sentinelFwd {
+				base = base + j + 1
+				l.nextCell = base + n
+				break
+			}
+		}
+		if base+n-1 >= sentinelFwd {
+			l.recAllocErr = errTooManyLocalsInRec
+		}
+	}
 	return base
 }
 
@@ -1182,7 +1205,7 @@ func (l *Lowerer) lowerSliceFromSliceExpr(si sliceInfo, se *ast.SliceExpr) error
 	case *arrayBinding:
 		// Slice from array: s = a[low:high]
 		ai := b.info
-		baseSlot := ai.base - numFixed
+		baseSlot := ai.base - Cell(sentinelFwd+1)
 		var low, high int
 		if se.Low != nil {
 			v, ok := l.constValue(se.Low)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -29,12 +30,22 @@ func compile(files []*ast.File, fset *token.FileSet, debug bool) (string, error)
 	if err != nil {
 		return "", err
 	}
-	prog, err := Lower(info)
-	if err != nil {
-		return "", err
+	defer func(s int) { sentinelFwd = s }(sentinelFwd)
+	maxSentinelFwd := sentinelFwd + maxSentinelBumps*highwayStride
+	var prog *Program
+	for {
+		prog, err = Lower(info)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errTooManyLocalsInRec) || sentinelFwd >= maxSentinelFwd {
+			return "", err
+		}
+		sentinelFwd += highwayStride
 	}
-	if prog.CellsUsed-numFixed > 255 {
-		return "", fmt.Errorf("too many variables: %d stack slots (max 255)", prog.CellsUsed-numFixed)
+	if prog.CellsUsed-(sentinelFwd+1) > 255 {
+		return "", fmt.Errorf(
+			"too many variables: %d stack slots (max 255)", prog.CellsUsed-(sentinelFwd+1))
 	}
 	OptimizeIR(prog)
 	return Optimize(Generate(prog, debug)), nil

@@ -106,7 +106,7 @@ Each phase starts with `noRetFlag = 1`. A `return` statement:
 
 The call setup at the end of each phase is guarded by
 `if noRetFlag { ... }`. If the base case returned in the `preStmts`
-(`noRetFlag`=0), the child frame push is skipped. The dispatch loop sees
+(`noRetFlag = 0`), the child frame push is skipped. The dispatch loop sees
 the decremented `active` and processes the parent frame's next phase.
 
 ```text
@@ -190,7 +190,7 @@ to call B.
 
 When `$cond` is true: phase 0 pushes a child, which eventually returns.
 Phase 1 loads the result, and `if $cond { return }` executes, setting
-`noRetFlag`=0. Call B is skipped.
+`noRetFlag = 0`. Call B is skipped.
 
 ## Recursion in Switch
 
@@ -251,18 +251,30 @@ base lowerer.
 
 ## Phase Temps
 
-Recursive dispatch uses phase temp cells (tape positions 25-39) instead
-of stack slots for dispatch control variables:
+Recursive dispatch uses phase temp cells (tape positions starting at
+`phaseTempBase = 25`, up to but not including `sentinelFwd`, skipping
+highway markers) instead of stack slots for dispatch control variables:
 
 | Position | Purpose |
 | -------- | ------- |
 | 25 | `activeReg` - recursion depth counter |
 | 26 | `retReg` - return value transfer |
-| 27-31, 33-39 | available for phase code (`noRetFlag`, `condVar`, etc.) |
+| 27 onward | available for phase code (`noRetFlag`, `condVar`, etc.) |
 
 Using fixed tape positions avoids cache/stack conflicts during the
 dispatch loop, since the dispatch code itself reads and writes frame
 slots.
+
+The phase-temp area is **dynamic**: `sentinelFwd` defaults to 24,
+which means the area is empty -- programs that don't compile recursive
+functions pay nothing for the dispatch infrastructure. When a
+recursive function is lowered, the compile driver bumps `sentinelFwd`
+by `highwayStride = 8` (re-running `Lower`) until the per-phase
+allocation fits, capped at 5 strides. Each bump promotes the
+previous sentinel position into a marker and opens a new phase-temp
+segment. If lowering still overflows at the cap, the compile fails
+with `errTooManyLocalsInRec`. See [`tape.md`](tape.md) for the
+geometry.
 
 ## Deferred Calls
 

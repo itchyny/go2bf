@@ -7,22 +7,8 @@ import (
 )
 
 // CPU execution model with highway markers for fast navigation.
-//
-// Tape layout (stride-8 highway):
-//
-//    0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
-//    0  R  R  T  R  R  T  R  1  [    algo temps   ]  1 [    algo temps    ]
-//    ^ backward sentinel     ^ marker                ^ marker
-//
-//   24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 ...
-//    1 [   phase temps    ]  1 [   phase temps    ]  0 [pad] [  stack...  ]
-//    ^ marker                ^ marker                ^ forward sentinel
-//
-// R = register, T = algo temp (interleaved for neighbor optimization).
-// Position 0 is always 0 (backward sentinel). Position 40 is always 0 (forward sentinel).
-// Markers at positions 8, 16, 24, 32 are always 1.
-// [>>>>>>>>] from any marker scans to sentinel (40). [<<<<<<<<] from any marker scans to position 0.
-// Positions 25-39 are reserved for phase temps used by recursive dispatch (skipping marker at 32).
+// Tape layout, sentinel positions, and the bump-on-overflow scheme
+// for phase temps are documented in docs/tape.md.
 
 // Tape positions for registers. Interleaved with algo temps at 3, 6 so
 // every register has at least one distance-1 neighbor.
@@ -36,13 +22,24 @@ var algoTempPositions = []int{
 }
 
 const (
-	numRegs       = 5
-	numFixed      = 41 // positions 0-40 are fixed (forward sentinel at 40)
-	sentinelBack  = 0  // backward sentinel
-	sentinelFwd   = 40 // forward sentinel / stack sentinel
-	highwayStride = 8  // [>>>>>>>>] stride
-	phaseTempBase = 25 // first phase temp (positions 25-39)
+	numRegs          = 5
+	sentinelBack     = 0  // backward sentinel
+	highwayStride    = 8  // [>>>>>>>>] stride
+	phaseTempBase    = 25 // first phase temp
+	maxSentinelBumps = 8  // max bumps to sentinelFwd before giving up
 )
+
+// sentinelFwd is the forward sentinel position (always 0 on the tape).
+// Cells with IDs 0..sentinelFwd map directly to those tape positions
+// and form the fixed CPU area (registers, algo temps, phase temps);
+// the first stack slot has cell ID sentinelFwd+1 and lives further
+// up the tape past two pad cells (see stackValuePos).
+//
+// It's a var rather than a const because the compile driver bumps it
+// by highwayStride (8) when the default phase-temp pool overflows
+// during recursive lowering -- the larger pool covers programs that
+// would otherwise hit "too many local variables in recursive function".
+var sentinelFwd = 24
 
 // Generator converts IR to Brainfuck code using a register + stack model.
 // 5 registers at positions 1,2,4,5,7 (interleaved with algo temps at 3,6 for
@@ -296,11 +293,11 @@ func (rc *regCache) dropCell(cell int) {
 // Stack helpers.
 
 func slotOf(cell int) int {
-	return cell - numFixed
+	return cell - (sentinelFwd + 1)
 }
 
 func isReg(cell int) bool {
-	return cell < numFixed
+	return cell <= sentinelFwd
 }
 
 func stackValuePos(slot int) int {
@@ -309,7 +306,7 @@ func stackValuePos(slot int) int {
 
 // Generate produces Brainfuck code. If debug is true, comments are emitted.
 func Generate(prog *Program, debug bool) string {
-	numSlots := prog.CellsUsed - numFixed
+	numSlots := prog.CellsUsed - (sentinelFwd + 1)
 	g := &Generator{
 		temps:     newPosAllocator(algoTempPositions),
 		frameSize: numSlots,
@@ -320,10 +317,7 @@ func Generate(prog *Program, debug bool) string {
 		g.cache.regs[i].slot = -1
 	}
 
-	g.comment("memory initialization")
-	for m := highwayStride; m < sentinelFwd; m += highwayStride {
-		g.incr(m)
-	}
+	g.genHighwayMarkers()
 	if numSlots > 0 {
 		g.genFramePush(numSlots)
 	}
@@ -1358,6 +1352,26 @@ func (g *Generator) emitSetViaMul(n int) {
 	g.emit(strings.Repeat("+", mb))
 	g.emit(">-]<")
 	g.emit(strings.Repeat("+", mr))
+}
+
+// genHighwayMarkers sets every highway marker cell (multiples of
+// highwayStride below sentinelFwd) to 1. For up to 4 markers the
+// unrolled `>>>>>>>>+` per marker is shortest; for 5 or more, a
+// walking-counter loop with stride highwayStride wins (the same
+// technique genFramePush uses, just at stride 8 instead of 3).
+func (g *Generator) genHighwayMarkers() {
+	g.comment("initialize markers")
+	if n := sentinelFwd/highwayStride - 1; n < 5 {
+		for m := highwayStride; m < sentinelFwd; m += highwayStride {
+			g.incr(m)
+		}
+	} else {
+		g.emitAdd(highwayStride-1, n)
+		rights := strings.Repeat(">", highwayStride)
+		lefts := strings.Repeat("<", highwayStride)
+		g.emit("[>+<-[" + rights + "+" + lefts + "-]" + rights + "]")
+		g.pos = sentinelFwd - 1
+	}
 }
 
 // Frame operations (recursion).
