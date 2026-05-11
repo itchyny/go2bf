@@ -439,9 +439,8 @@ go2bf extensions:
   return values, and locals must be `byte`, `uint16`,
   or `uint32`. Pointers, struct, array, slice, `uint64`,
   mutual recursion, recursive calls inside `for` loops,
-  bitwise operators (`&`/`|`/`^`/`&^` and the compound
-  assigns), recursive calls to other recursive functions,
-  and lexical shadowing of locals are not supported.
+  recursive calls to other recursive functions, and
+  lexical shadowing of locals are not supported.
 - Maximum 255 stack slots (variables + temporaries)
   per program. Slice backing arrays share this space;
   programs that allocate many or large slices at runtime

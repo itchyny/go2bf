@@ -1571,14 +1571,27 @@ func (g *Generator) walkToDynSlot(baseSlot, idx int) {
 //	}
 func (g *Generator) genDispatch(n *IRDispatch) {
 	g.comment("dispatch {")
-	phase := g.temps.alloc()
-	pr := g.temps.alloc()   // working copy of phase (decremented to find match)
-	flag := g.temps.alloc() // temp for phase matching
-	activeTemp := g.temps.alloc()
-	defer g.temps.free(phase)
-	defer g.temps.free(pr)
-	defer g.temps.free(flag)
-	defer g.temps.free(activeTemp)
+	// Two layouts: when the rec lowerer detected bitwise ops it
+	// reserved four phase-temp cells (Phase/Pr/Flag/ActiveTemp) so
+	// the algo-temp pool stays fully available to genBitwise.
+	// Otherwise (the common case) we allocate the four from the
+	// algo-temp pool here -- cheaper navigation, smaller BF.
+	var phase, pr, flag, activeTemp int
+	if n.Phase != 0 {
+		phase = int(n.Phase)
+		pr = int(n.Pr)
+		flag = int(n.Flag)
+		activeTemp = int(n.ActiveTemp)
+	} else {
+		phase = g.temps.alloc()
+		pr = g.temps.alloc()
+		flag = g.temps.alloc()
+		activeTemp = g.temps.alloc()
+		defer g.temps.free(phase)
+		defer g.temps.free(pr)
+		defer g.temps.free(flag)
+		defer g.temps.free(activeTemp)
+	}
 
 	// Copy active counter to a temp (active is a phase-temp cell).
 	ct := g.temps.alloc()

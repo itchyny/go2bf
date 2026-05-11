@@ -298,10 +298,18 @@ type IRStoreFrame struct {
 func (*IRStoreFrame) irNode() {}
 
 // IRDispatch is a phase dispatch loop for recursive functions.
+//
+// Phase, Pr, Flag, ActiveTemp are phase-temp cells reserved by the
+// rec lowerer for genDispatch's internal state. They're non-zero
+// only when the function uses bitwise operators (which need the
+// full algo-temp pool for genBitwise's ~11-temp peak); otherwise
+// they're left zero and genDispatch allocates the four cells from
+// the algo-temp pool itself -- closer to the registers.
 type IRDispatch struct {
-	Active    Cell
-	FrameSize int
-	Phases    []*IRBlock
+	Active                      Cell
+	Phase, Pr, Flag, ActiveTemp Cell
+	FrameSize                   int
+	Phases                      []*IRBlock
 }
 
 func (*IRDispatch) irNode() {}

@@ -2961,6 +2961,64 @@ func main() { print(f(5)) }`,
 			"", "100",
 		},
 		{
+			"bitwise ops in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	a := byte(12) & byte(10)
+	b := byte(12) | byte(10)
+	c := byte(12) ^ byte(10)
+	d := byte(12) &^ byte(10)
+	return f(n - 1) + a + b + c + d
+}
+func main() { print(f(2)) }`,
+			"", "64", // a=8, b=14, c=6, d=4; sum=32 per level; f(2)=2*32
+		},
+		{
+			"bitwise compound assigns in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	x := byte(15)
+	x &= byte(12)
+	x |= byte(3)
+	x ^= byte(7)
+	return f(n - 1) + x
+}
+func main() { print(f(3)) }`,
+			"", "24", // x ends at 8; f(3) = 3*8
+		},
+		{
+			"uint16 xor in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	return f(n - 1) + (uint16(0x1234) ^ uint16(0x00FF))
+}
+func main() { print(f(3)) }`,
+			"", "14433", // 0x12CB = 4811; f(3) = 3*4811
+		},
+		{
+			"uint32 xor in recursive function",
+			`package main
+func f(n byte) uint32 {
+	if n == 0 { return uint32(0) }
+	return f(n - 1) + (uint32(0x12345678) ^ uint32(0x00FF00FF))
+}
+func main() { print(f(3)) }`,
+			"", "945947541", // 0x12CB5687 = 315315847; f(3) = 3*315315847
+		},
+		{
+			"uint32 and in recursive function",
+			`package main
+func f(n byte) uint32 {
+	if n == 0 { return uint32(0xABCDEF00) }
+	return f(n - 1) & uint32(0xFF00FF00)
+}
+func main() { print(f(3)) }`,
+			"", "2868965120", // 0xABCDEF00 & 0xFF00FF00 = 0xAB00EF00
+		},
+		{
 			"recursive mul div mod",
 			`package main
 func f(n byte) byte {
@@ -10678,31 +10736,6 @@ func f(p *byte, n byte) byte {
 }
 func main() { x := byte(7); print(f(&x, 3)) }`,
 			"pointer parameter p in recursive function f is not supported",
-		},
-		{
-			"bitwise op in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	x := byte(7) ^ byte(1)
-	r := f(n - 1)
-	return x + r
-}
-func main() { print(f(3)) }`,
-			"bitwise operator ^ in recursive function is not supported",
-		},
-		{
-			"bitwise compound assign in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	x := byte(7)
-	x &= byte(3)
-	r := f(n - 1)
-	return x + r
-}
-func main() { print(f(3)) }`,
-			"bitwise assignment &= in recursive function is not supported",
 		},
 		{
 			"struct param in recursive function",

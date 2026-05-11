@@ -261,8 +261,24 @@ highway markers) instead of stack slots for dispatch control variables:
 | Position | Purpose |
 | -------- | ------- |
 | 25 | `activeReg` - recursion depth counter |
-| 26 | `retReg` - return value transfer |
-| 27 onward | available for phase code (`noRetFlag`, `condVar`, etc.) |
+| 26..26+retSize-1 | `retReg` - return value transfer |
+| next 4 (bitwise only) | `genDispatch`'s working state (`phase`, `pr`, `flag`, `activeTemp`) |
+| then onward | available for phase code (`noRetFlag`, `condVar`, etc.) |
+
+`genDispatch`'s 4 working-state cells normally come from the codegen's
+algo-temp pool, close to the registers so frame loads in phase code
+stay cheap. But `genBitwise` peaks at ~11 algo temps and the dispatch
+loop holds 4 -- the combination overflows when nested under a few
+if-guards. So `lowerGeneralRecursion` checks `hasBitwise(body)` and
+*only when bitwise is present* reserves 4 phase-temp cells for the
+dispatch loop, freeing the full algo-temp pool. `IRDispatch.Phase` /
+`Pr` / `Flag` / `ActiveTemp` carry the assigned positions to
+`genDispatch`; when they're zero (the non-bitwise case), `genDispatch`
+falls back to allocating from the algo-temp pool. Functions that
+don't use bitwise keep the cheaper layout -- phase code's frame
+loads sit four positions lower and the per-iteration `<>` navigation
+is correspondingly smaller (5-13% fewer BF bytes on the existing
+recursive testdata).
 
 Using fixed tape positions avoids cache/stack conflicts during the
 dispatch loop, since the dispatch code itself reads and writes frame
@@ -311,11 +327,8 @@ two places:
   types when the callee is recursive.
 - **`rejectComposites`** (`lowerer_rec.go`) walks the body and
   flags any `var x [N]T`, `var p Struct`, `:= [N]T{...}`,
-  `:= Struct{...}`, any `[]T` slice expression, or any bitwise
-  operator (`&`, `|`, `^`, `&^`, `&=`, `|=`, `^=`, `&^=`) before
-  phase splitting. Bitwise ops are rejected because their codegen
-  needs ~10 algorithm temps in addition to the 4 the dispatch loop
-  holds, and the algo-temp pool only has 16.
+  `:= Struct{...}`, or any `[]T` slice expression before phase
+  splitting.
 
 Within those constraints, most Go features work the same as in
 non-recursive functions:
@@ -471,11 +484,6 @@ A few shared helpers reduce boilerplate across the `recLowerer` body:
 - `uint64` parameters, returns, and locals are rejected;
   `uint16` and `uint32` work. See [Multi-Byte Integers](#multi-byte-integers)
   for why eight-cell layouts collide with highway markers.
-- Bitwise operators (`&`, `|`, `^`, `&^`) and their compound
-  assigns are rejected in recursive function bodies. Their
-  codegen needs ~10 algorithm temps; the dispatch loop already
-  holds 4 of the 16 in the algo-temp pool, so any bitwise op
-  would overflow it.
 - Calling another recursive function from inside a recursive
   function is not supported (only inlined non-recursive helpers).
   Mutual recursion is rejected upfront.

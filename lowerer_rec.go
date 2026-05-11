@@ -38,19 +38,23 @@ type recLocalInfo struct {
 // returns). Pointer, struct, array, slice, and `uint64` types are
 // rejected upfront, so this struct does not track that metadata.
 type recContext struct {
-	funcName    string
-	frameSize   int
-	slotPhase   int                     // always 0 (dispatch phase number)
-	slotRet     int                     // always 1 (single-byte return slot; multi-byte uintN returns flow through retReg)
-	paramBase   int                     // always 2 (params start here, one cell each)
-	localBase   int                     // 2 + len(params); locals and synthetic temps start here
-	locals      map[string]recLocalInfo // name -> slot + intSize (also covers params, named returns, and synthetic temps like $cond/$switch)
-	phases      []*IRBlock              // dispatch phases produced by buildPhases
-	activeReg   Cell                    // phase-temp cell holding the recursion depth counter
-	retReg      Cell                    // phase-temp cell at retReg..retReg+retSize-1 carrying child return values
-	retSize     int                     // number of return cells (1 for byte, 2 or 4 for uint16/uint32)
-	noRetFlag   Cell                    // phase temp: 1 if no return happened in this phase, 0 after return
-	returnNames []string                // named return value names (empty if unnamed)
+	funcName  string
+	frameSize int
+	slotPhase int                     // always 0 (dispatch phase number)
+	slotRet   int                     // always 1 (single-byte return slot; multi-byte uintN returns flow through retReg)
+	paramBase int                     // always 2 (params start here, one cell each)
+	localBase int                     // 2 + len(params); locals and synthetic temps start here
+	locals    map[string]recLocalInfo // name -> slot + intSize (also covers params, named returns, and synthetic temps like $cond/$switch)
+	phases    []*IRBlock              // dispatch phases produced by buildPhases
+	activeReg Cell                    // phase-temp cell holding the recursion depth counter
+	retReg    Cell                    // phase-temp cell at retReg..retReg+retSize-1 carrying child return values
+	retSize   int                     // number of return cells (1 for byte, 2 or 4 for uint16/uint32)
+
+	dispatchPhase, dispatchPr    Cell     // dispatch-loop working state, reserved in the phase-temp area so
+	dispatchFlag, dispatchActive Cell     // they don't compete with phase code for codegen's algo-temp pool.
+	phaseCodeBase                int      // first phase-temp cell available to phase code (past dispatch's reserved 4)
+	noRetFlag                    Cell     // phase temp: 1 if no return happened in this phase, 0 after return
+	returnNames                  []string // named return value names (empty if unnamed)
 
 	deferCaptureSlots []int      // pre-allocated frame slots for defer captures
 	deferCaptureIdx   int        // index into deferCaptureSlots during lowering
@@ -127,6 +131,33 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	rc.activeReg = phaseTempBase  // tape position 25
 	rc.retReg = phaseTempBase + 1 // tape position 26 (base of return area)
 
+	// By default the dispatch loop's four working cells (phase, pr,
+	// flag, activeTemp) come from the codegen's algo-temp pool --
+	// close to the registers, so frame loads in phase code stay
+	// cheap. Functions that use bitwise operators need the full
+	// algo-temp pool for genBitwise's ~11-temp peak, so for them we
+	// relocate the dispatch cells into the phase-temp area, freeing
+	// the algo-temp pool at the cost of pushing phase code's frame
+	// slots four positions higher (more `<>` navigation per access).
+	rc.phaseCodeBase = phaseTempBase + 1 + retSize
+	if hasBitwise(info.Body) {
+		pos := rc.phaseCodeBase
+		dispatchCells := make([]Cell, 0, 4)
+		for len(dispatchCells) < 4 {
+			if pos > 0 && pos%highwayStride == 0 {
+				pos++
+				continue
+			}
+			dispatchCells = append(dispatchCells, Cell(pos))
+			pos++
+		}
+		rc.dispatchPhase = dispatchCells[0]
+		rc.dispatchPr = dispatchCells[1]
+		rc.dispatchFlag = dispatchCells[2]
+		rc.dispatchActive = dispatchCells[3]
+		rc.phaseCodeBase = pos
+	}
+
 	// Evaluate arguments. Byte args produce 1 cell;
 	// uint16/uint32 args produce intSize contiguous cells.
 	type argCells struct {
@@ -201,9 +232,13 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 
 	// Emit the dispatch loop.
 	l.emit(&IRDispatch{
-		Active:    rc.activeReg,
-		FrameSize: rc.frameSize,
-		Phases:    rc.phases,
+		Active:     rc.activeReg,
+		Phase:      rc.dispatchPhase,
+		Pr:         rc.dispatchPr,
+		Flag:       rc.dispatchFlag,
+		ActiveTemp: rc.dispatchActive,
+		FrameSize:  rc.frameSize,
+		Phases:     rc.phases,
 	})
 
 	// After dispatch loop exits, retReg area holds the return value(s).
@@ -229,13 +264,37 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	return retCells, nil
 }
 
-// rejectComposites scans the function body for any struct, array, slice
-// usage, or bitwise operator and returns an error if found. Recursive
-// functions are scalar-only by design (params, returns, and locals).
-// Bitwise ops are rejected because their codegen (decompose-into-bits
-// with two `genMul`s per bit) peaks at ~11 algo temps; the dispatch
-// loop holds 4 of the 16 in the pool, so the combination overflows
-// "out of temporary cells" deep in codegen otherwise.
+// hasBitwise reports whether a function body uses any bitwise operator
+// (`&`, `|`, `^`, `&^`) or compound assign. The result decides whether
+// lowerGeneralRecursion relocates the dispatch cells into the phase-temp
+// area: with bitwise present we need the full algo-temp pool for
+// genBitwise; otherwise we keep the cheaper algo-temp layout.
+func hasBitwise(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch n := n.(type) {
+		case *ast.BinaryExpr:
+			switch n.Op {
+			case token.AND, token.OR, token.XOR, token.AND_NOT:
+				found = true
+			}
+		case *ast.AssignStmt:
+			switch n.Tok {
+			case token.AND_ASSIGN, token.OR_ASSIGN, token.XOR_ASSIGN, token.AND_NOT_ASSIGN:
+				found = true
+			}
+		}
+		return !found
+	})
+	return found
+}
+
+// rejectComposites scans the function body for any struct, array, or
+// slice usage and returns an error if found. Recursive functions are
+// scalar-only by design (params, returns, and locals).
 func (l *Lowerer) rejectComposites(body *ast.BlockStmt) error {
 	var err error
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -258,16 +317,6 @@ func (l *Lowerer) rejectComposites(body *ast.BlockStmt) error {
 			// Point{...}, etc.). The non-struct idents pass through.
 			if l.structDef(n) != nil {
 				err = fmt.Errorf("struct usage in recursive function is not supported")
-			}
-		case *ast.BinaryExpr:
-			switch n.Op {
-			case token.AND, token.OR, token.XOR, token.AND_NOT:
-				err = fmt.Errorf("bitwise operator %s in recursive function is not supported", n.Op)
-			}
-		case *ast.AssignStmt:
-			switch n.Tok {
-			case token.AND_ASSIGN, token.OR_ASSIGN, token.XOR_ASSIGN, token.AND_NOT_ASSIGN:
-				err = fmt.Errorf("bitwise assignment %s in recursive function is not supported", n.Tok)
 			}
 		}
 		return true
@@ -1003,8 +1052,10 @@ func (l *Lowerer) enterPhase(rc *recContext) func() {
 	savedNext := l.nextCell
 	savedFree := l.freeCells
 	l.nodes = nil
-	// Phase code uses cells starting just past activeReg + retReg.
-	l.nextCell = phaseTempBase + 1 + rc.retSize
+	// Phase code uses cells starting past activeReg, retReg, and the
+	// four dispatch-reserved cells -- phaseCodeBase already accounts
+	// for highway-marker skipping done at allocation time.
+	l.nextCell = Cell(rc.phaseCodeBase)
 	l.freeCells = nil
 	l.recFrameSize = rc.frameSize
 	l.recAllocErr = nil
