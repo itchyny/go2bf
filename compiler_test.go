@@ -2106,44 +2106,6 @@ func f(n byte, acc byte) byte {
 func main() { print(f(5, 0)) }`,
 			"", "15",
 		},
-		{
-			"tail recursive struct return",
-			`package main
-type Point struct { x, y byte }
-func walk(p Point, n byte) Point {
-	if n == 0 { return p }
-	return walk(Point{p.x + 1, p.y + 2}, n-1)
-}
-func main() {
-	p := walk(Point{0, 0}, 5)
-	print(p.x); print(" "); println(p.y)
-}`,
-			"", "5 10\n",
-		},
-		{
-			"tail recursive array return",
-			`package main
-func walk(a [2]byte, n byte) [2]byte {
-	if n == 0 { return a }
-	return walk([2]byte{a[0] + 1, a[1] + 2}, n-1)
-}
-func main() {
-	r := walk([2]byte{0, 0}, 3)
-	print(r[0]); print(" "); println(r[1])
-}`,
-			"", "3 6\n",
-		},
-		{
-			"tail recursive struct array literal arg",
-			`package main
-type Point struct { x byte; y byte }
-func f(n byte, a [2]Point) byte {
-	if n == 0 { return a[0].x + a[1].y }
-	return f(n-1, [2]Point{Point{1, 2}, Point{3, 4}})
-}
-func main() { println(f(2, [2]Point{Point{1, 2}, Point{3, 4}})) }`,
-			"", "5\n",
-		},
 		// --- General recursion ---
 		{
 			"general rec base case",
@@ -2592,18 +2554,6 @@ func main() { print(f(6)) }`,
 			"", "8",
 		},
 		{
-			"struct return from recursive function",
-			`package main
-type Point struct { x byte; y byte }
-func f(n byte) Point {
-	if n == 0 { return Point{1, 1} }
-	p := f(n - 1)
-	return Point{p.x * 2, p.y + 1}
-}
-func main() { p := f(3); println(p.x, p.y) }`,
-			"", "8 4\n",
-		},
-		{
 			"for loop in recursive function",
 			`package main
 func f(n byte) byte {
@@ -2712,21 +2662,6 @@ outer:
 }
 func main() { f(1) }`,
 			"", "00010203101112132021",
-		},
-		{
-			"range with value in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	a := [3]byte{n, n+1, n+2}
-	s := byte(0)
-	for _, v := range a {
-		s += v
-	}
-	return s
-}
-func main() { print(f(2)) }`,
-			"", "9",
 		},
 		{
 			"range with key in recursive function",
@@ -3009,123 +2944,6 @@ func main() { println(f(0)) }`,
 			"", "5\n",
 		},
 		{
-			"array composite literal in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [3]byte{1, 2, 3}
-	if n == 0 { return a[0] + a[1] + a[2] }
-	b := f(n - 1)
-	return b + a[0]
-}
-func main() { print(f(2)) }`,
-			"", "8",
-		},
-		{
-			"array index assign in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [3]byte{0, 0, 0}
-	a[0] = n
-	a[1] = n * 2
-	if n == 0 { return 0 }
-	b := f(n - 1)
-	return b + a[0] + a[1]
-}
-func main() { print(f(3)) }`,
-			"", "18",
-		},
-		{
-			"var array in recursive function",
-			`package main
-func f(n byte) byte {
-	var a [3]byte
-	a[0] = n
-	a[1] = n + 1
-	a[2] = n + 2
-	if n == 0 { return a[0] + a[1] + a[2] }
-	b := f(n - 1)
-	return b + a[2]
-}
-func main() { print(f(3)) }`,
-			"", "15",
-		},
-		{
-			"array inc/dec in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [2]byte{10, 20}
-	a[0]++
-	a[1]--
-	if n == 0 { return a[0] + a[1] }
-	b := f(n - 1)
-	return b
-}
-func main() { print(f(1)) }`,
-			"", "30",
-		},
-		{
-			"array variable index read in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [4]byte{10, 20, 30, 40}
-	if n == 0 { return a[0] }
-	b := f(n - 1)
-	return a[n] + b
-}
-func main() { print(f(3)) }`,
-			"", "100",
-		},
-		{
-			"array variable index write in recursive function",
-			`package main
-func f(n byte) byte {
-	var a [3]byte
-	a[n] = n * 10
-	if n == 0 { return a[0] }
-	b := f(n - 1)
-	return a[n] + b
-}
-func main() { print(f(2)) }`,
-			"", "30",
-		},
-		{
-			"array len in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [5]byte{1, 2, 3, 4, 5}
-	if n == 0 { return byte(len(a)) }
-	b := f(n - 1)
-	return b
-}
-func main() { print(f(1)) }`,
-			"", "5",
-		},
-		{
-			"array variable index inc/dec in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [3]byte{10, 20, 30}
-	a[n]++
-	if n == 0 { return a[0] }
-	b := f(n - 1)
-	return a[n] + b
-}
-func main() { print(f(2)) }`,
-			"", "63",
-		},
-		{
-			"array key-value literal in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [4]byte{1: 10, 3: 30}
-	if n == 0 { return a[1] + a[3] }
-	b := f(n - 1)
-	return b
-}
-func main() { print(f(1)) }`,
-			"", "40",
-		},
-		{
 			"switch on param in recursive function",
 			`package main
 func f(n byte) byte {
@@ -3153,117 +2971,6 @@ func f(n byte) byte {
 }
 func main() { f(3) }`,
 			"", "123",
-		},
-		{
-			"array return from recursive function",
-			`package main
-func f(n byte) [3]byte {
-	if n == 0 { return [3]byte{1, 2, 3} }
-	a := f(n - 1)
-	return [3]byte{a[0] + 1, a[1] + 1, a[2] + 1}
-}
-func main() {
-	a := f(2)
-	print(a[0], a[1], a[2])
-}`,
-			"", "345",
-		},
-		{
-			"array variable return from recursive function",
-			`package main
-func f(n byte) [2]byte {
-	var a [2]byte
-	a[0] = n
-	a[1] = n * 2
-	if n == 0 { return a }
-	b := f(n - 1)
-	a[0] = a[0] + b[0]
-	return a
-}
-func main() {
-	r := f(3)
-	print(r[0], r[1])
-}`,
-			"", "66",
-		},
-		{
-			"struct param in recursive function",
-			`package main
-type Point struct { x byte; y byte }
-func scale(p Point, n byte) Point {
-	if n == 0 { return Point{0, 0} }
-	q := scale(p, n-1)
-	return Point{q.x + p.x, q.y + p.y}
-}
-func main() {
-	r := scale(Point{3, 4}, 3)
-	print(r.x, r.y)
-}`,
-			"", "912",
-		},
-		{
-			"struct literal arg in recursive call",
-			`package main
-type Point struct { x, y byte }
-func f(p Point, n byte) byte {
-	if n == 0 { return p.x + p.y }
-	r := f(Point{p.x + 1, p.y + 2}, n - 1)
-	return r
-}
-func main() { println(f(Point{0, 0}, 3)) }`,
-			"", "9\n",
-		},
-		{
-			"binary search recursive",
-			`package main
-func bsearch(a [8]byte, target, lo, hi byte) byte {
-	if lo >= hi { return 255 }
-	mid := (lo + hi) / 2
-	if a[mid] == target { return mid }
-	if a[mid] < target {
-		return bsearch(a, target, mid+1, hi)
-	}
-	return bsearch(a, target, lo, mid)
-}
-func main() {
-	a := [8]byte{2, 5, 8, 12, 16, 23, 38, 56}
-	print(bsearch(a, 23, 0, 8))
-	print(" ")
-	print(bsearch(a, 2, 0, 8))
-	print(" ")
-	println(bsearch(a, 99, 0, 8))
-}`,
-			"", "5 0 255\n",
-		},
-		{
-			"array equality in recursive function",
-			`package main
-func f(a, b [3]byte, n byte) byte {
-	if n == 0 { return 0 }
-	r := f(a, b, n - 1)
-	if a == b { return r + 1 }
-	return r
-}
-func main() {
-	print(f([3]byte{1, 2, 3}, [3]byte{1, 2, 3}, 3))
-	print(" ")
-	println(f([3]byte{1, 2, 3}, [3]byte{1, 2, 4}, 3))
-}`,
-			"", "3 0\n",
-		},
-		{
-			"array param in recursive function",
-			`package main
-func sum(a [5]byte, n byte) byte {
-	if n == 0 { return a[0] }
-	b := sum(a, n-1)
-	return b + a[n]
-}
-func main() {
-	a := [5]byte{10, 20, 30, 40, 50}
-	print(sum(a, 4))
-}`,
-			"", "150",
 		},
 		{
 			"switch with default in recursive function",
@@ -3363,156 +3070,6 @@ func main() { print(f(4)) }`,
 			"", "14",
 		},
 		{
-			"array of structs in recursive function",
-			`package main
-type Point struct { x byte; y byte }
-func f(n byte) byte {
-	a := [2]Point{Point{1, 2}, Point{3, 4}}
-	if n == 0 { return a[0].x + a[1].y }
-	b := f(n - 1)
-	return b + a[0].x
-}
-func main() { print(f(2)) }`,
-			"", "7",
-		},
-		{
-			"2d array in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [2][3]byte{{1, 2, 3}, {4, 5, 6}}
-	if n == 0 { return a[0][1] + a[1][2] }
-	b := f(n - 1)
-	return b + a[0][0]
-}
-func main() { print(f(2)) }`,
-			"", "10",
-		},
-		{
-			"variable index array of structs in recursive function",
-			`package main
-type Point struct { x byte; y byte }
-func f(n byte) byte {
-	a := [3]Point{Point{1, 2}, Point{3, 4}, Point{5, 6}}
-	if n == 0 { return a[0].x }
-	b := f(n - 1)
-	return b + a[n].x
-}
-func main() { print(f(2)) }`,
-			"", "9",
-		},
-		{
-			"variable index 2d array in recursive function",
-			`package main
-func f(n byte) byte {
-	a := [3][2]byte{{10, 20}, {30, 40}, {50, 60}}
-	if n == 0 { return a[0][0] }
-	b := f(n - 1)
-	return b + a[n][1]
-}
-func main() { print(f(2)) }`,
-			"", "110",
-		},
-		{
-			"variable outer index 2d array in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var m [3][2]byte
-	m[n-1][0] = n
-	m[n-1][1] = n * 10
-	r := f(n - 1)
-	return m[n-1][0] + m[n-1][1] + r
-}
-func main() { println(f(3)) }`,
-			"", "66\n",
-		},
-		{
-			"variable inner index 2d array in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var m [2][3]byte
-	j := n - 1
-	m[0][j] = n
-	m[1][j] = n * 2
-	r := f(n - 1)
-	return m[0][j] + m[1][j] + r
-}
-func main() { println(f(3)) }`,
-			"", "18\n",
-		},
-		{
-			"both variable index 2d array in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var m [3][3]byte
-	i := n - 1
-	j := n - 1
-	m[i][j] = n
-	r := f(n - 1)
-	return m[i][j] + r
-}
-func main() { println(f(3)) }`,
-			"", "6\n",
-		},
-		{
-			"2d array assign in recursive function",
-			`package main
-func f(n byte) byte {
-	var a [2][2]byte
-	a[0][0] = n
-	a[0][1] = n + 1
-	a[1][0] = n + 2
-	a[1][1] = n + 3
-	if n == 0 { return a[0][0] + a[1][1] }
-	b := f(n - 1)
-	return b + a[0][1]
-}
-func main() { print(f(2)) }`,
-			"", "8",
-		},
-		{
-			"nested struct literal in recursive function",
-			`package main
-type Point struct { x byte; y byte }
-type Rect struct { min Point; max Point }
-func f(n byte) byte {
-	r := Rect{min: Point{1, 2}, max: Point{n, n + 1}}
-	if n <= 2 { return r.max.x }
-	a := f(n - 1)
-	return a + r.min.x
-}
-func main() { print(f(4)) }`,
-			"", "4",
-		},
-		{
-			"method call in recursive function",
-			`package main
-type Point struct { x byte; y byte }
-func (p Point) sum() byte { return p.x + p.y }
-func f(n byte) byte {
-	p := Point{n, n + 1}
-	if n == 0 { return p.sum() }
-	a := f(n - 1)
-	return a + p.sum()
-}
-func main() { print(f(3)) }`,
-			"", "16",
-		},
-		{
-			"array literal as recursive call argument",
-			`package main
-func f(a [3]byte, n byte) byte {
-	if n == 0 { return a[0] + a[1] + a[2] }
-	a[0]++
-	b := f(a, n - 1)
-	return b
-}
-func main() { print(f([3]byte{10, 20, 30}, 3)) }`,
-			"", "63",
-		},
-		{
 			"switch with tag in recursive function",
 			`package main
 func f(n byte) byte {
@@ -3576,91 +3133,6 @@ func main() { print(fib(8)) }`,
 			"", "21",
 		},
 		{
-			"struct field assign in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var p P
-	p.x = n
-	p.y = n + 1
-	return p.x + p.y + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "15",
-		},
-		{
-			"nested struct field assign in recursive function",
-			`package main
-type Inner struct { x byte; y byte }
-type Outer struct { a Inner; b byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var o Outer
-	o.a.x = n
-	o.a.y = n * 2
-	o.b = n * 3
-	return o.a.x + o.a.y + o.b + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "18",
-		},
-		{
-			"struct field inc dec in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var p P
-	p.x = n
-	p.x++
-	p.y = n
-	p.y--
-	return p.x + p.y + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "6",
-		},
-		{
-			"struct field compound assign in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var p P
-	p.x = 1
-	p.x += n
-	return p.x + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "9",
-		},
-		{
-			"recursive with chained array index",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [2][2]byte
-	a[0][0] = n
-	a[1][1] = n + 1
-	return a[0][0] + a[1][1] + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "8",
-		},
-		{
-			"recursive with struct composite literal",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	p := P{x: n, y: n + 1}
-	return p.x + p.y + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "8",
-		},
-		{
 			"recursive for with break and continue",
 			`package main
 func f(n byte) byte {
@@ -3677,60 +3149,6 @@ func main() { print(f(5)) }`,
 			"", "10",
 		},
 		{
-			"recursive with struct field inc dec",
-			`package main
-type P struct { x byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var p P
-	p.x = n
-	p.x--
-	return p.x + f(n-1)
-}
-func main() { print(f(4)) }`,
-			"", "6",
-		},
-		{
-			"recursive with array variable index and inc",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [3]byte
-	i := n % 3
-	a[i] = n
-	return a[i] + f(n-1)
-}
-func main() { print(f(4)) }`,
-			"", "10",
-		},
-		{
-			"recursive with array not equal",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	a := [2]byte{n, n + 1}
-	b := [2]byte{n, n + 2}
-	if a != b { return 1 + f(n-1) }
-	return f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "3",
-		},
-		{
-			"recursive with struct array field access",
-			`package main
-type P struct { x, y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [2]P
-	a[0].x = n
-	a[0].y = n + 1
-	return a[0].x + a[0].y + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "8",
-		},
-		{
 			"nested recursive call ackermann",
 			`package main
 func ack(m, n byte) byte {
@@ -3740,48 +3158,6 @@ func ack(m, n byte) byte {
 }
 func main() { print(ack(3, 2)) }`,
 			"", "29",
-		},
-		{
-			"array copy in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	a := [3]byte{n, n+1, n+2}
-	b := a
-	return b[0] + b[1] + b[2] + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "15",
-		},
-		{
-			"struct copy in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a P
-	a.x = n
-	a.y = n + 1
-	b := a
-	return b.x + b.y + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "15",
-		},
-		{
-			"dynamic struct field assign in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [3]P
-	i := n - 1
-	a[i].x = n
-	a[i].y = n * 2
-	return a[i].x + a[i].y + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "18",
 		},
 		{
 			"switch without tag in recursive function",
@@ -3797,77 +3173,6 @@ func f(n byte) byte {
 }
 func main() { print(f(4)) }`,
 			"", "14",
-		},
-		{
-			"nested struct field in recursive function",
-			`package main
-type Inner struct { x byte; y byte }
-type Outer struct { a Inner; b byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var o Outer
-	o.a.x = n
-	o.a.y = n + 1
-	o.b = n + 2
-	return o.a.x + o.a.y + o.b + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "15",
-		},
-		{
-			"2d array constant index assign in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [2][3]byte
-	a[0][1] = n
-	a[1][2] = n + 1
-	return a[0][1] + a[1][2] + f(n-1)
-}
-func main() { print(f(2)) }`,
-			"", "8",
-		},
-		{
-			"variable index array assign in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [4]byte
-	i := n - 1
-	a[i] = n * 10
-	return a[i] + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "60",
-		},
-		{
-			"struct literal return in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) P {
-	if n == 0 { return P{x: 0, y: 0} }
-	p := f(n - 1)
-	return P{x: p.x + n, y: p.y + n*2}
-}
-func main() {
-	r := f(3)
-	println(r.x, r.y)
-}`,
-			"", "6 12\n",
-		},
-		{
-			"array literal return in recursive function",
-			`package main
-func f(n byte) [2]byte {
-	if n == 0 { return [2]byte{0, 0} }
-	a := f(n - 1)
-	return [2]byte{a[0] + n, a[1] + 1}
-}
-func main() {
-	r := f(3)
-	println(r[0], r[1])
-}`,
-			"", "6 3\n",
 		},
 		{
 			"for with continue in recursive function",
@@ -3897,62 +3202,6 @@ func f(n byte) byte {
 }
 func main() { print(f(4)) }`,
 			"", "14",
-		},
-		{
-			"nested struct read in recursive function",
-			`package main
-type Inner struct { x byte }
-type Outer struct { a Inner }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var o Outer
-	o.a.x = n
-	return o.a.x + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "6",
-		},
-		{
-			"struct field dec in recursive function",
-			`package main
-type P struct { x byte; y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var p P
-	p.x = n
-	p.x--
-	return p.x + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "3",
-		},
-		{
-			"array dec in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [2]byte
-	a[0] = n
-	a[0]--
-	return a[0] + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "3",
-		},
-		{
-			"2d array read variable outer index in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [3][2]byte
-	a[0][0] = 10
-	a[1][0] = 20
-	a[2][0] = 30
-	i := n - 1
-	return a[i][0] + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "60",
 		},
 		{
 			"blank identifier in recursive function",
@@ -4012,20 +3261,6 @@ func main() { print(f(6)) }`,
 			"", "6",
 		},
 		{
-			"array literal return with key-value in recursive function",
-			`package main
-func f(n byte) [2]byte {
-	if n == 0 { return [2]byte{0: 0, 1: 0} }
-	a := f(n - 1)
-	return [2]byte{0: a[0] + n, 1: a[1] + 1}
-}
-func main() {
-	r := f(3)
-	println(r[0], r[1])
-}`,
-			"", "6 3\n",
-		},
-		{
 			"if with init modulo in recursive function",
 			`package main
 func f(n byte) byte {
@@ -4077,29 +3312,6 @@ func main() { println(f(4)) }`,
 			"", "20\n",
 		},
 		{
-			"inline call with array param in recursive function",
-			`package main
-func sum(a [3]byte) byte { return a[0] + a[1] + a[2] }
-func f(a [3]byte, n byte) byte {
-	if n == 0 { return 0 }
-	r := f(a, n - 1)
-	return sum(a) + r
-}
-func main() { println(f([3]byte{1, 2, 3}, 2)) }`,
-			"", "12\n",
-		},
-		{
-			"struct-array literal arg in recursive function",
-			`package main
-type P struct { x, y byte }
-func f(a [2]P, n byte) byte {
-	if n == 0 { return a[0].x + a[1].y }
-	return f(a, n - 1)
-}
-func main() { print(f([2]P{{1, 2}, {3, 4}}, 2)) }`,
-			"", "5",
-		},
-		{
 			"void recursive function",
 			`package main
 func f(n byte) byte {
@@ -4136,18 +3348,6 @@ func main() { print(f(123)) }`,
 			"", "6",
 		},
 		{
-			"divmod fusion in recursive function",
-			`package main
-func digitSum(n byte) byte {
-	if n < 10 { return n }
-	q := n / 10
-	r := n % 10
-	return r + digitSum(q)
-}
-func main() { println(digitSum(199)) }`,
-			"", "19\n",
-		},
-		{
 			"switch with tag in recursive function",
 			`package main
 func f(n byte) byte {
@@ -4166,34 +3366,6 @@ func main() { f(6) }`,
 			"", "fizz other one fizz other one ",
 		},
 		{
-			"nested struct field read in recursive function",
-			`package main
-type Inner struct { x byte }
-type Outer struct { a Inner }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	o := Outer{Inner{n}}
-	return o.a.x + f(n - 1)
-}
-func main() { println(f(4)) }`,
-			"", "10\n",
-		},
-		{
-			"nested struct field inc dec in recursive function",
-			`package main
-type Inner struct { x byte }
-type Outer struct { a Inner }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	o := Outer{Inner{n}}
-	o.a.x++
-	r := f(n - 1)
-	return o.a.x + r
-}
-func main() { println(f(3)) }`,
-			"", "9\n",
-		},
-		{
 			"switch with init in recursive function",
 			`package main
 func f(n byte) byte {
@@ -4209,50 +3381,6 @@ func f(n byte) byte {
 }
 func main() { f(4) }`,
 			"", "even odd even odd ",
-		},
-		{
-			"chained index assign in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var m [2][2]byte
-	m[0][0] = n
-	m[0][1] = n + 1
-	m[1][0] = n + 2
-	m[1][1] = n + 3
-	r := f(n - 1)
-	return m[0][0] + m[1][1] + r
-}
-func main() { println(f(2)) }`,
-			"", "12\n",
-		},
-		{
-			"2D array assign in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var m [2][2]byte
-	m[0][0] = n
-	m[1][1] = n * 2
-	return m[0][0] + m[1][1] + f(n - 1)
-}
-func main() { println(f(3)) }`,
-			"", "18\n",
-		},
-		{
-			"array inc dec in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [3]byte
-	a[0] = n
-	a[0]++
-	a[1] = n
-	a[1]--
-	return a[0] + a[1] + f(n - 1)
-}
-func main() { println(f(3)) }`,
-			"", "12\n",
 		},
 		{
 			"bool switch in recursive function",
@@ -4274,52 +3402,6 @@ func main() { print(f(7)) }`,
 			"", "big big mid mid mid low low 7",
 		},
 		{
-			"struct field assign sum in recursive function",
-			`package main
-type Point struct { x, y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var p Point
-	p.x = n
-	p.y = n * 2
-	return p.x + p.y + f(n - 1)
-}
-func main() { println(f(3)) }`,
-			"", "18\n",
-		},
-		{
-			"method call as statement in recursive function",
-			`package main
-type Point struct { x, y byte }
-func (p Point) show() {
-	println(p.x, p.y)
-}
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	p := Point{n, n * 2}
-	p.show()
-	r := f(n - 1)
-	return r
-}
-func main() { f(3) }`,
-			"", "3 6\n2 4\n1 2\n",
-		},
-		{
-			"range with value in recursive function",
-			`package main
-func f(a [4]byte, n byte) byte {
-	if n == 0 { return 0 }
-	s := byte(0)
-	for _, v := range a {
-		s += v
-	}
-	r := f(a, n - 1)
-	return s + r
-}
-func main() { println(f([4]byte{1, 2, 3, 4}, 2)) }`,
-			"", "20\n",
-		},
-		{
 			"for loop sum in recursive function",
 			`package main
 func f(n byte) byte {
@@ -4333,20 +3415,6 @@ func f(n byte) byte {
 }
 func main() { println(f(3)) }`,
 			"", "10\n",
-		},
-		{
-			"recursive 2d array both variable indices",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [3][3]byte
-	i := n % 3
-	j := (n + 1) % 3
-	a[i][j] = n
-	return a[i][j] + f(n-1)
-}
-func main() { print(f(4)) }`,
-			"", "10",
 		},
 		{
 			"recursive switch with cases",
@@ -4377,35 +3445,6 @@ func f(n byte) byte {
 }
 func main() { print(f(4)) }`,
 			"", "14",
-		},
-		{
-			"recursive nested struct field access",
-			`package main
-type Inner struct { v byte }
-type Outer struct { i Inner }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var o Outer
-	o.i.v = n
-	return o.i.v + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "6",
-		},
-		{
-			"recursive struct array variable index field assign",
-			`package main
-type P struct { x, y byte }
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [2]P
-	i := n % 2
-	a[i].x = n
-	a[i].y = n + 1
-	return a[i].x + a[i].y + f(n-1)
-}
-func main() { print(f(3)) }`,
-			"", "15",
 		},
 		// --- Defer ---
 		{
@@ -4585,20 +3624,6 @@ func main() { println(f(3)) }`,
 func f(n byte) byte {
 	if n == 0 { return 0 }
 	defer putchar(n + 48)
-	r := f(n - 1)
-	return r + 1
-}
-func main() { print(f(3)) }`,
-			"", "1233",
-		},
-		{
-			"defer with array access in recursive function",
-			`package main
-func f(n byte) byte {
-	if n == 0 { return 0 }
-	var a [2]byte
-	a[0] = n
-	defer print(a[0])
 	r := f(n - 1)
 	return r + 1
 }
@@ -11128,6 +10153,210 @@ func main() { print(f(1)) }`,
 			"unsupported expression statement in recursive function",
 		},
 		{
+			"multi-byte return in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(1)) }`,
+			"multi-byte integer return values are not supported in recursive function f",
+		},
+		{
+			"multi-byte param in recursive function",
+			`package main
+func f(n uint16) byte {
+	if n == uint16(0) { return byte(0) }
+	r := f(n - uint16(1))
+	return r + byte(1)
+}
+func main() { print(f(uint16(2))) }`,
+			"multi-byte integer parameters are not supported in recursive function f",
+		},
+		{
+			"pointer param in general recursion",
+			`package main
+func f(p *byte, n byte) byte {
+	if n == 0 { return *p }
+	r := f(p, n - 1)
+	return r
+}
+func main() { x := byte(7); print(f(&x, 3)) }`,
+			"pointer parameter p in recursive function f is not supported",
+		},
+		{
+			"bitwise op in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	x := byte(7) ^ byte(1)
+	r := f(n - 1)
+	return x + r
+}
+func main() { print(f(3)) }`,
+			"bitwise operator ^ in recursive function is not supported",
+		},
+		{
+			"bitwise compound assign in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	x := byte(7)
+	x &= byte(3)
+	r := f(n - 1)
+	return x + r
+}
+func main() { print(f(3)) }`,
+			"bitwise assignment &= in recursive function is not supported",
+		},
+		{
+			"struct param in recursive function",
+			`package main
+type P struct { x, y byte }
+func f(p P, n byte) byte {
+	if n == 0 { return p.x + p.y }
+	r := f(p, n - 1)
+	return r
+}
+func main() { print(f(P{1, 2}, 2)) }`,
+			"struct parameter p in recursive function f is not supported",
+		},
+		{
+			"array param in recursive function",
+			`package main
+func f(a [3]byte, n byte) byte {
+	if n == 0 { return a[0] + a[1] + a[2] }
+	r := f(a, n - 1)
+	return r
+}
+func main() { print(f([3]byte{1, 2, 3}, 2)) }`,
+			"array parameter a in recursive function f is not supported",
+		},
+		{
+			"struct return in recursive function",
+			`package main
+type P struct { x, y byte }
+func f(n byte) P {
+	if n == 0 { return P{1, 2} }
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2).x) }`,
+			"struct return type in recursive function f is not supported",
+		},
+		{
+			"array return in recursive function",
+			`package main
+func f(n byte) [3]byte {
+	if n == 0 { return [3]byte{1, 2, 3} }
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)[0]) }`,
+			"array return type in recursive function f is not supported",
+		},
+		{
+			"array local in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	a := [3]byte{1, 2, 3}
+	return a[0] + f(n - 1)
+}
+func main() { print(f(2)) }`,
+			"array usage in recursive function is not supported",
+		},
+		{
+			"struct local in recursive function",
+			`package main
+type P struct { x, y byte }
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	var p P
+	p.x = n
+	return p.x + f(n - 1)
+}
+func main() { print(f(2)) }`,
+			"struct usage in recursive function is not supported",
+		},
+		{
+			"label on non-loop in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+myLabel:
+	x := byte(5)
+	_ = x
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)) }`,
+			"label myLabel on non-loop statement is not supported",
+		},
+		{
+			"defer of non-builtin in recursive function",
+			`package main
+func g(x byte) { _ = x }
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	defer g(n)
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)) }`,
+			"unsupported defer call in recursive function: g",
+		},
+		{
+			"void function in expression in recursive function",
+			`package main
+func g(x byte) {}
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	x := g(n)
+	r := f(n - 1)
+	return r + x
+}
+func main() { print(f(2)) }`,
+			"function g has no return value",
+		},
+		{
+			"undefined variable in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	_ = x
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)) }`,
+			"undefined variable in recursive function: x",
+		},
+		{
+			"function literal call in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	x := func(y byte) byte { return y + 1 }(n)
+	r := f(n - 1)
+	return r + x
+}
+func main() { print(f(2)) }`,
+			"unsupported call in recursive expression: *ast.FuncLit",
+		},
+		{
+			"function literal call as statement in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	(func() { _ = byte(0) })()
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)) }`,
+			"unsupported call in recursive function",
+		},
+		{
 			"parse error",
 			`package main
 func main() { `,
@@ -11594,13 +10823,6 @@ func main() { a := [2]Point{Point{1, 2}, Point{3, 4}}; var i uint16 = 0; println
 			"cannot use multi-byte integer as array index, use byte() to truncate",
 		},
 		{
-			"uint16 in recursive function",
-			`package main
-func sum(n, acc uint16) uint16 { if n == uint16(0) { return acc }; return sum(n-uint16(1), acc+n) }
-func main() { println(sum(uint16(10), uint16(0))) }`,
-			"multi-byte integer parameters are not supported in recursive function sum",
-		},
-		{
 			"unsupported call in recursive expression: *ast.Ident",
 			`package main
 func f(n byte) byte {
@@ -11647,7 +10869,7 @@ func f(n byte) byte {
 	return s[0] + r
 }
 func main() { print(f(1)) }`,
-			"slices in recursive functions are not supported",
+			"slice usage in recursive function is not supported",
 		},
 		{
 			"slice parameter in recursive function",

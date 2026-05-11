@@ -5627,83 +5627,24 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 func (l *Lowerer) lowerTailCall(call *ast.CallExpr) error {
 	info := l.result.Funcs[l.tailCallFunc]
 
-	// Evaluate all arguments into temporaries first. For composite args
-	// (struct/array), resolve their base cell and size, then copy to
-	// temps to avoid overwriting source params during assignment.
-	type argVal struct {
-		cell Cell
-		base Cell // non-zero for composite args
-		size int
-	}
-	vals := make([]argVal, len(call.Args))
+	// Recursive functions are scalar-only -- pointer/composite params
+	// are rejected at inlineCall, so all args here are byte. Evaluate
+	// each into a temp before the param-assignment phase to avoid
+	// overwriting source params when the same variable appears in both
+	// source and destination of the assignment.
+	cells := make([]Cell, len(call.Args))
 	for i, arg := range call.Args {
-		if i < len(info.ParamTypes) {
-			pt := info.ParamTypes[i]
-			if pt.StructType != "" && !pt.IsPointer {
-				base, size, err := l.resolveStructArg(arg)
-				if err != nil {
-					return err
-				}
-				tmp := l.allocCells(size)
-				for j := range size {
-					l.emit(&IRCopy{Dst: tmp + j, Src: base + j})
-				}
-				vals[i] = argVal{base: tmp, size: size}
-				continue
-			}
-			if pt.ElemCount > 0 {
-				if id, ok := arg.(*ast.Ident); ok {
-					if ai, ok := l.lookupArray(id.Name); ok {
-						tmp := l.allocCells(ai.size())
-						for j := range ai.size() {
-							l.emit(&IRCopy{Dst: tmp + j, Src: ai.base + j})
-						}
-						vals[i] = argVal{base: tmp, size: ai.size()}
-						continue
-					}
-				}
-				if comp, ok := arg.(*ast.CompositeLit); ok {
-					size := l.arraySize(comp.Type)
-					base := l.allocCells(size)
-					for j := range size {
-						l.emit(&IRZero{Dst: base + j})
-					}
-					ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(comp.Type)
-					arr := arrayInfo{base: base, elemCount: ec, elemSize: es, elemType: et,
-						elemIntSize: eis, elemSlice: esl, innerElemSize: ies, innerElemIntSize: ieis}
-					if err := l.lowerCompositeLitInto(arr, comp); err != nil {
-						return err
-					}
-					vals[i] = argVal{base: base, size: size}
-					continue
-				}
-			}
-		}
 		r, err := l.lowerExpr(arg)
 		if err != nil {
 			return err
 		}
-		vals[i] = argVal{cell: l.ensureTemp(r).cell}
+		cells[i] = l.ensureTemp(r).cell
 	}
 
 	// Move evaluated values to param cells.
 	for i, paramName := range info.Params {
-		if vals[i].size > 0 {
-			// Composite param: look up by struct or array base.
-			var paramBase Cell
-			switch b := l.lookupBinding(paramName).(type) {
-			case *structBinding:
-				paramBase = b.info.base
-			case *arrayBinding:
-				paramBase = b.info.base
-			}
-			for j := range vals[i].size {
-				l.emit(&IRMove{Dst: paramBase + j, Src: vals[i].base + j})
-			}
-		} else {
-			paramCell, _ := l.lookupVar(paramName)
-			l.emit(&IRMove{Dst: paramCell, Src: vals[i].cell})
-		}
+		paramCell, _ := l.lookupVar(paramName)
+		l.emit(&IRMove{Dst: paramCell, Src: cells[i]})
 	}
 
 	// Signal the tail-call loop to restart.
@@ -5998,19 +5939,32 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		return nil, fmt.Errorf("function %s expects %d arguments, got %d", info.Name, len(info.Params), len(argExprs))
 	}
 	if info.IsRecursive || info.IsTailRec {
+		// Recursive functions (both tail and general) are scalar-only.
 		for _, pt := range info.ParamTypes {
-			if pt.IntSize >= 2 {
+			switch {
+			case pt.IntSize >= 2:
 				return nil, fmt.Errorf("multi-byte integer parameters are not supported in recursive function %s", info.Name)
-			}
-			if pt.IsSlice {
+			case pt.IsPointer:
+				return nil, fmt.Errorf("pointer parameter %s in recursive function %s is not supported", pt.Name, info.Name)
+			case pt.StructType != "":
+				return nil, fmt.Errorf("struct parameter %s in recursive function %s is not supported", pt.Name, info.Name)
+			case pt.ElemCount > 0:
+				return nil, fmt.Errorf("array parameter %s in recursive function %s is not supported", pt.Name, info.Name)
+			case pt.IsSlice:
 				return nil, fmt.Errorf("slice parameter %s in recursive function %s is not supported", pt.Name, info.Name)
 			}
 		}
-		if info.SingleReturn().IntSize >= 2 {
-			return nil, fmt.Errorf("multi-byte integer return values are not supported in recursive function %s", info.Name)
-		}
 		for _, ri := range info.ReturnTypes {
-			if ri.IsSlice {
+			switch {
+			case ri.IntSize >= 2:
+				return nil, fmt.Errorf("multi-byte integer return values are not supported in recursive function %s", info.Name)
+			case ri.IsPointer:
+				return nil, fmt.Errorf("pointer return type in recursive function %s is not supported", info.Name)
+			case ri.StructType != "":
+				return nil, fmt.Errorf("struct return type in recursive function %s is not supported", info.Name)
+			case ri.ElemCount > 0:
+				return nil, fmt.Errorf("array return type in recursive function %s is not supported", info.Name)
+			case ri.IsSlice:
 				return nil, fmt.Errorf("slice return type in recursive function %s is not supported", info.Name)
 			}
 		}

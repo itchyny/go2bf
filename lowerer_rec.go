@@ -20,23 +20,12 @@ import (
 // A dispatch loop processes one phase per iteration, always operating on
 // the topmost stack frame.
 
-// recArrayInfo holds metadata for an array variable in a recursive function frame.
-type recArrayInfo struct {
-	elemCount int    // number of elements
-	elemSize  int    // cells per element
-	elemType  string // struct type name (empty for byte or nested array)
-}
-
-func (ri recArrayInfo) size() int { return ri.elemCount * ri.elemSize }
-
 // recLocalInfo holds slot index plus per-local type metadata for a variable
 // in a recursive function frame. A single map[name]recLocalInfo replaces
 // what used to be parallel slot/type maps, mirroring the analyzer's
 // StructDef.Field map[string]FieldInfo pattern.
 type recLocalInfo struct {
-	slot       int
-	structType string
-	arrayInfo  recArrayInfo
+	slot int
 }
 
 // recContext holds state for lowering a recursive function.
@@ -73,26 +62,9 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		locals:    make(map[string]recLocalInfo),
 	}
 	paramSlot := rc.paramBase
-	for i, name := range info.Params {
-		paramSize := 1
-		paramInfo := recLocalInfo{slot: paramSlot}
-		if i < len(info.ParamTypes) {
-			pt := info.ParamTypes[i]
-			if pt.IsPointer {
-				// pointer parameter occupies 1 cell regardless of target type.
-			} else if pt.StructType != "" {
-				paramSize = l.result.Structs[pt.StructType].Size
-				paramInfo.structType = pt.StructType
-			} else if pt.ElemCount > 0 {
-				paramSize = pt.ElemCount * max(pt.ElemSize, 1)
-				paramInfo.arrayInfo = recArrayInfo{
-					elemCount: pt.ElemCount,
-					elemSize:  pt.ElemSize, elemType: pt.ElemType,
-				}
-			}
-		}
-		rc.locals[name] = paramInfo
-		paramSlot += paramSize
+	for _, name := range info.Params {
+		rc.locals[name] = recLocalInfo{slot: paramSlot}
+		paramSlot += 1
 	}
 	rc.localBase = paramSlot
 	for i, name := range localNames {
@@ -109,95 +81,25 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		}
 	}
 
-	// Scan for array locals and reallocate multi-slot frame space.
-	l.collectArrayLocals(rc, info.Body)
-
-	// Slices are not supported in recursive functions.
-	if hasSliceUsage(info.Body) {
-		return nil, fmt.Errorf("slices in recursive functions are not supported")
-	}
-	for _, pt := range info.ParamTypes {
-		if pt.IsSlice {
-			return nil, fmt.Errorf("slice parameter %s in recursive function %s is not supported", pt.Name, info.Name)
-		}
-	}
-	for _, ri := range info.ReturnTypes {
-		if ri.IsSlice {
-			return nil, fmt.Errorf("slice return type in recursive function %s is not supported", info.Name)
-		}
+	if err := l.rejectComposites(info.Body); err != nil {
+		return nil, err
 	}
 
 	// Allocate active and retval in the PHASE TEMP area (direct tape positions,
 	// not stack slots). This avoids cache/storeToStack issues in the dispatch loop.
 	// Reserve positions 25, 26 for these; phase code allocs start at 27.
-	// Compute return size for struct/array returns.
-	retSize := info.Returns
-	if retSize == 0 {
-		retSize = 0 // void function
-	} else if info.SingleReturn().StructType != "" {
-		retSize = l.result.Structs[info.SingleReturn().StructType].Size
-	} else if ri := info.SingleReturn(); ri.ElemCount > 0 {
-		retSize = ri.ElemCount * max(ri.ElemSize, 1)
-	}
-	rc.retSize = retSize
+	rc.retSize = info.Returns
 
 	rc.activeReg = phaseTempBase  // tape position 25
 	rc.retReg = phaseTempBase + 1 // tape position 26 (base of return area)
 
-	// Evaluate arguments. Composite (struct/array) arguments are resolved
-	// to their base cells and stored cell-by-cell.
+	// Evaluate arguments.
 	type argCells struct {
 		cells []Cell
 		temps bool
 	}
 	args := make([]argCells, len(argExprs))
 	for i, expr := range argExprs {
-		if i < len(info.ParamTypes) {
-			pt := info.ParamTypes[i]
-			if pt.StructType != "" && !pt.IsPointer {
-				base, size, err := l.resolveStructArg(expr)
-				if err != nil {
-					return nil, err
-				}
-				cells := make([]Cell, size)
-				for j := range size {
-					cells[j] = base + j
-				}
-				args[i] = argCells{cells, false}
-				continue
-			}
-			if pt.ElemCount > 0 {
-				if id, ok := expr.(*ast.Ident); ok {
-					ai, ok := l.lookupArray(id.Name)
-					if ok {
-						cells := make([]Cell, ai.size())
-						for j := range ai.size() {
-							cells[j] = ai.base + j
-						}
-						args[i] = argCells{cells, false}
-						continue
-					}
-				}
-				if comp, ok := expr.(*ast.CompositeLit); ok {
-					size := l.arraySize(comp.Type)
-					base := l.allocCells(size)
-					count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(comp.Type)
-					arr := arrayInfo{base: base, elemCount: count, elemSize: elemSize, elemType: elemType}
-					for j := range size {
-						l.emit(&IRZero{Dst: base + j})
-					}
-					if err := l.lowerCompositeLitInto(arr, comp); err != nil {
-						return nil, err
-					}
-					cells := make([]Cell, size)
-					for j := range size {
-						cells[j] = base + j
-					}
-					args[i] = argCells{cells, false}
-					continue
-				}
-			}
-		}
 		r, err := l.lowerExpr(expr)
 		if err != nil {
 			return nil, err
@@ -273,103 +175,50 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	return retCells, nil
 }
 
-// hasSliceUsage checks if a block contains any slice type reference.
-func hasSliceUsage(body *ast.BlockStmt) bool {
-	found := false
+// rejectComposites scans the function body for any struct, array, slice
+// usage, or bitwise operator and returns an error if found. Recursive
+// functions are scalar-only by design (params, returns, and locals).
+// Bitwise ops are rejected because their codegen (decompose-into-bits
+// with two `genMul`s per bit) peaks at ~11 algo temps; the dispatch
+// loop holds 4 of the 16 in the pool, so the combination overflows
+// "out of temporary cells" deep in codegen otherwise.
+func (l *Lowerer) rejectComposites(body *ast.BlockStmt) error {
+	var err error
 	ast.Inspect(body, func(n ast.Node) bool {
-		if found {
+		if err != nil {
 			return false
 		}
-		if at, ok := n.(*ast.ArrayType); ok && at.Len == nil {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
-}
-
-// collectArrayLocals scans the function body for array variable declarations
-// and reallocates their frame slots to hold multiple cells.
-func (l *Lowerer) collectArrayLocals(rc *recContext, body *ast.BlockStmt) {
-	seen := make(map[string]bool)
-	registerArray := func(name string, info recArrayInfo) {
-		if seen[name] || info.size() <= 1 {
-			return
-		}
-		seen[name] = true
-		rc.locals[name] = recLocalInfo{slot: rc.frameSize, arrayInfo: info}
-		rc.frameSize += info.size()
-	}
-	registerStruct := func(name, structType string, size int) {
-		if seen[name] {
-			return
-		}
-		seen[name] = true
-		rc.locals[name] = recLocalInfo{slot: rc.frameSize, structType: structType}
-		rc.frameSize += size
-	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		// a := [N]byte{...} or a := f(...)
-		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
-			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
-				if comp, ok := assign.Rhs[0].(*ast.CompositeLit); ok {
-					count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(comp.Type)
-					if count*elemSize > 0 {
-						registerArray(id.Name, recArrayInfo{count, elemSize, elemType})
-					} else if def := l.structDef(comp.Type); def != nil {
-						registerStruct(id.Name, def.Name, def.Size)
-					}
-				}
-				// b := a where a is an array or struct variable.
-				if rhsID, ok := assign.Rhs[0].(*ast.Ident); ok {
-					if src, ok := rc.locals[rhsID.Name]; ok {
-						if src.arrayInfo.size() > 1 {
-							registerArray(id.Name, src.arrayInfo)
-						} else if src.structType != "" {
-							if def, ok := l.result.Structs[src.structType]; ok {
-								registerStruct(id.Name, src.structType, def.Size)
-							}
-						}
-					}
-				}
-				// a := f(...) where f returns an array.
-				if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
-					if fn, ok := call.Fun.(*ast.Ident); ok {
-						if info, ok := l.result.Funcs[fn.Name]; ok {
-							if ri := info.SingleReturn(); ri.ElemCount > 0 {
-								es := max(ri.ElemSize, 1)
-								registerArray(id.Name, recArrayInfo{
-									elemCount: ri.ElemCount,
-									elemSize:  es, elemType: ri.ElemType,
-								})
-							}
-						}
-					}
-				}
+		switch n := n.(type) {
+		case *ast.ArrayType:
+			// []T (slice) when Len is nil; [N]T (array) otherwise.
+			kind := "array"
+			if n.Len == nil {
+				kind = "slice"
 			}
-		}
-		// var a [N]byte or var a [N]Point or var p StructType
-		if decl, ok := n.(*ast.DeclStmt); ok {
-			if gd, ok := decl.Decl.(*ast.GenDecl); ok {
-				for _, spec := range gd.Specs {
-					if vs, ok := spec.(*ast.ValueSpec); ok {
-						count, elemSize, elemType, _, _, _, _ := l.arrayElementInfo(vs.Type)
-						if count*elemSize > 0 {
-							for _, name := range vs.Names {
-								registerArray(name.Name, recArrayInfo{count, elemSize, elemType})
-							}
-						} else if def := l.structDef(vs.Type); def != nil {
-							for _, name := range vs.Names {
-								registerStruct(name.Name, def.Name, def.Size)
-							}
-						}
-					}
-				}
+			err = fmt.Errorf("%s usage in recursive function is not supported", kind)
+		case *ast.StructType:
+			// Anonymous struct: `struct{...}` type literal.
+			err = fmt.Errorf("struct usage in recursive function is not supported")
+		case *ast.Ident:
+			// Named struct type used in a value context (var p Point,
+			// Point{...}, etc.). The non-struct idents pass through.
+			if l.structDef(n) != nil {
+				err = fmt.Errorf("struct usage in recursive function is not supported")
+			}
+		case *ast.BinaryExpr:
+			switch n.Op {
+			case token.AND, token.OR, token.XOR, token.AND_NOT:
+				err = fmt.Errorf("bitwise operator %s in recursive function is not supported", n.Op)
+			}
+		case *ast.AssignStmt:
+			switch n.Tok {
+			case token.AND_ASSIGN, token.OR_ASSIGN, token.XOR_ASSIGN, token.AND_NOT_ASSIGN:
+				err = fmt.Errorf("bitwise assignment %s in recursive function is not supported", n.Tok)
 			}
 		}
 		return true
 	})
+	return err
 }
 
 // collectLocals finds all := variable names in the function body that aren't parameters.
@@ -528,21 +377,14 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 	// Phase 0 = preStmts of callSite 0 (if any), otherwise the whole body.
 	// Phase K (for K>0) = continuation after callSite K-1.
 
-	// For multi-cell returns, result variables need N contiguous frame slots.
-	// Re-allocate them at the end of the frame, overriding any single-slot
-	// allocation from collectLocals.
 	if rc.retSize > 1 {
-		retType := info.SingleReturn().StructType
 		allocated := make(map[string]bool)
 		for _, cs := range callSites {
-			info := rc.locals[cs.resultVar] // preserve any metadata set by collectArrayLocals
+			info := rc.locals[cs.resultVar]
 			if !allocated[cs.resultVar] {
 				info.slot = rc.frameSize
 				rc.frameSize += rc.retSize
 				allocated[cs.resultVar] = true
-			}
-			if retType != "" {
-				info.structType = retType
 			}
 			rc.locals[cs.resultVar] = info
 		}
@@ -1068,56 +910,13 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 	// Build call setup code on a fresh list.
 	l.nodes = nil
 
-	// Evaluate call arguments. Composite (struct/array) args are loaded
-	// cell-by-cell from the frame.
+	// Evaluate call arguments. Pointer/struct/array params
+	// are rejected at inlineCall.
 	type argValue struct {
 		cells []Cell
 	}
 	argVals := make([]argValue, len(call.argExprs))
 	for i, expr := range call.argExprs {
-		// Check for composite argument (struct or array variable).
-		if id, ok := expr.(*ast.Ident); ok {
-			if size := rl.compositeSize(id.Name); size > 0 {
-				slot := rc.locals[id.Name].slot
-				cells := make([]Cell, size)
-				for j := range size {
-					cells[j] = l.allocCell()
-					l.emit(&IRLoadFrame{Dst: cells[j], Slot: slot + j, FrameSize: rc.frameSize})
-				}
-				argVals[i] = argValue{cells}
-				continue
-			}
-		}
-		// Handle struct/array composite literal arguments.
-		if comp, ok := expr.(*ast.CompositeLit); ok {
-			if def := rl.structDef(comp.Type); def != nil {
-				cells := make([]Cell, def.Size)
-				for j := range def.Size {
-					cells[j] = l.allocCell()
-					l.emit(&IRZero{Dst: cells[j]})
-				}
-				for j, elt := range comp.Elts {
-					off := j
-					val := elt
-					if kv, ok := elt.(*ast.KeyValueExpr); ok {
-						off = def.Field[kv.Key.(*ast.Ident).Name].Offset
-						val = kv.Value
-					} else {
-						off = def.Field[def.Fields[j]].Offset
-					}
-					r, err := rl.lowerExpr(val)
-					if err != nil {
-						return nil, err
-					}
-					l.emit(&IRCopy{Dst: cells[off], Src: r.cell})
-					if r.temp {
-						l.freeCell(r.cell)
-					}
-				}
-				argVals[i] = argValue{cells}
-				continue
-			}
-		}
 		r, err := rl.lowerExpr(expr)
 		if err != nil {
 			return nil, err
@@ -1261,27 +1060,6 @@ func (rl *recLowerer) storeAllLocals(rc *recContext) {
 	}
 }
 
-// zeroFrameSlots zeroes n frame slots starting at baseSlot.
-func (rl *recLowerer) zeroFrameSlots(baseSlot, n int) {
-	zero := rl.allocCell()
-	rl.emit(&IRConst{Dst: zero, Value: 0})
-	for j := range n {
-		rl.emit(&IRStoreFrame{Slot: baseSlot + j, Src: zero, FrameSize: rl.rc.frameSize})
-	}
-	rl.freeCell(zero)
-}
-
-// copyFrameSlots copies n frame slots from srcSlot to dstSlot
-// using a temporary cell for each slot.
-func (rl *recLowerer) copyFrameSlots(srcSlot, dstSlot, n int) {
-	for j := range n {
-		cell := rl.allocCell()
-		rl.emit(&IRLoadFrame{Dst: cell, Slot: srcSlot + j, FrameSize: rl.rc.frameSize})
-		rl.emit(&IRStoreFrame{Slot: dstSlot + j, Src: cell, FrameSize: rl.rc.frameSize})
-		rl.freeCell(cell)
-	}
-}
-
 // lowerStmts processes statements within a recursive phase.
 // Each statement is guarded by noRetFlag so that statements after a return
 // inside an if-without-else are skipped.
@@ -1381,7 +1159,7 @@ func (rl *recLowerer) lowerExprStmt(s *ast.ExprStmt) error {
 }
 
 func (rl *recLowerer) lowerCallStmt(call *ast.CallExpr) error {
-	funcName, receiver := rl.resolveRecCall(call)
+	funcName, _ := rl.resolveCall(call)
 	if funcName == "" {
 		return fmt.Errorf("unsupported call in recursive function")
 	}
@@ -1395,11 +1173,7 @@ func (rl *recLowerer) lowerCallStmt(call *ast.CallExpr) error {
 	if info.IsRecursive {
 		return fmt.Errorf("unsupported recursive call as statement: %s", funcName)
 	}
-	args := call.Args
-	if receiver != nil {
-		args = append([]ast.Expr{receiver}, args...)
-	}
-	retCells, err := rl.inlineCallInRec(info, args)
+	retCells, err := rl.inlineCallInRec(info, call.Args)
 	if err != nil {
 		return err
 	}
@@ -1409,101 +1183,26 @@ func (rl *recLowerer) lowerCallStmt(call *ast.CallExpr) error {
 	return nil
 }
 
-// resolveRecCall returns the function name and optional receiver for a call
-// in recursive context. Uses frame-based struct type lookup for method calls.
-func (rl *recLowerer) resolveRecCall(call *ast.CallExpr) (string, ast.Expr) {
-	if id, ok := call.Fun.(*ast.Ident); ok {
-		return id.Name, nil
-	}
-	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
-		if id, ok := sel.X.(*ast.Ident); ok {
-			if info, ok := rl.rc.locals[id.Name]; ok && info.structType != "" {
-				return info.structType + "." + sel.Sel.Name, sel.X
-			}
-		}
-	}
-	return "", nil
-}
-
 // inlineCallInRec inlines a non-recursive function call within a recursive
 // function phase. Similar to Lowerer.inlineCall but uses rl.lowerExpr for
 // argument evaluation and rl.Lowerer.lowerStmts for the inlined body.
 func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, error) {
-	// Evaluate arguments, handling composite types specially.
-	type argVal struct {
-		cell Cell // scalar arg
-		base Cell // composite arg base
-		size int  // composite arg size (0 for scalar)
-		def  *StructDef
-	}
-	vals := make([]argVal, len(args))
+	// All args are scalars: composite args would require a frame-resident
+	// composite local as the source, and those are rejected upfront.
+	results := make([]exprResult, len(args))
 	for i, arg := range args {
-		if i < len(info.ParamTypes) {
-			pt := info.ParamTypes[i]
-			if pt.StructType != "" && !pt.IsPointer {
-				def := rl.result.Structs[pt.StructType]
-				if id, ok := arg.(*ast.Ident); ok {
-					if info, ok := rl.rc.locals[id.Name]; ok && info.structType != "" {
-						baseSlot := info.slot
-						// Allocate consecutive cells, skipping highway markers.
-						base := rl.nextCell
-						rl.nextCell += def.Size
-						for j := range def.Size {
-							if (base+j) > 0 && (base+j)%highwayStride == 0 && (base+j) < sentinelFwd {
-								base = rl.nextCell
-								rl.nextCell += def.Size
-								break
-							}
-						}
-						for j := range def.Size {
-							rl.emit(&IRLoadFrame{Dst: base + j, Slot: baseSlot + j, FrameSize: rl.rc.frameSize})
-						}
-						vals[i] = argVal{base: base, size: def.Size, def: def}
-						continue
-					}
-				}
-			}
-			if pt.ElemCount > 0 {
-				if id, ok := arg.(*ast.Ident); ok {
-					if li, ok := rl.rc.locals[id.Name]; ok && li.arrayInfo.size() > 0 {
-						ai := li.arrayInfo
-						base := rl.allocCells(ai.size())
-						for j := range ai.size() {
-							rl.emit(&IRLoadFrame{Dst: base + j, Slot: li.slot + j, FrameSize: rl.rc.frameSize})
-						}
-						vals[i] = argVal{base: base, size: ai.size()}
-						continue
-					}
-				}
-			}
-		}
 		r, err := rl.lowerExpr(arg)
 		if err != nil {
 			return nil, err
 		}
-		vals[i] = argVal{cell: r.cell}
+		results[i] = r
 	}
 	rl.pushScope()
 	sc := rl.currentScope()
 	for j, name := range info.Params {
-		if vals[j].size > 0 {
-			if vals[j].def != nil {
-				si := structInfo{base: vals[j].base, def: vals[j].def}
-				sc[name] = &structBinding{info: si}
-			} else {
-				rl.defineArray(sc, name, vals[j].size)
-				paramAI, _ := rl.lookupArray(name)
-				for k := range vals[j].size {
-					rl.emit(&IRCopy{Dst: paramAI.base + k, Src: vals[j].base + k})
-				}
-				continue
-			}
-			sc.defineByte(name, vals[j].base)
-		} else {
-			cell := rl.allocCell()
-			rl.emit(&IRCopy{Dst: cell, Src: vals[j].cell})
-			sc.defineByte(name, cell)
-		}
+		cell := rl.allocCell()
+		rl.emit(&IRCopy{Dst: cell, Src: results[j].cell})
+		sc.defineByte(name, cell)
 	}
 	retCells := make([]Cell, info.Returns)
 	for j := range retCells {
@@ -1546,10 +1245,6 @@ func (rl *recLowerer) lowerDecl(s *ast.DeclStmt) error {
 			continue
 		}
 		for i, name := range vs.Names {
-			if size := rl.compositeSize(name.Name); size > 0 {
-				rl.zeroFrameSlots(rl.rc.locals[name.Name].slot, size)
-				continue
-			}
 			cell, err := rl.lookupVar(name.Name)
 			if err != nil {
 				return err
@@ -1581,13 +1276,9 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 	// Multi-return: q, r := divmod(a, b)
 	if len(s.Lhs) > 1 && len(s.Rhs) == 1 {
 		if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
-			funcName, receiver := rl.resolveRecCall(call)
+			funcName, _ := rl.resolveCall(call)
 			if info, ok := rl.result.Funcs[funcName]; ok && info.Returns == len(s.Lhs) && !info.IsRecursive {
-				args := call.Args
-				if receiver != nil {
-					args = append([]ast.Expr{receiver}, args...)
-				}
-				retCells, err := rl.inlineCallInRec(info, args)
+				retCells, err := rl.inlineCallInRec(info, call.Args)
 				if err != nil {
 					return err
 				}
@@ -1634,48 +1325,20 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 
 	for i, lhs := range s.Lhs {
 		rhs := s.Rhs[i]
-		switch target := lhs.(type) {
-		case *ast.IndexExpr:
-			return rl.lowerArrayAssign(target, rhs)
-		case *ast.SelectorExpr:
-			return rl.lowerFieldAssign(target, rhs)
-		case *ast.Ident:
-			if err := rl.lowerRecVarInit(target.Name, rhs); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported assignment target in recursive function")
+		id, ok := lhs.(*ast.Ident)
+		if !ok {
+			return fmt.Errorf("unsupported assignment target in recursive function: %T", lhs)
+		}
+		if err := rl.lowerRecVarInit(id.Name, rhs); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 // lowerRecVarInit handles name = rhs in recursive functions, including
-// composite literals, composite variable copies, and scalar assignments.
+// scalar assignments (composites are rejected upfront).
 func (rl *recLowerer) lowerRecVarInit(name string, rhs ast.Expr) error {
-	// Composite literal: a = [N]byte{...} or p = Point{...}
-	if comp, ok := rhs.(*ast.CompositeLit); ok {
-		li := rl.rc.locals[name]
-		if li.arrayInfo.size() > 0 {
-			return rl.lowerArrayCompositeLit(name, comp)
-		}
-		if li.structType != "" {
-			return rl.lowerStructCompositeLit(name, li.structType, comp)
-		}
-		if rl.arraySize(comp.Type) == 0 {
-			if _, ok := comp.Type.(*ast.ArrayType); ok {
-				return nil // [0]byte{} -- no-op
-			}
-		}
-	}
-	// Composite variable copy: b = a where a is array or struct.
-	if rhsID, ok := rhs.(*ast.Ident); ok {
-		if size := rl.compositeSize(rhsID.Name); size > 0 {
-			rl.copyFrameSlots(rl.rc.locals[rhsID.Name].slot, rl.rc.locals[name].slot, size)
-			return nil
-		}
-	}
-	// Scalar assignment.
 	cell, err := rl.lookupVar(name)
 	if err != nil {
 		return err
@@ -1688,183 +1351,14 @@ func (rl *recLowerer) lowerRecVarInit(name string, rhs ast.Expr) error {
 	return nil
 }
 
-// compositeSize returns the total frame slot size for a composite variable,
-// or 0 if the variable is a scalar.
-func (rl *recLowerer) compositeSize(name string) int {
-	li := rl.rc.locals[name]
-	if li.arrayInfo.size() > 0 {
-		return li.arrayInfo.size()
-	}
-	if li.structType != "" {
-		return rl.result.Structs[li.structType].Size
-	}
-	return 0
-}
-
-func (rl *recLowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
-	// Chained index: a[i][j] = val
-	if innerIdx, ok := idx.X.(*ast.IndexExpr); ok {
-		return rl.lowerChainedIndexAssign(innerIdx, idx.Index, rhs)
-	}
-	id, ok := idx.X.(*ast.Ident)
-	if !ok {
-		return fmt.Errorf("unsupported array access in recursive function")
-	}
-	baseSlot, info, err := rl.lookupArraySlot(id.Name)
-	if err != nil {
-		return err
-	}
-	r, err := rl.lowerExpr(rhs)
-	if err != nil {
-		return err
-	}
-	return rl.recWriteInto(baseSlot, info.elemCount, idx.Index, r)
-}
-
-func (rl *recLowerer) lowerChainedIndexAssign(outerIdx *ast.IndexExpr, innerIndex, rhs ast.Expr) error {
-	id, ok := outerIdx.X.(*ast.Ident)
-	if !ok {
-		return fmt.Errorf("unsupported chained array access in recursive function")
-	}
-	baseSlot, info, err := rl.lookupArraySlot(id.Name)
-	if err != nil {
-		return err
-	}
-	r, err := rl.lowerExpr(rhs)
-	if err != nil {
-		return err
-	}
-	// Constant outer: write into sub-array directly.
-	if constI, ok := rl.constValue(outerIdx.Index); ok {
-		return rl.recWriteInto(baseSlot+constI*info.elemSize, info.elemSize, innerIndex, r)
-	}
-	// Variable outer: if-cascade, then write inner within each.
-	idxI, err := rl.lowerExpr(outerIdx.Index)
-	if err != nil {
-		return err
-	}
-	if constJ, ok := rl.constValue(innerIndex); ok {
-		rl.emitIfCascade(info.elemCount, idxI.cell, func(i int) {
-			rl.emit(&IRStoreFrame{Slot: baseSlot + i*info.elemSize + constJ, Src: r.cell, FrameSize: rl.rc.frameSize})
-		})
-	} else {
-		idxJ, err := rl.lowerExpr(innerIndex)
-		if err != nil {
-			return err
-		}
-		rl.emitIfCascade(info.elemCount, idxI.cell, func(i int) {
-			rl.emitFrameIndexWrite(baseSlot+i*info.elemSize, info.elemSize, idxJ.cell, r.cell)
-		})
-		if idxJ.temp {
-			rl.freeCell(idxJ.cell)
-		}
-	}
-	if idxI.temp {
-		rl.freeCell(idxI.cell)
-	}
-	if r.temp {
-		rl.freeCell(r.cell)
-	}
-	return nil
-}
-
-// lowerFieldAssign handles struct field assignment (p.x = val) in recursive functions.
-// For a[i].x = val with variable index, uses an if-cascade to write the correct slot.
-func (rl *recLowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
-	// Handle a[i].x = val where a is an array of structs.
-	if idx, ok := sel.X.(*ast.IndexExpr); ok {
-		if id, ok := idx.X.(*ast.Ident); ok {
-			baseSlot, info, err := rl.lookupArraySlot(id.Name)
-			if err != nil {
-				return err
-			}
-			if info.elemType == "" {
-				return fmt.Errorf("array %s element is not a struct", id.Name)
-			}
-			def := rl.result.Structs[info.elemType]
-			offset := def.Field[sel.Sel.Name].Offset
-			r, err := rl.lowerExpr(rhs)
-			if err != nil {
-				return err
-			}
-			r = rl.ensureTemp(r)
-			return rl.recFieldWriteInto(baseSlot, info, offset, idx.Index, r)
-		}
-	}
-	slot, err := rl.resolveFieldSlot(sel)
-	if err != nil {
-		return err
-	}
-	r, err := rl.lowerExpr(rhs)
-	if err != nil {
-		return err
-	}
-	r = rl.ensureTemp(r)
-	return rl.recWriteInto(slot, 1, &ast.BasicLit{Kind: token.INT, Value: "0"}, r)
-}
-
-// resolveFieldSlot resolves a selector expression to a frame slot offset.
-func (rl *recLowerer) resolveFieldSlot(sel *ast.SelectorExpr) (int, error) {
-	switch x := sel.X.(type) {
-	case *ast.Ident:
-		li, ok := rl.rc.locals[x.Name]
-		if !ok || li.structType == "" {
-			return 0, fmt.Errorf("variable %s is not a struct in recursive function", x.Name)
-		}
-		baseSlot := li.slot
-		def := rl.result.Structs[li.structType]
-		fi, ok := def.Field[sel.Sel.Name]
-		if !ok {
-			return 0, fmt.Errorf("unknown field %s", sel.Sel.Name)
-		}
-		return baseSlot + fi.Offset, nil
-	case *ast.SelectorExpr:
-		innerSlot, err := rl.resolveFieldSlot(x)
-		if err != nil {
-			return 0, err
-		}
-		innerDef := rl.resolveRecFieldDef(x)
-		if innerDef == nil {
-			return 0, fmt.Errorf("field %s is not a struct", x.Sel.Name)
-		}
-		fi, ok := innerDef.Field[sel.Sel.Name]
-		if !ok {
-			return 0, fmt.Errorf("unknown field %s", sel.Sel.Name)
-		}
-		return innerSlot + fi.Offset, nil
-	default:
-		return 0, fmt.Errorf("unsupported selector target in recursive function")
-	}
-}
-
 func (rl *recLowerer) lowerIncDec(s *ast.IncDecStmt) error {
-	var cell Cell
-	switch x := s.X.(type) {
-	case *ast.Ident:
-		c, err := rl.lookupVar(x.Name)
-		if err != nil {
-			return err
-		}
-		cell = c
-	case *ast.IndexExpr:
-		return rl.lowerArrayIncDec(x, s.Tok)
-	case *ast.SelectorExpr:
-		slot, err := rl.resolveFieldSlot(x)
-		if err != nil {
-			return err
-		}
-		r, err := rl.recIndexInto(slot, 1, &ast.BasicLit{Kind: token.INT, Value: "0"})
-		if err != nil {
-			return err
-		}
-		if s.Tok == token.INC {
-			rl.emit(&IRAddI{Dst: r.cell, Value: 1})
-		} else {
-			rl.emit(&IRSubI{Dst: r.cell, Value: 1})
-		}
-		return rl.recWriteInto(slot, 1, &ast.BasicLit{Kind: token.INT, Value: "0"}, r)
-	default:
-		return fmt.Errorf("unsupported inc/dec target in recursive function")
+	id, ok := s.X.(*ast.Ident)
+	if !ok {
+		return fmt.Errorf("unsupported inc/dec target in recursive function: %T", s.X)
+	}
+	cell, err := rl.lookupVar(id.Name)
+	if err != nil {
+		return err
 	}
 	if s.Tok == token.INC {
 		rl.emit(&IRAddI{Dst: cell, Value: 1})
@@ -1872,279 +1366,6 @@ func (rl *recLowerer) lowerIncDec(s *ast.IncDecStmt) error {
 		rl.emit(&IRSubI{Dst: cell, Value: 1})
 	}
 	return nil
-}
-
-func (rl *recLowerer) lowerArrayIncDec(idx *ast.IndexExpr, tok token.Token) error {
-	id, ok := idx.X.(*ast.Ident)
-	if !ok {
-		return fmt.Errorf("unsupported array access in recursive function")
-	}
-	baseSlot, info, err := rl.lookupArraySlot(id.Name)
-	if err != nil {
-		return err
-	}
-	r, err := rl.recIndexInto(baseSlot, info.elemCount, idx.Index)
-	if err != nil {
-		return err
-	}
-	if tok == token.INC {
-		rl.emit(&IRAddI{Dst: r.cell, Value: 1})
-	} else {
-		rl.emit(&IRSubI{Dst: r.cell, Value: 1})
-	}
-	return rl.recWriteInto(baseSlot, info.elemCount, idx.Index, r)
-}
-
-// lookupArraySlot returns the base frame slot and array info for an array variable.
-func (rl *recLowerer) lookupArraySlot(name string) (int, recArrayInfo, error) {
-	li, ok := rl.rc.locals[name]
-	if !ok {
-		return 0, recArrayInfo{}, fmt.Errorf("undefined variable in recursive function: %s", name)
-	}
-	if li.arrayInfo.size() == 0 {
-		return 0, recArrayInfo{}, fmt.Errorf("variable %s is not an array in recursive function", name)
-	}
-	return li.slot, li.arrayInfo, nil
-}
-
-func (rl *recLowerer) lowerStructCompositeLit(name, structType string, comp *ast.CompositeLit) error {
-	baseSlot := rl.rc.locals[name].slot
-	def := rl.result.Structs[structType]
-	rl.zeroFrameSlots(baseSlot, def.Size)
-	// Store field values.
-	for j, elt := range comp.Elts {
-		off := j
-		val := elt
-		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			off = def.Field[kv.Key.(*ast.Ident).Name].Offset
-			val = kv.Value
-		} else {
-			off = def.Field[def.Fields[j]].Offset
-		}
-		// Handle nested struct literal.
-		if innerComp, ok := val.(*ast.CompositeLit); ok {
-			if innerDef := rl.structDef(innerComp.Type); innerDef != nil {
-				for k, field := range innerComp.Elts {
-					innerOff := k
-					fval := field
-					if kv, ok := field.(*ast.KeyValueExpr); ok {
-						innerOff = innerDef.Field[kv.Key.(*ast.Ident).Name].Offset
-						fval = kv.Value
-					} else {
-						innerOff = innerDef.Field[innerDef.Fields[k]].Offset
-					}
-					r, err := rl.lowerExpr(fval)
-					if err != nil {
-						return err
-					}
-					rl.emit(&IRStoreFrame{Slot: baseSlot + off + innerOff, Src: r.cell, FrameSize: rl.rc.frameSize})
-					if r.temp {
-						rl.freeCell(r.cell)
-					}
-				}
-				continue
-			}
-		}
-		r, err := rl.lowerExpr(val)
-		if err != nil {
-			return err
-		}
-		rl.emit(&IRStoreFrame{Slot: baseSlot + off, Src: r.cell, FrameSize: rl.rc.frameSize})
-		if r.temp {
-			rl.freeCell(r.cell)
-		}
-	}
-	return nil
-}
-
-func (rl *recLowerer) lowerArrayCompositeLit(name string, comp *ast.CompositeLit) error {
-	baseSlot, info, err := rl.lookupArraySlot(name)
-	if err != nil {
-		return err
-	}
-	size := info.size()
-	rl.zeroFrameSlots(baseSlot, size)
-	// Store element values.
-	for j, elt := range comp.Elts {
-		idx := j
-		val := elt
-		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			idx, _ = rl.constValue(kv.Key)
-			val = kv.Value
-		}
-		elemBase := baseSlot + idx*info.elemSize
-		if info.elemSize == 1 {
-			// Scalar element.
-			r, err := rl.lowerExpr(val)
-			if err != nil {
-				return err
-			}
-			rl.emit(&IRStoreFrame{Slot: elemBase, Src: r.cell, FrameSize: rl.rc.frameSize})
-			if r.temp {
-				rl.freeCell(r.cell)
-			}
-		} else if innerComp, ok := val.(*ast.CompositeLit); ok {
-			// Nested composite literal (struct or inner array).
-			if def := rl.structDef(innerComp.Type); def != nil {
-				// Struct element.
-				for k, field := range innerComp.Elts {
-					off := k
-					fval := field
-					if kv, ok := field.(*ast.KeyValueExpr); ok {
-						off = def.Field[kv.Key.(*ast.Ident).Name].Offset
-						fval = kv.Value
-					} else {
-						off = def.Field[def.Fields[k]].Offset
-					}
-					r, err := rl.lowerExpr(fval)
-					if err != nil {
-						return err
-					}
-					rl.emit(&IRStoreFrame{Slot: elemBase + off, Src: r.cell, FrameSize: rl.rc.frameSize})
-					if r.temp {
-						rl.freeCell(r.cell)
-					}
-				}
-			} else {
-				// Inner array.
-				for k, inner := range innerComp.Elts {
-					r, err := rl.lowerExpr(inner)
-					if err != nil {
-						return err
-					}
-					rl.emit(&IRStoreFrame{Slot: elemBase + k, Src: r.cell, FrameSize: rl.rc.frameSize})
-					if r.temp {
-						rl.freeCell(r.cell)
-					}
-				}
-			}
-		} else {
-			return fmt.Errorf("unsupported composite element in recursive function")
-		}
-	}
-	return nil
-}
-
-// emitIfCascade emits an if-cascade that checks idxCell against each
-// index 0..size-1 and executes emitBody for the matching case.
-func (rl *recLowerer) emitIfCascade(size int, idxCell Cell, emitBody func(j int)) {
-	for j := range size {
-		cmp := rl.allocCell()
-		idxCopy := rl.allocCell()
-		rl.emit(&IRCopy{Dst: idxCopy, Src: idxCell})
-		rl.emit(&IRConst{Dst: cmp, Value: byte(j)}) // #nosec G115
-		rl.emit(&IRCmp{Op: CmpEq, Dst: cmp, Src1: idxCopy, Src2: cmp})
-		rl.freeCell(idxCopy)
-		saved := rl.nodes
-		rl.nodes = nil
-		emitBody(j)
-		thenBlock := &IRBlock{Nodes: rl.nodes}
-		rl.nodes = saved
-		rl.emit(&IRIf{Cond: cmp, Then: thenBlock})
-		rl.freeCell(cmp)
-	}
-}
-
-// emitFrameIndexRead emits an if-cascade to load a[idx] from frame slots.
-// recIndexInto reads a scalar from a frame-based array at the given index.
-func (rl *recLowerer) recIndexInto(baseSlot, count int, indexExpr ast.Expr) (exprResult, error) {
-	if constIdx, ok := rl.constValue(indexExpr); ok {
-		cell := rl.allocCell()
-		rl.emit(&IRLoadFrame{Dst: cell, Slot: baseSlot + constIdx, FrameSize: rl.rc.frameSize})
-		return exprResult{cell: cell, temp: true}, nil
-	}
-	idxR, err := rl.lowerExpr(indexExpr)
-	if err != nil {
-		return exprResult{}, err
-	}
-	result := rl.allocCell()
-	rl.emit(&IRZero{Dst: result})
-	rl.emitFrameIndexRead(baseSlot, count, idxR.cell, result)
-	if idxR.temp {
-		rl.freeCell(idxR.cell)
-	}
-	return exprResult{cell: result, temp: true}, nil
-}
-
-// recFieldIndexInto reads a struct field from a frame-based struct array.
-// Computes baseSlot + i*elemSize + offset for constant i, or if-cascade for variable i.
-func (rl *recLowerer) recFieldIndexInto(baseSlot int, info recArrayInfo, offset int, indexExpr ast.Expr) (exprResult, error) {
-	if constIdx, ok := rl.constValue(indexExpr); ok {
-		cell := rl.allocCell()
-		rl.emit(&IRLoadFrame{Dst: cell, Slot: baseSlot + constIdx*info.elemSize + offset, FrameSize: rl.rc.frameSize})
-		return exprResult{cell: cell, temp: true}, nil
-	}
-	idxR, err := rl.lowerExpr(indexExpr)
-	if err != nil {
-		return exprResult{}, err
-	}
-	result := rl.allocCell()
-	rl.emit(&IRZero{Dst: result})
-	rl.emitFrameCompositeRead(baseSlot, info, idxR.cell, offset, result)
-	if idxR.temp {
-		rl.freeCell(idxR.cell)
-	}
-	return exprResult{cell: result, temp: true}, nil
-}
-
-// recFieldWriteInto writes a scalar to a struct field in a frame-based struct array.
-func (rl *recLowerer) recFieldWriteInto(baseSlot int, info recArrayInfo, offset int, indexExpr ast.Expr, val exprResult) error {
-	if constIdx, ok := rl.constValue(indexExpr); ok {
-		rl.emit(&IRStoreFrame{Slot: baseSlot + constIdx*info.elemSize + offset, Src: val.cell, FrameSize: rl.rc.frameSize})
-	} else {
-		idxR, err := rl.lowerExpr(indexExpr)
-		if err != nil {
-			return err
-		}
-		rl.emitFrameFieldWrite(baseSlot, info, offset, idxR.cell, val.cell)
-		if idxR.temp {
-			rl.freeCell(idxR.cell)
-		}
-	}
-	if val.temp {
-		rl.freeCell(val.cell)
-	}
-	return nil
-}
-
-// recWriteInto writes a scalar to a frame-based array at the given index.
-func (rl *recLowerer) recWriteInto(baseSlot, count int, indexExpr ast.Expr, val exprResult) error {
-	if constIdx, ok := rl.constValue(indexExpr); ok {
-		rl.emit(&IRStoreFrame{Slot: baseSlot + constIdx, Src: val.cell, FrameSize: rl.rc.frameSize})
-	} else {
-		idxR, err := rl.lowerExpr(indexExpr)
-		if err != nil {
-			return err
-		}
-		rl.emitFrameIndexWrite(baseSlot, count, idxR.cell, val.cell)
-		if idxR.temp {
-			rl.freeCell(idxR.cell)
-		}
-	}
-	if val.temp {
-		rl.freeCell(val.cell)
-	}
-	return nil
-}
-
-func (rl *recLowerer) emitFrameIndexRead(baseSlot, size int, idxCell, result Cell) {
-	rl.emitIfCascade(size, idxCell, func(j int) {
-		rl.emit(&IRLoadFrame{Dst: result, Slot: baseSlot + j, FrameSize: rl.rc.frameSize})
-	})
-}
-
-// emitFrameIndexWrite emits an if-cascade to store val to a[idx] in frame slots.
-func (rl *recLowerer) emitFrameIndexWrite(baseSlot, size int, idxCell, val Cell) {
-	rl.emitIfCascade(size, idxCell, func(j int) {
-		rl.emit(&IRStoreFrame{Slot: baseSlot + j, Src: val, FrameSize: rl.rc.frameSize})
-	})
-}
-
-// emitFrameFieldWrite stores val to a[idx].field using an if-cascade.
-func (rl *recLowerer) emitFrameFieldWrite(baseSlot int, info recArrayInfo, fieldOffset int, idxCell, val Cell) {
-	rl.emitIfCascade(info.elemCount, idxCell, func(j int) {
-		rl.emit(&IRStoreFrame{Slot: baseSlot + j*info.elemSize + fieldOffset, Src: val, FrameSize: rl.rc.frameSize})
-	})
 }
 
 func (rl *recLowerer) lowerIf(s *ast.IfStmt) error {
@@ -2318,39 +1539,14 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 		cell = rl.allocCell()
 		defer rl.freeCell(cell)
 	}
-	// Check if ranging over an array: for i, v := range arr
-	var valCell Cell
-	var arrBaseSlot int
-	var arrInfo recArrayInfo
-	var hasVal bool
+	// Range over a scalar limit: for i := range n. Range over arrays
+	// requires array locals, which are rejected upfront.
 	if s.Value != nil {
-		if valID, ok := s.Value.(*ast.Ident); ok {
-			if arrID, ok := s.X.(*ast.Ident); ok {
-				baseSlot, info, err := rl.lookupArraySlot(arrID.Name)
-				if err == nil {
-					arrBaseSlot = baseSlot
-					arrInfo = info
-					hasVal = true
-					valCell, err = rl.lookupVar(valID.Name)
-					if err != nil {
-						return err
-					}
-				}
-			}
-		}
+		return fmt.Errorf("range with value in recursive function is not supported (no array locals)")
 	}
-	// Evaluate the range limit.
-	var limit exprResult
-	if hasVal {
-		t := rl.allocCell()
-		rl.emit(&IRConst{Dst: t, Value: byte(arrInfo.elemCount)}) // #nosec G115
-		limit = exprResult{cell: t, temp: true}
-	} else {
-		var err error
-		limit, err = rl.lowerExpr(s.X)
-		if err != nil {
-			return err
-		}
+	limit, err := rl.lowerExpr(s.X)
+	if err != nil {
+		return err
 	}
 	rl.emit(&IRZero{Dst: cell})
 	condCell := rl.allocCell()
@@ -2370,11 +1566,6 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	rl.nodes = nil
 	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
 	rl.emit(&IRZero{Dst: rl.loopBreakFlag})
-	// Load range value variable each iteration: v = array[key]
-	if hasVal {
-		rl.emit(&IRZero{Dst: valCell})
-		rl.emitFrameIndexRead(arrBaseSlot, arrInfo.elemCount, cell, valCell)
-	}
 	if err := rl.lowerLoopBody(s.Body.List); err != nil {
 		return err
 	}
@@ -2459,61 +1650,7 @@ func (rl *recLowerer) emitCondTo(dst Cell, cond ast.Expr) error {
 func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 	if len(s.Results) >= 1 {
 		if rl.rc.retSize > 1 {
-			// Multi-cell return (struct/array).
-			result := s.Results[0]
-			if id, ok := result.(*ast.Ident); ok {
-				// Variable: load each cell from frame to retReg area.
-				li, ok := rl.rc.locals[id.Name]
-				if !ok {
-					return fmt.Errorf("undefined variable: %s", id.Name)
-				}
-				slot := li.slot
-				for j := range rl.rc.retSize {
-					cell := rl.allocCell()
-					rl.emit(&IRLoadFrame{Dst: cell, Slot: slot + j, FrameSize: rl.rc.frameSize})
-					rl.emit(&IRMove{Dst: rl.rc.retReg + j, Src: cell})
-					rl.freeCell(cell)
-				}
-			} else if comp, ok := result.(*ast.CompositeLit); ok {
-				if def := rl.structDef(comp.Type); def != nil {
-					// Struct literal: lower each field using recLowerer's lowerExpr.
-					for j, elt := range comp.Elts {
-						var off int
-						var ve ast.Expr
-						if kv, ok := elt.(*ast.KeyValueExpr); ok {
-							off = def.Field[kv.Key.(*ast.Ident).Name].Offset
-							ve = kv.Value
-						} else {
-							off = def.Field[def.Fields[j]].Offset
-							ve = elt
-						}
-						r, err := rl.lowerExpr(ve)
-						if err != nil {
-							return err
-						}
-						rl.emitCopyOrMove(rl.rc.retReg+off, r)
-					}
-				} else if arrayTypeSize(comp.Type) > 0 {
-					// Array literal: lower each element.
-					for j, elt := range comp.Elts {
-						idx := j
-						val := elt
-						if kv, ok := elt.(*ast.KeyValueExpr); ok {
-							idx, _ = rl.constValue(kv.Key)
-							val = kv.Value
-						}
-						r, err := rl.lowerExpr(val)
-						if err != nil {
-							return err
-						}
-						rl.emitCopyOrMove(rl.rc.retReg+idx, r)
-					}
-				} else {
-					return fmt.Errorf("unsupported composite return in recursive function")
-				}
-			} else {
-				return fmt.Errorf("unsupported multi-cell return in recursive function")
-			}
+			return fmt.Errorf("unsupported multi-cell return in recursive function")
 		} else {
 			r, err := rl.lowerExpr(s.Results[0])
 			if err != nil {
@@ -2641,59 +1778,6 @@ func (rl *recLowerer) emitDeferred() {
 	}
 }
 
-// lowerRecCompositeCompare handles == and != for frame-based arrays
-// and structs in recursive functions. Loads elements from the frame
-// and compares element-by-element.
-func (rl *recLowerer) lowerRecCompositeCompare(e *ast.BinaryExpr) (exprResult, bool, error) {
-	resolve := func(expr ast.Expr) (int, int, bool) {
-		id, ok := expr.(*ast.Ident)
-		if !ok {
-			return 0, 0, false
-		}
-		li, ok := rl.rc.locals[id.Name]
-		if !ok {
-			return 0, 0, false
-		}
-		if li.arrayInfo.size() > 0 {
-			return li.slot, li.arrayInfo.size(), true
-		}
-		if li.structType != "" {
-			def := rl.result.Structs[li.structType]
-			return li.slot, def.Size, true
-		}
-		return 0, 0, false
-	}
-	lSlot, lSize, lOk := resolve(e.X)
-	rSlot, rSize, rOk := resolve(e.Y)
-	if !lOk || !rOk || lSize != rSize {
-		return exprResult{}, false, nil
-	}
-	// Compare element-by-element: load each pair from frame.
-	result := rl.allocCell()
-	rl.emit(&IRConst{Dst: result, Value: 1})
-	for i := range lSize {
-		lCell := rl.allocCell()
-		rCell := rl.allocCell()
-		rl.emit(&IRLoadFrame{Dst: lCell, Slot: lSlot + i, FrameSize: rl.rc.frameSize})
-		rl.emit(&IRLoadFrame{Dst: rCell, Slot: rSlot + i, FrameSize: rl.rc.frameSize})
-		cond := rl.allocCell()
-		rl.emit(&IRCopy{Dst: cond, Src: result})
-		rl.emit(&IRIf{Cond: cond, Then: &IRBlock{Nodes: []IRNode{
-			&IRCmp{Op: CmpEq, Dst: result, Src1: lCell, Src2: rCell},
-		}}})
-		rl.freeCell(cond)
-		rl.freeCell(lCell)
-		rl.freeCell(rCell)
-	}
-	if e.Op == token.NEQ {
-		notResult := rl.allocCell()
-		rl.emit(&IRNot{Dst: notResult, Src: result})
-		rl.freeCell(result)
-		return exprResult{cell: notResult, temp: true}, true, nil
-	}
-	return exprResult{cell: result, temp: true}, true, nil
-}
-
 // Expression lowering.
 
 func (rl *recLowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
@@ -2707,60 +1791,17 @@ func (rl *recLowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 	case *ast.UnaryExpr:
 		return rl.lowerUnary(e, rl.lowerExpr)
 	case *ast.BinaryExpr:
-		if e.Op == token.EQL || e.Op == token.NEQ {
-			if r, ok, err := rl.lowerRecCompositeCompare(e); ok {
-				return r, err
-			}
-		}
 		return rl.lowerBinary(e, rl.lowerExpr)
 	case *ast.CallExpr:
 		return rl.lowerCallExpr(e)
-	case *ast.IndexExpr:
-		return rl.lowerIndexExpr(e)
-	case *ast.SelectorExpr:
-		return rl.lowerSelectorExpr(e)
 	default:
 		return exprResult{}, fmt.Errorf("unsupported expression in recursive function: %T", expr)
 	}
 }
 
 func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
-	// Handle len() for frame-based arrays.
-	if fn, ok := e.Fun.(*ast.Ident); ok && (fn.Name == "len" || fn.Name == "cap") && len(e.Args) == 1 {
-		if id, ok := e.Args[0].(*ast.Ident); ok {
-			if li, ok := rl.rc.locals[id.Name]; ok && li.arrayInfo.size() > 0 {
-				t := rl.allocCell()
-				rl.emit(&IRConst{Dst: t, Value: byte(li.arrayInfo.elemCount)}) // #nosec G115
-				return exprResult{cell: t, temp: true}, nil
-			}
-		}
-	}
 	if r, ok, err := rl.lowerCallExprWith(e, rl.lowerExpr); ok {
 		return r, err
-	}
-	// Handle method calls: p.sum() -> Point.sum(p)
-	if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
-		if id, ok := sel.X.(*ast.Ident); ok {
-			if li, ok := rl.rc.locals[id.Name]; ok && li.structType != "" {
-				funcName := li.structType + "." + sel.Sel.Name
-				info, ok := rl.result.Funcs[funcName]
-				if !ok {
-					return exprResult{}, fmt.Errorf("undefined method: %s", funcName)
-				}
-				if info.Returns == 0 {
-					return exprResult{}, fmt.Errorf("method %s has no return value", funcName)
-				}
-				args := append([]ast.Expr{sel.X}, e.Args...)
-				retCells, err := rl.inlineCallInRec(info, args)
-				if err != nil {
-					return exprResult{}, err
-				}
-				for i := 1; i < len(retCells); i++ {
-					rl.freeCell(retCells[i])
-				}
-				return exprResult{cell: retCells[0], temp: true}, nil
-			}
-		}
 	}
 	// Inline non-recursive user functions.
 	if fn, ok := e.Fun.(*ast.Ident); ok {
@@ -2780,156 +1821,4 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 		}
 	}
 	return exprResult{}, fmt.Errorf("unsupported call in recursive expression: %T", e.Fun)
-}
-
-func (rl *recLowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
-	// Chained index: a[i][j] -- outer index on composite element.
-	if innerIdx, ok := e.X.(*ast.IndexExpr); ok {
-		innerID, ok := innerIdx.X.(*ast.Ident)
-		if !ok {
-			return exprResult{}, fmt.Errorf("unsupported chained array access in recursive function")
-		}
-		baseSlot, info, err := rl.lookupArraySlot(innerID.Name)
-		if err != nil {
-			return exprResult{}, err
-		}
-		// Constant outer: index into sub-array directly.
-		if constI, ok := rl.constValue(innerIdx.Index); ok {
-			return rl.recIndexInto(baseSlot+constI*info.elemSize, info.elemSize, e.Index)
-		}
-		// Variable outer: if-cascade, then index inner within each.
-		idxI, err := rl.lowerExpr(innerIdx.Index)
-		if err != nil {
-			return exprResult{}, err
-		}
-		result := rl.allocCell()
-		rl.emit(&IRZero{Dst: result})
-		if constJ, ok := rl.constValue(e.Index); ok {
-			rl.emitFrameCompositeRead(baseSlot, info, idxI.cell, constJ, result)
-		} else {
-			idxJ, err := rl.lowerExpr(e.Index)
-			if err != nil {
-				return exprResult{}, err
-			}
-			rl.emitIfCascade(info.elemCount, idxI.cell, func(i int) {
-				rl.emitFrameIndexRead(baseSlot+i*info.elemSize, info.elemSize, idxJ.cell, result)
-			})
-			if idxJ.temp {
-				rl.freeCell(idxJ.cell)
-			}
-		}
-		if idxI.temp {
-			rl.freeCell(idxI.cell)
-		}
-		return exprResult{cell: result, temp: true}, nil
-	}
-	id, ok := e.X.(*ast.Ident)
-	if !ok {
-		return exprResult{}, fmt.Errorf("unsupported array access in recursive function")
-	}
-	baseSlot, info, err := rl.lookupArraySlot(id.Name)
-	if err != nil {
-		return exprResult{}, err
-	}
-	// Constant index on composite element: return base slot for chained access.
-	if info.elemSize > 1 {
-		if constIdx, ok := rl.constValue(e.Index); ok {
-			return exprResult{cell: baseSlot + constIdx*info.elemSize}, nil
-		}
-		return exprResult{}, fmt.Errorf("variable index on composite array not supported in recursive functions")
-	}
-	return rl.recIndexInto(baseSlot, info.elemCount, e.Index)
-}
-
-// emitFrameCompositeRead emits an if-cascade to load a scalar from a composite
-// array element with a variable outer index: a[n] at offset within the element.
-// For each possible index i, checks if idxCell == i and loads from
-// baseSlot + i*elemSize + offset.
-func (rl *recLowerer) emitFrameCompositeRead(baseSlot int, info recArrayInfo, idxCell Cell, offset int, result Cell) {
-	rl.emitIfCascade(info.elemCount, idxCell, func(i int) {
-		rl.emit(&IRLoadFrame{Dst: result, Slot: baseSlot + i*info.elemSize + offset, FrameSize: rl.rc.frameSize})
-	})
-}
-
-// resolveRecFieldDef resolves the struct definition for a field in a selector,
-// using the recursive function's locals map.
-func (rl *recLowerer) resolveRecFieldDef(e *ast.SelectorExpr) *StructDef {
-	var parentDef *StructDef
-	switch x := e.X.(type) {
-	case *ast.Ident:
-		li, ok := rl.rc.locals[x.Name]
-		if !ok || li.structType == "" {
-			return nil
-		}
-		parentDef = rl.result.Structs[li.structType]
-	case *ast.SelectorExpr:
-		parentDef = rl.resolveRecFieldDef(x)
-	}
-	if parentDef == nil {
-		return nil
-	}
-	fieldType := parentDef.Field[e.Sel.Name].StructType
-	if fieldType == "" {
-		return nil
-	}
-	return rl.result.Structs[fieldType]
-}
-
-func (rl *recLowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
-	// Handle a[i].x -- array of structs field access.
-	if idx, ok := e.X.(*ast.IndexExpr); ok {
-		id, ok := idx.X.(*ast.Ident)
-		if !ok {
-			return exprResult{}, fmt.Errorf("unsupported array selector in recursive function")
-		}
-		baseSlot, info, err := rl.lookupArraySlot(id.Name)
-		if err != nil {
-			return exprResult{}, err
-		}
-		def := rl.result.Structs[info.elemType]
-		offset := def.Field[e.Sel.Name].Offset
-		return rl.recFieldIndexInto(baseSlot, info, offset, idx.Index)
-	}
-	// Resolve the base: identifier or chained selector (nested struct).
-	var baseSlot int
-	var def *StructDef
-	switch x := e.X.(type) {
-	case *ast.Ident:
-		li, ok := rl.rc.locals[x.Name]
-		if !ok || li.structType == "" {
-			return exprResult{}, fmt.Errorf("variable %s is not a struct in recursive function", x.Name)
-		}
-		baseSlot = li.slot
-		def = rl.result.Structs[li.structType]
-	case *ast.SelectorExpr:
-		// Chained: r.min.x -> resolve r.min first to get base slot.
-		inner, err := rl.lowerSelectorExpr(x)
-		if err != nil {
-			return exprResult{}, err
-		}
-		baseSlot = inner.cell
-		// Find the struct type of the inner field by walking the type chain.
-		innerDef := rl.resolveRecFieldDef(x)
-		if innerDef == nil {
-			return exprResult{}, fmt.Errorf("field %s is not a struct", x.Sel.Name)
-		}
-		def = innerDef
-	default:
-		return exprResult{}, fmt.Errorf("unsupported selector in recursive function")
-	}
-	if def == nil {
-		return exprResult{}, fmt.Errorf("unsupported selector in recursive function")
-	}
-	fi, ok := def.Field[e.Sel.Name]
-	if !ok {
-		return exprResult{}, fmt.Errorf("unknown field %s in struct %s", e.Sel.Name, def.Name)
-	}
-	slot := baseSlot + fi.Offset
-	// If the field is a nested struct, return the base slot for chained access.
-	if fi.StructType != "" {
-		return exprResult{cell: slot}, nil
-	}
-	cell := rl.allocCell()
-	rl.emit(&IRLoadFrame{Dst: cell, Slot: slot, FrameSize: rl.rc.frameSize})
-	return exprResult{cell: cell, temp: true}, nil
 }
