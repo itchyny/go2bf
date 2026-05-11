@@ -1057,6 +1057,75 @@ recursive `lowerFor`/`lowerRange` push/pop the same way, with their
 own dedicated `lowerLabeledStmt` so the inner statement is dispatched
 through `recLowerer.lowerStmt` rather than the embedded base.
 
+### Goto
+
+`goto` lowers to a state-machine dispatch loop. When `hasGoto`
+detects any `goto` statement in a function body, `lowerGotoDispatch`
+takes over instead of straight `lowerStmts`. The body is split at
+each top-level non-loop labeled statement into segments; statements
+before the first label form segment 0, the label's body becomes
+segment 1, any following non-labeled statements append to segment 1,
+and so on. A `gotoState` cell holds the current segment index; the
+whole body becomes:
+
+```text
+state = 0
+while state != exit:
+    returnFlag = 0           // loop-top reset
+    if state == 0: { ... segment 0 ...
+                     if !returnFlag { state = 1 }    // fall-through
+    }
+    if state == 1: { ...
+                     if !returnFlag { state = 2 }
+    }
+    ...
+    cond = (state != exit)
+```
+
+The match check uses `IRCmp{CmpEq, match, state, idxCell}`, with
+the segment index in a constant cell. The fall-through `state =
+next` at the end of every segment is wrapped in `if !returnFlag`,
+so a `goto` or `return` inside the body preserves the state it set.
+
+`goto LABEL` resolves the label name via `gotoLabels[name]` to a
+segment index, then emits:
+
+```text
+state = labelIdx
+returnFlag = 1       // skip rest of segment via existing guards
+```
+
+`return` adds `state = exit` to its usual `returnFlag = 1` so the
+loop's cond check terminates on the next iteration.
+
+`returnFlag` is reset both at the top of every loop iteration AND
+at the top of every segment body. The per-segment reset is necessary
+because multiple segments can run in the same iteration via
+fall-through: without it, a `goto` in segment 0 leaves `returnFlag =
+1`, and segment 2's fall-through guard then refuses to advance state
+-- the dispatch never makes progress.
+
+Functions without `return` statements still allocate `returnFlag` if
+they use `goto`, since the dispatch needs the within-segment skip
+mechanism. `hasReturn(body) || hasGoto(body)` gates the allocation.
+
+The dispatch's `idxCell` (the constant index for each segment's
+match check) is held alive across the segment body's lowering. If
+it were freed early, the body's `allocCell` (e.g., for `x := byte(0)`)
+would reuse the slot, and every loop iteration would overwrite `x`
+when the next iteration's dispatch re-emits `IRConst{idxCell, 0}`.
+
+Limitations:
+
+- Labels nested inside `if`/`for`/`switch` blocks are rejected by
+  the existing `lowerLabeledStmt` (which the dispatcher never
+  routes those labels through).
+- `goto` in tail-recursive functions is rejected up front: the
+  tail-call loop and the dispatch loop would have to share a single
+  body rewrite, and the interaction isn't worth the complexity.
+- The segment count is bounded by 254 (`gotoState` is a byte;
+  `exit` reserves one value).
+
 ## Defer
 
 `defer` captures the function call arguments at defer-time

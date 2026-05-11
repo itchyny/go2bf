@@ -41,6 +41,11 @@ type Lowerer struct {
 	loopFrames    []loopFrame
 	pendingLabel  string // label captured from *ast.LabeledStmt, consumed by next for/range
 
+	// Goto dispatch context.
+	gotoLabels map[string]int // label name -> segment index, non-nil while lowering a goto-using function
+	gotoState  Cell           // cell holding the current segment index (0..exit), valid when gotoLabels != nil
+	gotoExit   int            // segment index that terminates the dispatch loop
+
 	// Heap allocator for slices.
 	heapPtr Cell // cell holding the next free stack slot index
 
@@ -265,16 +270,24 @@ func Lower(result *AnalysisResult) (*Program, error) {
 		sc[name] = &stringConstBinding{value: v}
 	}
 
-	// Set up return flag only if the body contains return statements.
+	// Set up return flag if the body contains return statements, or any
+	// goto -- the goto dispatch loop uses returnFlag to skip the rest of
+	// a segment after a jump.
 	info := result.Funcs["main"]
-	if hasReturn(info.Body) {
+	if hasReturn(info.Body) || hasGoto(info.Body) {
 		l.returnFlag = l.allocCell()
 		l.emit(&IRZero{Dst: l.returnFlag})
 	}
 	l.inFunc = true
 
-	if err := l.lowerStmts(info.Body.List); err != nil {
-		return nil, err
+	if hasGoto(info.Body) {
+		if err := l.lowerGotoDispatch(info.Body.List); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := l.lowerStmts(info.Body.List); err != nil {
+			return nil, err
+		}
 	}
 	l.emitDeferred()
 
@@ -5448,6 +5461,19 @@ func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 		}
 		l.emit(&IRConst{Dst: l.loopSkipFlag, Value: 1})
 		return nil
+	case token.GOTO:
+		if l.gotoLabels == nil || s.Label == nil {
+			return fmt.Errorf("goto outside a goto-dispatch function")
+		}
+		idx, ok := l.gotoLabels[s.Label.Name]
+		if !ok {
+			return fmt.Errorf("goto target %s is not a top-level label of the enclosing function", s.Label.Name)
+		}
+		l.emit(&IRConst{Dst: l.gotoState, Value: byte(idx)}) // #nosec G115
+		if l.returnFlag != 0 {
+			l.emit(&IRConst{Dst: l.returnFlag, Value: 1})
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported branch statement: %s", s.Tok)
 	}
@@ -5481,19 +5507,192 @@ func (l *Lowerer) emitLabeledBranch(label string, isBreak bool) error {
 }
 
 // lowerLabeledStmt records the label for the next for/range to consume,
-// then lowers the inner statement. Non-loop labeled statements are not
-// supported (no goto, no labeled blocks).
+// then lowers the inner statement. Top-level non-loop labels in
+// goto-using functions are stripped before this is called (see
+// lowerGotoDispatch); only loop labels and labels nested inside
+// blocks reach this path. Non-loop labels in nested positions are
+// rejected: lifting them to function-body top level makes them work
+// as goto targets.
 func (l *Lowerer) lowerLabeledStmt(s *ast.LabeledStmt) error {
 	switch s.Stmt.(type) {
 	case *ast.ForStmt, *ast.RangeStmt:
 	default:
-		return fmt.Errorf("label %s on non-loop statement is not supported", s.Label.Name)
+		return fmt.Errorf("label %s must be at the function-body top level", s.Label.Name)
 	}
 	saved := l.pendingLabel
 	l.pendingLabel = s.Label.Name
 	err := l.lowerStmt(s.Stmt)
 	l.pendingLabel = saved
 	return err
+}
+
+// hasGoto reports whether a function body contains any goto statement.
+func hasGoto(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if b, ok := n.(*ast.BranchStmt); ok && b.Tok == token.GOTO {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// splitGotoSegments splits the function body into segments at each non-loop
+// labeled statement. Segment 0 covers the entry through the first label;
+// segment k (k>=1) starts at label k. Loop labels (on for/range) are not
+// segment boundaries; they remain attached to the loop for break/continue.
+// Returns the segments (each is a slice of statements with labels stripped)
+// and a map from label name to segment index.
+func splitGotoSegments(stmts []ast.Stmt) ([][]ast.Stmt, map[string]int, error) {
+	segments := [][]ast.Stmt{nil}
+	labelToIdx := map[string]int{}
+	for _, s := range stmts {
+		ls, ok := s.(*ast.LabeledStmt)
+		if !ok {
+			segments[len(segments)-1] = append(segments[len(segments)-1], s)
+			continue
+		}
+		if _, ok := ls.Stmt.(*ast.ForStmt); ok {
+			segments[len(segments)-1] = append(segments[len(segments)-1], s)
+			continue
+		}
+		if _, ok := ls.Stmt.(*ast.RangeStmt); ok {
+			segments[len(segments)-1] = append(segments[len(segments)-1], s)
+			continue
+		}
+		if _, exists := labelToIdx[ls.Label.Name]; exists {
+			return nil, nil, fmt.Errorf("duplicate label %s", ls.Label.Name)
+		}
+		labelToIdx[ls.Label.Name] = len(segments)
+		segments = append(segments, []ast.Stmt{ls.Stmt})
+	}
+	return segments, labelToIdx, nil
+}
+
+// lowerGotoDispatch lowers a function body that uses goto into a state-machine
+// dispatch loop. The body is split at each top-level non-loop label into
+// segments; a `gotoState` cell holds the current segment index. The loop
+// runs while gotoState != gotoExit. Each iteration runs the matching segment;
+// the segment body may set gotoState explicitly (via goto) or fall through,
+// in which case the synthetic last statement of the segment sets state to
+// the next index. Return statements set state to gotoExit and rely on the
+// existing returnFlag mechanism to skip the rest of the segment.
+func (l *Lowerer) lowerGotoDispatch(stmts []ast.Stmt) error {
+	segments, labelToIdx, err := splitGotoSegments(stmts)
+	if err != nil {
+		return err
+	}
+	exit := len(segments)
+	if exit > 254 {
+		return fmt.Errorf("too many labels in function: %d (max 254)", len(segments)-1)
+	}
+
+	state := l.allocCell()
+	l.emit(&IRZero{Dst: state})
+	cond := l.allocCell()
+	l.emit(&IRConst{Dst: cond, Value: 1})
+
+	savedLabels := l.gotoLabels
+	savedState := l.gotoState
+	savedExit := l.gotoExit
+	l.gotoLabels = labelToIdx
+	l.gotoState = state
+	l.gotoExit = exit
+	defer func() {
+		l.gotoLabels = savedLabels
+		l.gotoState = savedState
+		l.gotoExit = savedExit
+	}()
+
+	// Build the dispatch loop body.
+	saved := l.nodes
+	l.nodes = nil
+
+	// Reset returnFlag at the top of each iteration. Returns set state to
+	// exit (loop terminates); gotos set state to the target. Both also set
+	// returnFlag to skip the rest of the segment body. Resetting it here
+	// gives the next iteration a clean slate -- the loop condition has
+	// already used the post-iteration state value to decide whether to
+	// re-enter.
+	if l.returnFlag != 0 {
+		l.emit(&IRZero{Dst: l.returnFlag})
+	}
+
+	for i, seg := range segments {
+		match := l.allocCell()
+		idxCell := l.allocCell()
+		l.emit(&IRConst{Dst: idxCell, Value: byte(i)}) // #nosec G115
+		l.emit(&IRCmp{Op: CmpEq, Dst: match, Src1: state, Src2: idxCell})
+		// Hold idxCell alive across segment body lowering: freeing it
+		// here would let the body's allocCell reuse the slot for a user
+		// variable, but the SAME slot is written by the next iteration's
+		// dispatch -- clobbering the variable on every loop pass.
+
+		segBody, err := l.captureBlock(func() error {
+			// Reset returnFlag at the top of each segment body so that
+			// a goto in an earlier segment of the same dispatch iteration
+			// doesn't suppress this segment's statements. The state cell
+			// alone gates which segment's body runs; returnFlag is purely
+			// a within-segment skip mechanism after a return or goto.
+			if l.returnFlag != 0 {
+				l.emit(&IRZero{Dst: l.returnFlag})
+			}
+			if err := l.lowerStmts(seg); err != nil {
+				return err
+			}
+			// Fall-through: if the segment didn't goto/return, advance state.
+			// Guard with !returnFlag so a goto or return that fired inside
+			// the segment body keeps the state it set.
+			next := min(i+1, exit)
+			if l.returnFlag != 0 {
+				notRet := l.allocCell()
+				l.emit(&IRNot{Dst: notRet, Src: l.returnFlag})
+				advance := &IRBlock{Nodes: []IRNode{&IRConst{Dst: state, Value: byte(next)}}} // #nosec G115
+				l.emit(&IRIf{Cond: notRet, Then: advance})
+				l.freeCell(notRet)
+			} else {
+				l.emit(&IRConst{Dst: state, Value: byte(next)}) // #nosec G115
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		l.emit(&IRIf{Cond: match, Then: segBody})
+		l.freeCell(match)
+		l.freeCell(idxCell)
+	}
+
+	// After segment dispatch: cond = (state != exit).
+	exitConst := l.allocCell()
+	l.emit(&IRConst{Dst: exitConst, Value: byte(exit)}) // #nosec G115
+	l.emit(&IRCmp{Op: CmpNeq, Dst: cond, Src1: state, Src2: exitConst})
+	l.freeCell(exitConst)
+
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+
+	l.emit(&IRLoop{Cond: cond, Body: body})
+
+	l.freeCell(cond)
+	l.freeCell(state)
+	return nil
+}
+
+// captureBlock redirects emit to a fresh node list while fn runs, then
+// restores the prior list and returns the captured block.
+func (l *Lowerer) captureBlock(fn func() error) (*IRBlock, error) {
+	saved := l.nodes
+	l.nodes = nil
+	err := fn()
+	block := &IRBlock{Nodes: l.nodes}
+	l.nodes = saved
+	return block, err
 }
 
 func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
@@ -5754,6 +5953,9 @@ func (l *Lowerer) returnFinish() error {
 	l.emit(&IRConst{Dst: l.returnFlag, Value: 1})
 	if l.tailCallFlag != 0 {
 		l.emit(&IRZero{Dst: l.tailCallFlag})
+	}
+	if l.gotoLabels != nil {
+		l.emit(&IRConst{Dst: l.gotoState, Value: byte(l.gotoExit)}) // #nosec G115
 	}
 	return nil
 }
@@ -6230,7 +6432,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	savedTailFlag := l.tailCallFlag
 
 	l.returnDst = retCells
-	if hasReturn(info.Body) {
+	if hasReturn(info.Body) || hasGoto(info.Body) {
 		l.returnFlag = l.allocCell()
 		l.emit(&IRZero{Dst: l.returnFlag})
 	} else {
@@ -6242,7 +6444,14 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	l.deferredCalls = nil
 
 	if info.IsTailRec {
+		if hasGoto(info.Body) {
+			return nil, fmt.Errorf("goto in tail-recursive function %s is not supported", info.Name)
+		}
 		if err := l.lowerTailRecFunc(info); err != nil {
+			return nil, err
+		}
+	} else if hasGoto(info.Body) {
+		if err := l.lowerGotoDispatch(info.Body.List); err != nil {
 			return nil, err
 		}
 	} else {

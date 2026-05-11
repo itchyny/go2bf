@@ -428,19 +428,13 @@ go2bf extensions:
 
 ## Limitations
 
-- No `int`, signed integer types, floating-point number
-  types, or complex number types.
 - No import statements.
-- No maps, interfaces, or channels.
-- Array nesting up to `[N][M][K]byte`, `[N][M]Point`,
-  or `[N][M]uintN`. `[N][M][K][L]byte`, `[N][M][K]Point`,
-  `[N][M][K]uintN` are not supported.
-- Zero-length arrays (`[0]T`) are rejected at compile time.
-- Slice nesting up to `[][]byte`, `[]Point`, `[]uintN`.
-  `[][][]byte`, `[][]Point`, `[][]uintN`, `[][N]uintN`
-  not supported.
-- No `select`, `go`, or `goto` statements.
-- No closures or function pointers.
+- No `int`, signed integer, floating-point number types.
+- No maps, interfaces, channels, closures, function pointers.
+- Array nesting up to `[N][M][K]byte`. `[N][M][K][L]byte`,
+  `[N][M][K]Point`, `[N][M][K]uintN` are not supported.
+- Slice nesting up to `[][]byte`. `[][][]byte`, `[][]Point`,
+  `[][]uintN`, `[][N]uintN` are not supported.
 - Recursive functions are scalar-only: parameters,
   return values, and locals must be `byte`, `uint16`,
   or `uint32`. Pointers, struct, array, slice, `uint64`,

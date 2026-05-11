@@ -944,6 +944,77 @@ func main() {
 }`,
 			"", "two\n3\n",
 		},
+		// --- Goto ---
+		{
+			"backward goto",
+			`package main
+func main() {
+	i := byte(0)
+loop:
+	if i < 5 {
+		print(i)
+		i++
+		goto loop
+	}
+}`,
+			"", "01234",
+		},
+		{
+			"forward goto",
+			`package main
+func main() {
+	x := byte(5)
+	if x > 3 {
+		goto big
+	}
+	print("S")
+big:
+	print("B")
+}`,
+			"", "B",
+		},
+		{
+			"goto cleanup pattern",
+			`package main
+func main() {
+	x := byte(0)
+	if x == 0 { goto cleanup }
+	print("A")
+cleanup:
+	print("C")
+}`,
+			"", "C",
+		},
+		{
+			"goto out of nested loops",
+			`package main
+func main() {
+	for i := byte(0); i < 5; i++ {
+		for j := byte(0); j < 5; j++ {
+			print(i, j)
+			if i == 1 && j == 2 { goto done }
+		}
+	}
+done:
+	print("!")
+}`,
+			"", "0001020304101112!",
+		},
+		{
+			"goto in non-main function",
+			`package main
+func count(n byte) byte {
+	x := byte(0)
+loop:
+	if x < n {
+		x++
+		goto loop
+	}
+	return x
+}
+func main() { print(count(7)) }`,
+			"", "7",
+		},
 		// --- Arithmetic operators ---
 		{
 			"addition",
@@ -10715,7 +10786,39 @@ myLabel:
 	return r
 }
 func main() { print(f(2)) }`,
-			"label myLabel on non-loop statement is not supported",
+			"label myLabel on non-loop statement is not supported in recursive functions",
+		},
+		{
+			"label nested inside block in non-recursive function",
+			`package main
+func main() {
+	x := byte(0)
+	if x == 0 {
+inner:
+		putchar(byte('A'))
+		_ = inner
+	}
+	goto inner
+}`,
+			"label inner must be at the function-body top level",
+		},
+		{
+			"goto undefined label",
+			`package main
+func main() { goto missing }`,
+			"goto target missing is not a top-level label of the enclosing function",
+		},
+		{
+			"goto in tail-recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+loop:
+	if n > 5 { n--; goto loop }
+	return f(n - 1)
+}
+func main() { print(f(3)) }`,
+			"goto in tail-recursive function f is not supported",
 		},
 		{
 			"defer of non-builtin in recursive function",

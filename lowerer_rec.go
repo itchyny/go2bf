@@ -1669,7 +1669,7 @@ func (rl *recLowerer) lowerLabeledStmt(s *ast.LabeledStmt) error {
 	switch s.Stmt.(type) {
 	case *ast.ForStmt, *ast.RangeStmt:
 	default:
-		return fmt.Errorf("label %s on non-loop statement is not supported", s.Label.Name)
+		return fmt.Errorf("label %s on non-loop statement is not supported in recursive functions", s.Label.Name)
 	}
 	saved := rl.pendingLabel
 	rl.pendingLabel = s.Label.Name

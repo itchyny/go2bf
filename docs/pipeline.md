@@ -43,6 +43,10 @@ Converts the AST into a structured IR (see [`ir.md`](ir.md)).
   (disabled when the function contains `defer`)
 - Lowers general recursive functions via phase dispatch
   (see [`recursion.md`](recursion.md))
+- Lowers functions that use `goto` via a state-machine dispatch
+  loop -- the body is split at each top-level label into segments
+  and a state cell selects which segment to run each iteration
+  (see [`lowering.md`](lowering.md))
 - Handles structs as contiguous cell ranges with compile-time field
   offsets (`p.x` becomes a direct cell access)
 - Handles arrays and pointers through unified `indexInto`/`writeInto`
