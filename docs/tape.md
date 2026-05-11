@@ -93,6 +93,13 @@ jumps across markers and stops only at a sentinel (value 0). Default
 layout has markers at 8 and 16; each bump adds a marker at the previous
 sentinel position (24, 32, 40, ...).
 
+The memory-init pass sets these cells to 1. For up to four markers it
+emits `>>>>>>>>+` per marker (unrolled). For five or more markers it
+uses a walking-counter loop -- the same technique `genFramePush` uses,
+just at stride 8 -- which has constant source size and leaves the
+cursor one cell before the forward sentinel, shortening the subsequent
+`moveToSentinel` to a single `>`.
+
 ### Phase temps (`phaseTempBase` through `sentinelFwd-1`, skipping markers)
 
 Reserved for recursive dispatch code (see [`recursion.md`](recursion.md)).

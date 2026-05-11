@@ -1926,6 +1926,20 @@ func (l *Lowerer) shapeOfCall(call *ast.CallExpr) (exprShape, bool) {
 			isPointer:   true,
 		}, true
 	}
+	// min/max return the widest argument type. Inferring this lets
+	// `m := min(a, b)` declare m as uintN when the args are uintN.
+	if (fn.Name == "min" || fn.Name == "max") && len(call.Args) > 0 {
+		width := 0
+		for _, arg := range call.Args {
+			sh := l.shapeOf(arg, l.currentScope())
+			if sh.intSize > width {
+				width = sh.intSize
+			}
+		}
+		if width >= 2 {
+			return exprShape{intSize: width}, true
+		}
+	}
 	return exprShape{}, false
 }
 
@@ -2459,34 +2473,16 @@ func (l *Lowerer) wrapNodesInGuard(mark int) {
 	l.freeCell(guard)
 }
 
+// tryLowerDivModAssign detects adjacent div/mod assignments
+// (`q := x/y; r := x%y` in either order) and fuses them into a single
+// IRDivMod, halving the cost of the divmod loop.
 func (l *Lowerer) tryLowerDivModAssign(a, b ast.Stmt) (bool, error) {
-	return l.tryLowerDivModAssignWith(a, b, l.lowerExpr,
-		func(id *ast.Ident, tok token.Token) (Cell, error) {
-			if base, ok := l.lookupIntCell(id.Name); ok {
-				return base, nil
-			}
-			return l.lookupOrDefineVar(id, tok)
-		},
-	)
-}
-
-// tryLowerDivModAssignWith detects adjacent div/mod assignments and fuses
-// them into a single IRDivMod. The lowerExpr and lookupDst callbacks allow
-// both regular and recursive lowerers to share this logic.
-func (l *Lowerer) tryLowerDivModAssignWith(
-	a, b ast.Stmt,
-	lowerExpr func(ast.Expr) (exprResult, error),
-	lookupDst func(*ast.Ident, token.Token) (Cell, error),
-) (bool, error) {
 	aAssign, aOk := a.(*ast.AssignStmt)
 	bAssign, bOk := b.(*ast.AssignStmt)
 	if !aOk || !bOk || len(aAssign.Lhs) != 1 || len(bAssign.Lhs) != 1 ||
 		len(aAssign.Rhs) != 1 || len(bAssign.Rhs) != 1 {
 		return false, nil
 	}
-	// Pre-allocate LHS cells; tryLowerDivModAssign bypasses lowerAssign.
-	l.declareFromAssign(aAssign)
-	l.declareFromAssign(bAssign)
 	aBin, aIsBin := aAssign.Rhs[0].(*ast.BinaryExpr)
 	bBin, bIsBin := bAssign.Rhs[0].(*ast.BinaryExpr)
 	if !aIsBin || !bIsBin {
@@ -2506,11 +2502,16 @@ func (l *Lowerer) tryLowerDivModAssignWith(
 	if !sameExpr(divBin.X, modBin.X) || !sameExpr(divBin.Y, modBin.Y) {
 		return false, nil
 	}
-	src1, err := lowerExpr(divBin.X)
+	// Allocate LHS cells; tryLowerDivModAssign bypasses lowerAssign.
+	// Done after the op checks so a non-matching pair doesn't leak
+	// LHS bindings into the scope.
+	l.declareFromAssign(aAssign)
+	l.declareFromAssign(bAssign)
+	src1, err := l.lowerExpr(divBin.X)
 	if err != nil {
 		return false, err
 	}
-	src2, err := lowerExpr(divBin.Y)
+	src2, err := l.lowerExpr(divBin.Y)
 	if err != nil {
 		return false, err
 	}
@@ -2522,6 +2523,12 @@ func (l *Lowerer) tryLowerDivModAssignWith(
 	modID, ok := modLHS.(*ast.Ident)
 	if !ok {
 		return false, nil
+	}
+	lookupDst := func(id *ast.Ident, tok token.Token) (Cell, error) {
+		if base, ok := l.lookupIntCell(id.Name); ok {
+			return base, nil
+		}
+		return l.lookupOrDefineVar(id, tok)
 	}
 	quotDst, err := lookupDst(divID, aAssign.Tok)
 	if err != nil {
@@ -5628,23 +5635,60 @@ func (l *Lowerer) lowerTailCall(call *ast.CallExpr) error {
 	info := l.result.Funcs[l.tailCallFunc]
 
 	// Recursive functions are scalar-only -- pointer/composite params
-	// are rejected at inlineCall, so all args here are byte. Evaluate
-	// each into a temp before the param-assignment phase to avoid
-	// overwriting source params when the same variable appears in both
-	// source and destination of the assignment.
-	cells := make([]Cell, len(call.Args))
+	// are rejected at inlineCall, so all args here are byte or uintN.
+	// uintN args occupy intSize contiguous cells and must be copied to
+	// a temp before the param-assignment phase to avoid overwriting
+	// source params (the same arg may reference another param being
+	// reassigned in the same call).
+	type argVal struct {
+		cell Cell
+		base Cell // non-zero for uintN args
+		size int  // >0 for multi-cell args
+	}
+	vals := make([]argVal, len(call.Args))
 	for i, arg := range call.Args {
+		var pt ParamInfo
+		if i < len(info.ParamTypes) {
+			pt = info.ParamTypes[i]
+		}
+		if pt.IntSize >= 2 {
+			r, err := l.lowerExpr(arg)
+			if err != nil {
+				return err
+			}
+			if r.intSize != pt.IntSize {
+				return fmt.Errorf(
+					"intSize mismatch in tail call to %s: arg %d got %d, want %d",
+					info.Name, i, r.intSize, pt.IntSize)
+			}
+			tmp := l.allocCells(pt.IntSize)
+			for j := range pt.IntSize {
+				l.emit(&IRCopy{Dst: tmp + j, Src: r.cell + j})
+			}
+			if r.temp {
+				l.freeCellRange(r.cell, pt.IntSize)
+			}
+			vals[i] = argVal{base: tmp, size: pt.IntSize}
+			continue
+		}
 		r, err := l.lowerExpr(arg)
 		if err != nil {
 			return err
 		}
-		cells[i] = l.ensureTemp(r).cell
+		vals[i] = argVal{cell: l.ensureTemp(r).cell}
 	}
 
 	// Move evaluated values to param cells.
 	for i, paramName := range info.Params {
-		paramCell, _ := l.lookupVar(paramName)
-		l.emit(&IRMove{Dst: paramCell, Src: cells[i]})
+		if vals[i].size > 0 {
+			b, _ := l.lookupBinding(paramName).(*intBinding)
+			for j := range vals[i].size {
+				l.emit(&IRMove{Dst: b.base + j, Src: vals[i].base + j})
+			}
+		} else {
+			paramCell, _ := l.lookupVar(paramName)
+			l.emit(&IRMove{Dst: paramCell, Src: vals[i].cell})
+		}
 	}
 
 	// Signal the tail-call loop to restart.
@@ -5938,12 +5982,13 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	if len(argExprs) != len(info.Params) {
 		return nil, fmt.Errorf("function %s expects %d arguments, got %d", info.Name, len(info.Params), len(argExprs))
 	}
+
 	if info.IsRecursive || info.IsTailRec {
 		// Recursive functions (both tail and general) are scalar-only.
 		for _, pt := range info.ParamTypes {
 			switch {
-			case pt.IntSize >= 2:
-				return nil, fmt.Errorf("multi-byte integer parameters are not supported in recursive function %s", info.Name)
+			case pt.IntSize >= 8:
+				return nil, fmt.Errorf("uint64 parameter %s in recursive function %s is not supported", pt.Name, info.Name)
 			case pt.IsPointer:
 				return nil, fmt.Errorf("pointer parameter %s in recursive function %s is not supported", pt.Name, info.Name)
 			case pt.StructType != "":
@@ -5956,8 +6001,8 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		}
 		for _, ri := range info.ReturnTypes {
 			switch {
-			case ri.IntSize >= 2:
-				return nil, fmt.Errorf("multi-byte integer return values are not supported in recursive function %s", info.Name)
+			case ri.IntSize >= 8:
+				return nil, fmt.Errorf("uint64 return type in recursive function %s is not supported", info.Name)
 			case ri.IsPointer:
 				return nil, fmt.Errorf("pointer return type in recursive function %s is not supported", info.Name)
 			case ri.StructType != "":
@@ -6148,22 +6193,9 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 		}
 	}
 
-	// Allocate return value cells.
-	// For composite return types (struct/array), allocate contiguous cells.
-	retSize := l.returnCellCount(info)
-	retCells := make([]Cell, retSize)
-	if retSize > 1 {
-		base := l.allocCells(retSize)
-		for i := range retCells {
-			retCells[i] = base + i
-			l.emit(&IRZero{Dst: retCells[i]})
-		}
-	} else {
-		for i := range retCells {
-			retCells[i] = l.allocCell()
-			l.emit(&IRZero{Dst: retCells[i]})
-		}
-	}
+	// Allocate return value cells. Multi-cell (struct/array/uintN) returns
+	// must be contiguous so downstream consumers can index `base+k`.
+	retCells := l.allocReturnCells(info)
 
 	// Register named return variables as aliases for the return cells.
 	if len(info.ReturnNames) > 0 {
@@ -6210,7 +6242,9 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	l.deferredCalls = nil
 
 	if info.IsTailRec {
-		l.lowerTailRecFunc(info)
+		if err := l.lowerTailRecFunc(info); err != nil {
+			return nil, err
+		}
 	} else {
 		if err := l.lowerStmts(info.Body.List); err != nil {
 			return nil, err
@@ -6234,8 +6268,30 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 	return retCells, nil
 }
 
+// allocReturnCells allocates `retSize` cells for a function's return values
+// and zeros each. Multi-cell returns are contiguous so downstream consumers
+// (e.g., emitPrintInt) can index `base+k`.
+func (l *Lowerer) allocReturnCells(info *FuncInfo) []Cell {
+	retSize := l.returnCellCount(info)
+	retCells := make([]Cell, retSize)
+	if retSize > 1 {
+		base := l.allocCells(retSize)
+		for i := range retCells {
+			retCells[i] = base + i
+		}
+	} else {
+		for i := range retCells {
+			retCells[i] = l.allocCell()
+		}
+	}
+	for _, c := range retCells {
+		l.emit(&IRZero{Dst: c})
+	}
+	return retCells
+}
+
 // lowerTailRecFunc lowers a tail-recursive function by converting to a loop.
-func (l *Lowerer) lowerTailRecFunc(info *FuncInfo) {
+func (l *Lowerer) lowerTailRecFunc(info *FuncInfo) error {
 	// Allocate a tail-call flag.
 	tcFlag := l.allocCell()
 	l.emit(&IRConst{Dst: tcFlag, Value: 1})
@@ -6248,7 +6304,7 @@ func (l *Lowerer) lowerTailRecFunc(info *FuncInfo) {
 	saved := l.nodes
 	l.nodes = nil
 	l.emit(&IRZero{Dst: l.returnFlag}) // reset return flag each iteration
-	_ = l.lowerStmts(info.Body.List)
+	err := l.lowerStmts(info.Body.List)
 	body := &IRBlock{Nodes: l.nodes}
 	l.nodes = saved
 
@@ -6257,6 +6313,7 @@ func (l *Lowerer) lowerTailRecFunc(info *FuncInfo) {
 	l.tailCallFunc = ""
 	l.tailCallFlag = 0
 	l.freeCell(tcFlag)
+	return err
 }
 
 // Expression lowering.

@@ -5,49 +5,56 @@ import (
 	"go/ast"
 	"go/token"
 	"maps"
-	"strconv"
 )
 
 // === General recursion via stack-based CPU model ===
 //
 // Frame layout (slot indices):
 //   0: phase (dispatch phase number)
-//   1: retval (return value, also receives child's return value)
-//   2..2+P-1: parameters
-//   2+P..2+P+L-1: local variables
+//   1: retval (single-byte return; uintN returns flow through retReg)
+//   2..2+P-1: parameters (one cell each; recursive params are scalar-only)
+//   2+P..end: local variables (one cell for byte, intSize cells for uintN)
 //
 // The function body is split into "phases" at each recursive call site.
 // A dispatch loop processes one phase per iteration, always operating on
 // the topmost stack frame.
+//
+// Pointer, composite (struct, array, slice), and uint64 params/returns
+// are rejected upfront -- the rec lowerer has no dereference path or
+// composite layout. See `inlineCall` (lowerer.go) and `rejectComposites`
+// / `collectIntLocals` (lowerer_rec.go) for the entry-point checks.
 
 // recLocalInfo holds slot index plus per-local type metadata for a variable
-// in a recursive function frame. A single map[name]recLocalInfo replaces
-// what used to be parallel slot/type maps, mirroring the analyzer's
-// StructDef.Field map[string]FieldInfo pattern.
+// in a recursive function frame. Recursive functions are scalar-only, so
+// the only metadata beyond `slot` is the multi-byte integer width.
 type recLocalInfo struct {
-	slot int
+	slot    int
+	intSize int // 0 for byte; 2/4 for uint16/uint32
 }
 
-// recContext holds state for lowering a recursive function.
+// recContext holds state for lowering a recursive function. Recursive
+// functions are scalar-only: all params and locals occupy one frame
+// slot each (or `intSize` cells for `uint16`/`uint32` locals and
+// returns). Pointer, struct, array, slice, and `uint64` types are
+// rejected upfront, so this struct does not track that metadata.
 type recContext struct {
 	funcName    string
 	frameSize   int
-	slotPhase   int // always 0
-	slotRet     int // always 1
-	paramBase   int // always 2
-	localBase   int
-	locals      map[string]recLocalInfo // name -> slot + type metadata (incl. synthetic temps)
-	phases      []*IRBlock
-	activeReg   Cell     // register cell for dispatch loop control
-	retReg      Cell     // base register cell for passing return values
-	retSize     int      // number of return cells (1 for byte, N for struct/array)
-	noRetFlag   Cell     // phase temp: 1 if no return happened in this phase, 0 after return
-	returnNames []string // named return value names (empty if unnamed)
+	slotPhase   int                     // always 0 (dispatch phase number)
+	slotRet     int                     // always 1 (single-byte return slot; multi-byte uintN returns flow through retReg)
+	paramBase   int                     // always 2 (params start here, one cell each)
+	localBase   int                     // 2 + len(params); locals and synthetic temps start here
+	locals      map[string]recLocalInfo // name -> slot + intSize (also covers params, named returns, and synthetic temps like $cond/$switch)
+	phases      []*IRBlock              // dispatch phases produced by buildPhases
+	activeReg   Cell                    // phase-temp cell holding the recursion depth counter
+	retReg      Cell                    // phase-temp cell at retReg..retReg+retSize-1 carrying child return values
+	retSize     int                     // number of return cells (1 for byte, 2 or 4 for uint16/uint32)
+	noRetFlag   Cell                    // phase temp: 1 if no return happened in this phase, 0 after return
+	returnNames []string                // named return value names (empty if unnamed)
 
-	deferCaptureSlots []int // pre-allocated frame slots for defer captures
-	deferCaptureIdx   int   // index into deferCaptureSlots during lowering
-	// Deferred calls: IR blocks to emit before each return's frame pop.
-	deferredCalls []*IRBlock
+	deferCaptureSlots []int      // pre-allocated frame slots for defer captures
+	deferCaptureIdx   int        // index into deferCaptureSlots during lowering
+	deferredCalls     []*IRBlock // IR blocks emitted before each return's frame pop
 }
 
 func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error) {
@@ -62,9 +69,18 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		locals:    make(map[string]recLocalInfo),
 	}
 	paramSlot := rc.paramBase
-	for _, name := range info.Params {
-		rc.locals[name] = recLocalInfo{slot: paramSlot}
-		paramSlot += 1
+	for i, name := range info.Params {
+		// Params are scalars: byte (1 cell) or uint16/uint32 (intSize
+		// cells). Pointer/composite/uint64/slice params are rejected at
+		// inlineCall before reaching here.
+		size, intSize := 1, 0
+		if i < len(info.ParamTypes) {
+			if n := info.ParamTypes[i].IntSize; n >= 2 {
+				size, intSize = n, n
+			}
+		}
+		rc.locals[name] = recLocalInfo{slot: paramSlot, intSize: intSize}
+		paramSlot += size
 	}
 	rc.localBase = paramSlot
 	for i, name := range localNames {
@@ -72,28 +88,47 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	}
 	rc.frameSize = rc.localBase + len(localNames)
 
-	// Named return values are mapped to frame slots like locals.
+	// Named return values are mapped to frame slots like locals. For
+	// uintN named returns, allocate intSize cells so reads/writes through
+	// the returned name span the full multi-byte value.
 	rc.returnNames = info.ReturnNames
-	for _, name := range info.ReturnNames {
-		if _, exists := rc.locals[name]; !exists {
-			rc.locals[name] = recLocalInfo{slot: rc.frameSize}
-			rc.frameSize++
+	for i, name := range info.ReturnNames {
+		if _, exists := rc.locals[name]; exists {
+			continue
 		}
+		intSize := 0
+		if i < len(info.ReturnTypes) {
+			if n := info.ReturnTypes[i].IntSize; n >= 2 {
+				intSize = n
+			}
+		}
+		rc.locals[name] = recLocalInfo{slot: rc.frameSize, intSize: intSize}
+		rc.frameSize += max(intSize, 1)
 	}
 
 	if err := l.rejectComposites(info.Body); err != nil {
+		return nil, err
+	}
+	if err := l.collectIntLocals(rc, info.Body); err != nil {
 		return nil, err
 	}
 
 	// Allocate active and retval in the PHASE TEMP area (direct tape positions,
 	// not stack slots). This avoids cache/storeToStack issues in the dispatch loop.
 	// Reserve positions 25, 26 for these; phase code allocs start at 27.
-	rc.retSize = info.Returns
+	// uintN returns are the only multi-cell case; struct/array returns are
+	// rejected before reaching this point.
+	retSize := info.Returns
+	if ri := info.SingleReturn(); ri.IntSize >= 2 {
+		retSize = ri.IntSize
+	}
+	rc.retSize = retSize
 
 	rc.activeReg = phaseTempBase  // tape position 25
 	rc.retReg = phaseTempBase + 1 // tape position 26 (base of return area)
 
-	// Evaluate arguments.
+	// Evaluate arguments. Byte args produce 1 cell;
+	// uint16/uint32 args produce intSize contiguous cells.
 	type argCells struct {
 		cells []Cell
 		temps bool
@@ -104,7 +139,15 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		if err != nil {
 			return nil, err
 		}
-		args[i] = argCells{[]Cell{r.cell}, r.temp}
+		if r.intSize >= 2 {
+			cells := make([]Cell, r.intSize)
+			for j := range r.intSize {
+				cells[j] = r.cell + j
+			}
+			args[i] = argCells{cells, r.temp}
+		} else {
+			args[i] = argCells{[]Cell{r.cell}, r.temp}
+		}
 	}
 
 	// Pre-allocate frame slots for defer captures. This must happen before
@@ -125,7 +168,7 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	})
 
 	// Build phases first - this may grow rc.frameSize (e.g. extractRecCalls
-	// adds temp variables for inlined recursive expressions).
+	// adds temp variables for inlined recursive functions).
 	if err := l.buildPhases(rc, info); err != nil {
 		return nil, err
 	}
@@ -164,10 +207,21 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	})
 
 	// After dispatch loop exits, retReg area holds the return value(s).
+	// Multi-byte returns must land in contiguous cells since callers
+	// (e.g., emitPrintInt, emitCopyOrMove for uintN destinations)
+	// access them as base+k.
 	retCells := make([]Cell, rc.retSize)
-	for j := range rc.retSize {
-		retCells[j] = l.allocCell()
-		l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg + j})
+	if rc.retSize > 1 {
+		base := l.allocCells(rc.retSize)
+		for j := range rc.retSize {
+			retCells[j] = base + j
+			l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg + j})
+		}
+	} else {
+		for j := range rc.retSize {
+			retCells[j] = l.allocCell()
+			l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg + j})
+		}
 	}
 
 	// activeReg and retReg are phase temp positions, no need to free.
@@ -221,6 +275,95 @@ func (l *Lowerer) rejectComposites(body *ast.BlockStmt) error {
 	return err
 }
 
+// collectIntLocals scans the body for uintN variable declarations
+// (`var x uint16`, `x := uint16(...)`, `b := a` where a is uintN, etc.)
+// and reallocates their frame slots to hold IntSize cells. Returns an
+// error when a `uint64` local is found: the eight-cell layout would
+// span the highway marker at position 32 once `sentinelFwd` is bumped,
+// the same constraint that blocks `uint64` returns.
+func (l *Lowerer) collectIntLocals(rc *recContext, body *ast.BlockStmt) error {
+	seen := make(map[string]bool)
+	var firstErr error
+	register := func(name string, intSize int) {
+		if seen[name] || intSize < 2 {
+			return
+		}
+		if intSize >= 8 && firstErr == nil {
+			firstErr = fmt.Errorf("uint64 local %s in recursive function is not supported", name)
+			return
+		}
+		seen[name] = true
+		rc.locals[name] = recLocalInfo{slot: rc.frameSize, intSize: intSize}
+		rc.frameSize += intSize
+	}
+	intSizeOf := func(typ ast.Expr) int {
+		if id, ok := typ.(*ast.Ident); ok {
+			return intIdentSize(id.Name)
+		}
+		return 0
+	}
+	// inferExprIntSize walks an expression tree to determine its uintN
+	// width: uintN(...) conversion is N; a uintN local lookup returns
+	// its size; a call to a uintN-returning function picks up the
+	// callee's return width; binary op of two uintN operands inherits
+	// the width.
+	var inferExprIntSize func(e ast.Expr) int
+	inferExprIntSize = func(e ast.Expr) int {
+		switch x := e.(type) {
+		case *ast.ParenExpr:
+			return inferExprIntSize(x.X)
+		case *ast.CallExpr:
+			if fn, ok := x.Fun.(*ast.Ident); ok {
+				if size := intIdentSize(fn.Name); size >= 2 {
+					return size
+				}
+				if info, ok := l.result.Funcs[fn.Name]; ok {
+					if n := info.SingleReturn().IntSize; n >= 2 {
+						return n
+					}
+				}
+			}
+		case *ast.Ident:
+			if src, ok := rc.locals[x.Name]; ok && src.intSize >= 2 {
+				return src.intSize
+			}
+		case *ast.BinaryExpr:
+			if l := inferExprIntSize(x.X); l >= 2 {
+				return l
+			}
+			return inferExprIntSize(x.Y)
+		}
+		return 0
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		if firstErr != nil {
+			return false
+		}
+		if decl, ok := n.(*ast.DeclStmt); ok {
+			if gd, ok := decl.Decl.(*ast.GenDecl); ok {
+				for _, spec := range gd.Specs {
+					if vs, ok := spec.(*ast.ValueSpec); ok {
+						if size := intSizeOf(vs.Type); size >= 2 {
+							for _, name := range vs.Names {
+								register(name.Name, size)
+							}
+						}
+					}
+				}
+			}
+		}
+		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
+			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
+				if size := inferExprIntSize(assign.Rhs[0]); size >= 2 {
+					register(id.Name, size)
+				}
+			}
+		}
+		return true
+	})
+	return firstErr
+}
+
 // collectLocals finds all := variable names in the function body that aren't parameters.
 func collectLocals(body *ast.BlockStmt, params []string) []string {
 	paramSet := make(map[string]bool)
@@ -247,9 +390,11 @@ func collectLocals(body *ast.BlockStmt, params []string) []string {
 				locals = append(locals, "$switch")
 			}
 		}
-		// Var declarations.
+		// Var declarations. Const declarations are skipped: they're
+		// inlined at use sites via constBinding/intConstBinding in the
+		// scope, not stored in a frame slot.
 		if decl, ok := n.(*ast.DeclStmt); ok {
-			if gd, ok := decl.Decl.(*ast.GenDecl); ok {
+			if gd, ok := decl.Decl.(*ast.GenDecl); ok && gd.Tok != token.CONST {
 				for _, spec := range gd.Specs {
 					if vs, ok := spec.(*ast.ValueSpec); ok {
 						for _, name := range vs.Names {
@@ -377,7 +522,11 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 	// Phase 0 = preStmts of callSite 0 (if any), otherwise the whole body.
 	// Phase K (for K>0) = continuation after callSite K-1.
 
+	// For multi-cell uintN returns, result variables need N contiguous frame
+	// slots. Re-allocate them at the end of the frame, overriding the single-
+	// slot allocation from collectLocals.
 	if rc.retSize > 1 {
+		retIntSize := info.SingleReturn().IntSize
 		allocated := make(map[string]bool)
 		for _, cs := range callSites {
 			info := rc.locals[cs.resultVar]
@@ -386,6 +535,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 				rc.frameSize += rc.retSize
 				allocated[cs.resultVar] = true
 			}
+			info.intSize = retIntSize
 			rc.locals[cs.resultVar] = info
 		}
 	}
@@ -845,18 +995,30 @@ func extractRecCalls(expr ast.Expr, rc *recContext) ([]extractedCall, ast.Expr) 
 	return extracted, result
 }
 
-// buildRecPhase builds an IR block for a phase that ends with a return (pop frame).
-func (l *Lowerer) buildRecPhase(rc *recContext, stmts []ast.Stmt) (*IRBlock, error) {
-	// Isolate: save parent state, redirect allocation to phase temp range.
+// enterPhase saves the parent emission state and redirects allocation to
+// the phase-temp range. The returned function restores the saved state;
+// callers should `defer` it.
+func (l *Lowerer) enterPhase(rc *recContext) func() {
 	savedNodes := l.nodes
 	savedNext := l.nextCell
 	savedFree := l.freeCells
 	l.nodes = nil
-	// Phase code uses cells starting at phaseTempBase+2 (27).
+	// Phase code uses cells starting just past activeReg + retReg.
 	l.nextCell = phaseTempBase + 1 + rc.retSize
 	l.freeCells = nil
 	l.recFrameSize = rc.frameSize
 	l.recAllocErr = nil
+	return func() {
+		l.nodes = savedNodes
+		l.nextCell = savedNext
+		l.freeCells = savedFree
+		l.recFrameSize = 0
+	}
+}
+
+// buildRecPhase builds an IR block for a phase that ends with a return (pop frame).
+func (l *Lowerer) buildRecPhase(rc *recContext, stmts []ast.Stmt) (*IRBlock, error) {
+	defer l.enterPhase(rc)()
 
 	// Allocate noRetFlag so lowerStmts can guard statements after a return.
 	rc.noRetFlag = l.allocCell()
@@ -869,26 +1031,12 @@ func (l *Lowerer) buildRecPhase(rc *recContext, stmts []ast.Stmt) (*IRBlock, err
 	if l.recAllocErr != nil {
 		return nil, l.recAllocErr
 	}
-	result := &IRBlock{Nodes: l.nodes}
-	l.recFrameSize = 0
-
-	l.nodes = savedNodes
-	l.nextCell = savedNext
-	l.freeCells = savedFree
-	return result, nil
+	return &IRBlock{Nodes: l.nodes}, nil
 }
 
 // buildRecPhaseWithCall builds a phase that ends by pushing a child frame.
 func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call recCallSite, nextPhase int) (*IRBlock, error) {
-	// Isolate: save parent state, redirect allocation to phase temp range.
-	savedNodes := l.nodes
-	savedNext := l.nextCell
-	savedFree := l.freeCells
-	l.nodes = nil
-	l.nextCell = phaseTempBase + 1 + rc.retSize // skip activeReg and retReg
-	l.freeCells = nil
-	l.recFrameSize = rc.frameSize
-	l.recAllocErr = nil
+	defer l.enterPhase(rc)()
 
 	// Allocate a "did not return" flag. Set to 1 at phase start.
 	// lowerReturn clears it. The call setup checks it instead of activeReg.
@@ -910,22 +1058,36 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 	// Build call setup code on a fresh list.
 	l.nodes = nil
 
-	// Evaluate call arguments. Pointer/struct/array params
+	// Evaluate call arguments. Byte args produce 1 cell; uint16/uint32
+	// args produce intSize contiguous cells. Pointer/struct/array params
 	// are rejected at inlineCall.
 	type argValue struct {
 		cells []Cell
 	}
+	info := rl.result.Funcs[rc.funcName]
 	argVals := make([]argValue, len(call.argExprs))
 	for i, expr := range call.argExprs {
 		r, err := rl.lowerExpr(expr)
 		if err != nil {
 			return nil, err
 		}
-		argVals[i] = argValue{[]Cell{r.cell}}
+		intSize := 0
+		if i < len(info.ParamTypes) {
+			intSize = info.ParamTypes[i].IntSize
+		}
+		if intSize >= 2 {
+			cells := make([]Cell, intSize)
+			for j := range intSize {
+				cells[j] = r.cell + j
+			}
+			argVals[i] = argValue{cells}
+		} else {
+			argVals[i] = argValue{[]Cell{r.cell}}
+		}
 	}
 
 	// Store all modified locals back to the frame before pushing child.
-	rl.storeAllLocals(rc)
+	rl.storeAllLocals()
 
 	// Set continuation phase in current frame.
 	phaseConst := l.allocCell()
@@ -976,7 +1138,7 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 		// Use savedLoadedMap to avoid storing variables loaded during arg evaluation.
 		l.nodes = nil
 		skipRL := &recLowerer{Lowerer: l, rc: rc, loadedMap: maps.Clone(savedLoadedMap)}
-		skipRL.storeAllLocals(rc)
+		skipRL.storeAllLocals()
 		skipPhaseConst := l.allocCell()
 		l.emit(&IRConst{Dst: skipPhaseConst, Value: byte(nextPhase)}) // #nosec G115
 		l.emit(&IRStoreFrame{Slot: rc.slotPhase, Src: skipPhaseConst, FrameSize: rc.frameSize})
@@ -1002,11 +1164,6 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 			Then: &IRBlock{Nodes: callNodes},
 		})
 	}
-
-	l.nodes = savedNodes
-	l.nextCell = savedNext
-	l.freeCells = savedFree
-	l.recFrameSize = 0
 	return &IRBlock{Nodes: allNodes}, nil
 }
 
@@ -1026,7 +1183,9 @@ func (l *Lowerer) newRecLowerer(rc *recContext) *recLowerer {
 	}
 }
 
-// lookupVar overrides the default to load from the frame.
+// lookupVar overrides the default to load from the frame. For uintN
+// locals, allocates intSize contiguous cells and loads each from the
+// frame; loadedMap caches the base cell.
 func (rl *recLowerer) lookupVar(name string) (Cell, error) {
 	if name == "_" {
 		return rl.allocCell(), nil
@@ -1039,24 +1198,69 @@ func (rl *recLowerer) lookupVar(name string) (Cell, error) {
 	if reg, ok := rl.loadedMap[slot]; ok {
 		return reg, nil
 	}
+	if info.intSize >= 2 {
+		base := rl.allocCells(info.intSize)
+		rl.loadFrame(base, slot, info.intSize)
+		rl.loadedMap[slot] = base
+		return base, nil
+	}
 	reg := rl.allocCell()
-	rl.emit(&IRLoadFrame{Dst: reg, Slot: slot, FrameSize: rl.rc.frameSize})
+	rl.loadFrame(reg, slot, 1)
 	rl.loadedMap[slot] = reg
 	return reg, nil
 }
 
+// slotSize returns the cell count for a frame slot. Most slots are 1
+// cell; uint16/uint32 locals occupy intSize contiguous cells.
+func (rl *recLowerer) slotSize(slot int) int {
+	for _, info := range rl.rc.locals {
+		if info.slot == slot && info.intSize >= 2 {
+			return info.intSize
+		}
+	}
+	return 1
+}
+
+// captureBlock redirects emit to a fresh node list while fn runs, then
+// restores the prior list and returns the captured block. Emission is
+// restored even when fn errors.
+func (rl *recLowerer) captureBlock(fn func() error) (*IRBlock, error) {
+	saved := rl.nodes
+	rl.nodes = nil
+	err := fn()
+	block := &IRBlock{Nodes: rl.nodes}
+	rl.nodes = saved
+	return block, err
+}
+
+// loadFrame emits n IRLoadFrame nodes copying frame slots [slot, slot+n)
+// into cells [dst, dst+n).
+func (rl *recLowerer) loadFrame(dst Cell, slot, n int) {
+	for j := range n {
+		rl.emit(&IRLoadFrame{Dst: dst + j, Slot: slot + j, FrameSize: rl.rc.frameSize})
+	}
+}
+
+// storeFrame emits n IRStoreFrame nodes copying cells [src, src+n) into
+// frame slots [slot, slot+n).
+func (rl *recLowerer) storeFrame(slot int, src Cell, n int) {
+	for j := range n {
+		rl.emit(&IRStoreFrame{Slot: slot + j, Src: src + j, FrameSize: rl.rc.frameSize})
+	}
+}
+
 // reloadAllLocals re-reads all cached locals from the frame into their
 // existing phase temp cells.
-func (rl *recLowerer) reloadAllLocals(rc *recContext) {
+func (rl *recLowerer) reloadAllLocals() {
 	for slot, reg := range rl.loadedMap {
-		rl.emit(&IRLoadFrame{Dst: reg, Slot: slot, FrameSize: rc.frameSize})
+		rl.loadFrame(reg, slot, rl.slotSize(slot))
 	}
 }
 
 // storeAllLocals writes all loaded (and potentially modified) locals back to the frame.
-func (rl *recLowerer) storeAllLocals(rc *recContext) {
+func (rl *recLowerer) storeAllLocals() {
 	for slot, reg := range rl.loadedMap {
-		rl.emit(&IRStoreFrame{Slot: slot, Src: reg, FrameSize: rc.frameSize})
+		rl.storeFrame(slot, reg, rl.slotSize(slot))
 	}
 }
 
@@ -1064,59 +1268,23 @@ func (rl *recLowerer) storeAllLocals(rc *recContext) {
 // Each statement is guarded by noRetFlag so that statements after a return
 // inside an if-without-else are skipped.
 func (rl *recLowerer) lowerStmts(stmts []ast.Stmt) error {
-	for i := 0; i < len(stmts); i++ {
-		// Fuse adjacent div/mod assignments: q := x/y; r := x%y -> IRDivMod.
-		if i+1 < len(stmts) {
-			if i == 0 {
-				if fused, err := rl.tryLowerDivModAssign(stmts[i], stmts[i+1]); err != nil {
-					return err
-				} else if fused {
-					i++
-					continue
-				}
-			} else {
-				saved := rl.nodes
-				rl.nodes = nil
-				if fused, err := rl.tryLowerDivModAssign(stmts[i], stmts[i+1]); err != nil {
-					return err
-				} else if fused {
-					body := &IRBlock{Nodes: rl.nodes}
-					rl.nodes = saved
-					rl.emit(&IRIf{Cond: rl.rc.noRetFlag, Then: body, Else: &IRBlock{}})
-					i++
-					continue
-				}
-				// Not fused: restore and fall through to normal handling.
-				rl.nodes = saved
-			}
-		}
+	for i, stmt := range stmts {
 		if i == 0 {
 			// First statement: noRetFlag is always 1, no guard needed.
-			if err := rl.lowerStmt(stmts[i]); err != nil {
+			if err := rl.lowerStmt(stmt); err != nil {
 				return err
 			}
 			continue
 		}
 		// Wrap in IRIf with empty else to skip if a prior return happened.
 		// The else block must be non-nil so emitIfElse is used (preserves noRetFlag).
-		saved := rl.nodes
-		rl.nodes = nil
-		if err := rl.lowerStmt(stmts[i]); err != nil {
+		body, err := rl.captureBlock(func() error { return rl.lowerStmt(stmt) })
+		if err != nil {
 			return err
 		}
-		body := &IRBlock{Nodes: rl.nodes}
-		rl.nodes = saved
 		rl.emit(&IRIf{Cond: rl.rc.noRetFlag, Then: body, Else: &IRBlock{}})
 	}
 	return nil
-}
-
-func (rl *recLowerer) tryLowerDivModAssign(a, b ast.Stmt) (bool, error) {
-	return rl.tryLowerDivModAssignWith(a, b, rl.lowerExpr,
-		func(id *ast.Ident, _ token.Token) (Cell, error) {
-			return rl.lookupVar(id.Name)
-		},
-	)
 }
 
 func (rl *recLowerer) lowerStmt(stmt ast.Stmt) error {
@@ -1198,20 +1366,50 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 		results[i] = r
 	}
 	rl.pushScope()
+	defer rl.popScope()
 	sc := rl.currentScope()
 	for j, name := range info.Params {
+		intSize := 0
+		if j < len(info.ParamTypes) {
+			intSize = info.ParamTypes[j].IntSize
+		}
+		if intSize >= 2 {
+			base := rl.allocCells(intSize)
+			for k := range intSize {
+				rl.emit(&IRCopy{Dst: base + k, Src: results[j].cell + k})
+			}
+			sc[name] = &intBinding{base: base, size: intSize}
+			continue
+		}
 		cell := rl.allocCell()
 		rl.emit(&IRCopy{Dst: cell, Src: results[j].cell})
 		sc.defineByte(name, cell)
 	}
-	retCells := make([]Cell, info.Returns)
-	for j := range retCells {
-		retCells[j] = rl.allocCell()
-		rl.emit(&IRZero{Dst: retCells[j]})
+	retCells := rl.allocReturnCells(info)
+	err := rl.runInlinedFunc(info, retCells, func() error {
+		return rl.Lowerer.lowerStmts(info.Body.List)
+	})
+	if err != nil {
+		return nil, err
 	}
+	return retCells, nil
+}
+
+// runInlinedFunc swaps in the inline-call return context (returnDst,
+// returnFlag, inFunc), invokes body, and restores. body typically lowers
+// the inlined function's statements.
+func (rl *recLowerer) runInlinedFunc(info *FuncInfo, retCells []Cell, body func() error) error {
 	savedRetDst := rl.returnDst
 	savedRetFlag := rl.returnFlag
 	savedInFunc := rl.inFunc
+	defer func() {
+		if rl.returnFlag != 0 {
+			rl.freeCell(rl.returnFlag)
+		}
+		rl.returnDst = savedRetDst
+		rl.returnFlag = savedRetFlag
+		rl.inFunc = savedInFunc
+	}()
 	rl.returnDst = retCells
 	if hasReturn(info.Body) {
 		rl.returnFlag = rl.allocCell()
@@ -1220,24 +1418,16 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 		rl.returnFlag = 0
 	}
 	rl.inFunc = true
-	err := rl.Lowerer.lowerStmts(info.Body.List)
-	if rl.returnFlag != 0 {
-		rl.freeCell(rl.returnFlag)
-	}
-	rl.returnDst = savedRetDst
-	rl.returnFlag = savedRetFlag
-	rl.inFunc = savedInFunc
-	rl.popScope()
-	if err != nil {
-		return nil, err
-	}
-	return retCells, nil
+	return body()
 }
 
 func (rl *recLowerer) lowerDecl(s *ast.DeclStmt) error {
 	gd, ok := s.Decl.(*ast.GenDecl)
 	if !ok {
 		return fmt.Errorf("unsupported declaration in recursive function")
+	}
+	if gd.Tok == token.CONST {
+		return rl.lowerLocalConsts(gd)
 	}
 	for _, spec := range gd.Specs {
 		vs, ok := spec.(*ast.ValueSpec)
@@ -1256,7 +1446,10 @@ func (rl *recLowerer) lowerDecl(s *ast.DeclStmt) error {
 				}
 				rl.emitCopyOrMove(cell, r)
 			} else {
-				rl.emit(&IRZero{Dst: cell})
+				size := max(rl.rc.locals[name.Name].intSize, 1)
+				for j := range size {
+					rl.emit(&IRZero{Dst: cell + j})
+				}
 			}
 		}
 	}
@@ -1276,24 +1469,25 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 	// Multi-return: q, r := divmod(a, b)
 	if len(s.Lhs) > 1 && len(s.Rhs) == 1 {
 		if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
-			funcName, _ := rl.resolveCall(call)
-			if info, ok := rl.result.Funcs[funcName]; ok && info.Returns == len(s.Lhs) && !info.IsRecursive {
-				retCells, err := rl.inlineCallInRec(info, call.Args)
-				if err != nil {
-					return err
-				}
-				for i, lhs := range s.Lhs {
-					id, ok := lhs.(*ast.Ident)
-					if !ok {
-						return fmt.Errorf("unsupported multi-return target in recursive function")
-					}
-					cell, err := rl.lookupVar(id.Name)
+			if fn, ok := call.Fun.(*ast.Ident); ok {
+				if info, ok := rl.result.Funcs[fn.Name]; ok && info.Returns == len(s.Lhs) && !info.IsRecursive {
+					retCells, err := rl.inlineCallInRec(info, call.Args)
 					if err != nil {
 						return err
 					}
-					rl.emit(&IRMove{Dst: cell, Src: retCells[i]})
+					for i, lhs := range s.Lhs {
+						id, ok := lhs.(*ast.Ident)
+						if !ok {
+							return fmt.Errorf("unsupported multi-return target in recursive function")
+						}
+						cell, err := rl.lookupVar(id.Name)
+						if err != nil {
+							return err
+						}
+						rl.emit(&IRMove{Dst: cell, Src: retCells[i]})
+					}
+					return nil
 				}
-				return nil
 			}
 		}
 	}
@@ -1360,6 +1554,14 @@ func (rl *recLowerer) lowerIncDec(s *ast.IncDecStmt) error {
 	if err != nil {
 		return err
 	}
+	if li := rl.rc.locals[id.Name]; li.intSize >= 2 {
+		if s.Tok == token.INC {
+			rl.emitIncInt(cell, li.intSize)
+		} else {
+			rl.emitDecInt(cell, li.intSize)
+		}
+		return nil
+	}
 	if s.Tok == token.INC {
 		rl.emit(&IRAddI{Dst: cell, Value: 1})
 	} else {
@@ -1381,32 +1583,53 @@ func (rl *recLowerer) lowerIf(s *ast.IfStmt) error {
 	// Save loadedMap before branches. Variables loaded inside one branch
 	// may not be loaded at runtime when that branch is not taken, so the
 	// else-branch must not reuse cells loaded only in the then-branch.
+	// At the end of each branch that does NOT end in return, call
+	// storeAllLocals to push cached-cell modifications back to the frame --
+	// otherwise an `if cond { x = ... }` updates only a cached cell and
+	// the modification is lost when the cache entry is dropped on branch
+	// exit. Returns already pop the frame, so no store-back is needed (or
+	// safe -- the frame is gone).
 	savedLoadedMap := maps.Clone(rl.loadedMap)
 
-	saved := rl.nodes
-	rl.nodes = nil
-	if err := rl.lowerStmts(s.Body.List); err != nil {
+	thenBlock, err := rl.captureBlock(func() error {
+		if err := rl.lowerStmts(s.Body.List); err != nil {
+			return err
+		}
+		if !endsWithReturn(s.Body.List) {
+			rl.storeAllLocals()
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	thenBlock := &IRBlock{Nodes: rl.nodes}
 
 	var elseBlock *IRBlock
 	if s.Else != nil {
 		rl.loadedMap = maps.Clone(savedLoadedMap)
-		rl.nodes = nil
-		switch e := s.Else.(type) {
-		case *ast.BlockStmt:
-			if err := rl.lowerStmts(e.List); err != nil {
-				return err
+		elseBlock, err = rl.captureBlock(func() error {
+			var stmts []ast.Stmt
+			switch e := s.Else.(type) {
+			case *ast.BlockStmt:
+				if err := rl.lowerStmts(e.List); err != nil {
+					return err
+				}
+				stmts = e.List
+			case *ast.IfStmt:
+				if err := rl.lowerIf(e); err != nil {
+					return err
+				}
+				stmts = []ast.Stmt{e}
 			}
-		case *ast.IfStmt:
-			if err := rl.lowerIf(e); err != nil {
-				return err
+			if !endsWithReturn(stmts) {
+				rl.storeAllLocals()
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		elseBlock = &IRBlock{Nodes: rl.nodes}
 	}
-	rl.nodes = saved
 	rl.loadedMap = savedLoadedMap
 
 	rl.emit(&IRIf{Cond: cond.cell, Then: thenBlock, Else: elseBlock})
@@ -1478,41 +1701,42 @@ func (rl *recLowerer) lowerFor(s *ast.ForStmt) error {
 	rl.loopFrames = append(rl.loopFrames, loopFrame{
 		label: label, skipFlag: rl.loopSkipFlag, breakFlag: rl.loopBreakFlag,
 	})
-	saved := rl.nodes
-	rl.nodes = nil
-	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
-	rl.emit(&IRZero{Dst: rl.loopBreakFlag})
-	if err := rl.lowerLoopBody(s.Body.List); err != nil {
+	body, err := rl.captureBlock(func() error {
+		rl.emit(&IRZero{Dst: rl.loopSkipFlag})
+		rl.emit(&IRZero{Dst: rl.loopBreakFlag})
+		if err := rl.lowerLoopBody(s.Body.List); err != nil {
+			return err
+		}
+		rl.emit(&IRZero{Dst: rl.loopSkipFlag})
+		// If break: clear condCell to exit loop. If not: run post + recalc cond.
+		breakGuard := rl.allocCell()
+		rl.emit(&IRNot{Dst: breakGuard, Src: rl.loopBreakFlag})
+		postCondBlock, err := rl.captureBlock(func() error {
+			if s.Post != nil {
+				if err := rl.lowerStmt(s.Post); err != nil {
+					return err
+				}
+			}
+			if s.Cond != nil {
+				return rl.emitCondTo(condCell, s.Cond)
+			}
+			rl.emit(&IRConst{Dst: condCell, Value: 1})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		rl.emit(&IRIf{
+			Cond: breakGuard,
+			Then: postCondBlock,
+			Else: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
+		})
+		rl.freeCell(breakGuard)
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
-	// If break: clear condCell to exit loop. If not: run post + recalc cond.
-	breakGuard := rl.allocCell()
-	rl.emit(&IRNot{Dst: breakGuard, Src: rl.loopBreakFlag})
-	guardedSaved := rl.nodes
-	rl.nodes = nil
-	if s.Post != nil {
-		if err := rl.lowerStmt(s.Post); err != nil {
-			return err
-		}
-	}
-	if s.Cond != nil {
-		if err := rl.emitCondTo(condCell, s.Cond); err != nil {
-			return err
-		}
-	} else {
-		rl.emit(&IRConst{Dst: condCell, Value: 1})
-	}
-	postCondBlock := &IRBlock{Nodes: rl.nodes}
-	rl.nodes = guardedSaved
-	rl.emit(&IRIf{
-		Cond: breakGuard,
-		Then: postCondBlock,
-		Else: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
-	})
-	rl.freeCell(breakGuard)
-	body := &IRBlock{Nodes: rl.nodes}
-	rl.nodes = saved
 	rl.emit(&IRLoop{Cond: condCell, Body: body})
 	rl.freeCell(rl.loopSkipFlag)
 	rl.freeCell(rl.loopBreakFlag)
@@ -1562,31 +1786,35 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	rl.loopFrames = append(rl.loopFrames, loopFrame{
 		label: label, skipFlag: rl.loopSkipFlag, breakFlag: rl.loopBreakFlag,
 	})
-	saved := rl.nodes
-	rl.nodes = nil
-	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
-	rl.emit(&IRZero{Dst: rl.loopBreakFlag})
-	if err := rl.lowerLoopBody(s.Body.List); err != nil {
+	body, err := rl.captureBlock(func() error {
+		rl.emit(&IRZero{Dst: rl.loopSkipFlag})
+		rl.emit(&IRZero{Dst: rl.loopBreakFlag})
+		if err := rl.lowerLoopBody(s.Body.List); err != nil {
+			return err
+		}
+		rl.emit(&IRZero{Dst: rl.loopSkipFlag})
+		breakGuard := rl.allocCell()
+		rl.emit(&IRNot{Dst: breakGuard, Src: rl.loopBreakFlag})
+		postBlock, err := rl.captureBlock(func() error {
+			rl.emit(&IRAddI{Dst: cell, Value: 1})
+			rl.emit(&IRCopy{Dst: limitCopy, Src: limit.cell})
+			rl.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limitCopy})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		rl.emit(&IRIf{
+			Cond: breakGuard,
+			Then: postBlock,
+			Else: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
+		})
+		rl.freeCell(breakGuard)
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	rl.emit(&IRZero{Dst: rl.loopSkipFlag})
-	breakGuard := rl.allocCell()
-	rl.emit(&IRNot{Dst: breakGuard, Src: rl.loopBreakFlag})
-	guardedSaved := rl.nodes
-	rl.nodes = nil
-	rl.emit(&IRAddI{Dst: cell, Value: 1})
-	rl.emit(&IRCopy{Dst: limitCopy, Src: limit.cell})
-	rl.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limitCopy})
-	postBlock := &IRBlock{Nodes: rl.nodes}
-	rl.nodes = guardedSaved
-	rl.emit(&IRIf{
-		Cond: breakGuard,
-		Then: postBlock,
-		Else: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
-	})
-	rl.freeCell(breakGuard)
-	body := &IRBlock{Nodes: rl.nodes}
-	rl.nodes = saved
 	rl.emit(&IRLoop{Cond: condCell, Body: body})
 	rl.freeCell(rl.loopSkipFlag)
 	rl.freeCell(rl.loopBreakFlag)
@@ -1607,19 +1835,16 @@ func (rl *recLowerer) lowerLoopBody(stmts []ast.Stmt) error {
 	rl.preloadVars(stmts)
 	guard := rl.allocCell()
 	for _, stmt := range stmts {
-		rl.storeAllLocals(rl.rc)
-		rl.reloadAllLocals(rl.rc)
+		rl.storeAllLocals()
+		rl.reloadAllLocals()
 		rl.emit(&IRNot{Dst: guard, Src: rl.loopSkipFlag})
-		saved := rl.nodes
-		rl.nodes = nil
-		if err := rl.lowerStmt(stmt); err != nil {
+		stmtBlock, err := rl.captureBlock(func() error { return rl.lowerStmt(stmt) })
+		if err != nil {
 			return err
 		}
-		stmtBlock := &IRBlock{Nodes: rl.nodes}
-		rl.nodes = saved
 		rl.emit(&IRIf{Cond: guard, Then: stmtBlock})
 	}
-	rl.storeAllLocals(rl.rc)
+	rl.storeAllLocals()
 	rl.freeCell(guard)
 	return nil
 }
@@ -1650,7 +1875,21 @@ func (rl *recLowerer) emitCondTo(dst Cell, cond ast.Expr) error {
 func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 	if len(s.Results) >= 1 {
 		if rl.rc.retSize > 1 {
-			return fmt.Errorf("unsupported multi-cell return in recursive function")
+			// Multi-cell uintN return: lower the expression, copy N cells
+			// to retReg. Struct/array returns are rejected upfront.
+			r, err := rl.lowerExpr(s.Results[0])
+			if err != nil {
+				return err
+			}
+			if r.intSize != rl.rc.retSize {
+				return fmt.Errorf("intSize mismatch in return: got %d, want %d", r.intSize, rl.rc.retSize)
+			}
+			for j := range rl.rc.retSize {
+				rl.emit(&IRMove{Dst: rl.rc.retReg + j, Src: r.cell + j})
+			}
+			if r.temp {
+				rl.freeCellRange(r.cell, rl.rc.retSize)
+			}
 		} else {
 			r, err := rl.lowerExpr(s.Results[0])
 			if err != nil {
@@ -1662,18 +1901,25 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 		// Bare return with named return values: store cached cells to
 		// frame first (they may have been modified), then load from frame
 		// (if-bodies may have modified the frame via IRStoreFrame).
+		// Each named return occupies 1 cell for byte or intSize cells for
+		// uint16/uint32; retReg is laid out the same way.
 		for _, name := range rl.rc.returnNames {
-			slot := rl.rc.locals[name].slot
-			if reg, ok := rl.loadedMap[slot]; ok {
-				rl.emit(&IRStoreFrame{Slot: slot, Src: reg, FrameSize: rl.rc.frameSize})
+			li := rl.rc.locals[name]
+			if reg, ok := rl.loadedMap[li.slot]; ok {
+				rl.storeFrame(li.slot, reg, max(li.intSize, 1))
 			}
 		}
-		for i, name := range rl.rc.returnNames {
-			slot := rl.rc.locals[name].slot
-			cell := rl.allocCell()
-			rl.emit(&IRLoadFrame{Dst: cell, Slot: slot, FrameSize: rl.rc.frameSize})
-			rl.emit(&IRMove{Dst: rl.rc.retReg + i, Src: cell})
-			rl.freeCell(cell)
+		off := 0
+		for _, name := range rl.rc.returnNames {
+			li := rl.rc.locals[name]
+			size := max(li.intSize, 1)
+			for j := range size {
+				cell := rl.allocCell()
+				rl.loadFrame(cell, li.slot+j, 1)
+				rl.emit(&IRMove{Dst: rl.rc.retReg + off + j, Src: cell})
+				rl.freeCell(cell)
+			}
+			off += size
 		}
 	}
 	// Emit deferred calls before popping the frame.
@@ -1687,85 +1933,66 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 }
 
 func (rl *recLowerer) lowerDefer(s *ast.DeferStmt) error {
-	// Capture non-string arguments into frame slots (not in rc.locals,
-	// so storeAllLocals won't overwrite them).
-	type capturedSlot struct {
-		slot int
-	}
-	// Use pre-allocated frame slots for captures.
-	var captures []capturedSlot
-	for _, arg := range s.Call.Args {
-		if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-			continue
-		}
-		_ = arg
-		slot := rl.rc.deferCaptureSlots[rl.rc.deferCaptureIdx]
-		rl.rc.deferCaptureIdx++
-		captures = append(captures, capturedSlot{slot: slot})
-	}
-	// Now evaluate args and store into the pre-allocated slots.
-	ci := 0
-	for _, arg := range s.Call.Args {
-		if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-			continue
-		}
-		r, err := rl.lowerExpr(arg)
-		if err != nil {
-			return err
-		}
-		rl.emit(&IRStoreFrame{Slot: captures[ci].slot, Src: r.cell, FrameSize: rl.rc.frameSize})
-		ci++
-	}
-
-	// Build the deferred block using raw IR (no lookupVar).
-	// At replay time, load captured values from frame and emit the call.
 	fn, ok := s.Call.Fun.(*ast.Ident)
 	if !ok {
 		return fmt.Errorf("unsupported defer call in recursive function")
 	}
-	saved := rl.nodes
-	rl.nodes = nil
-	ci = 0
 	switch fn.Name {
-	case "putchar":
-		cell := rl.allocCell()
-		rl.emit(&IRLoadFrame{Dst: cell, Slot: captures[0].slot, FrameSize: rl.rc.frameSize})
-		rl.emit(&IRPutc{Src: cell})
-	case "print", "println":
-		argIdx := 0
-		for _, arg := range s.Call.Args {
-			if argIdx > 0 && fn.Name == "println" {
-				sp := rl.allocCell()
-				rl.emit(&IRConst{Dst: sp, Value: ' '})
-				rl.emit(&IRPutc{Src: sp})
-				rl.freeCell(sp)
-			}
-			argIdx++
-			if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-				s, _ := strconv.Unquote(lit.Value)
-				for _, b := range []byte(s) {
-					cell := rl.allocCell()
-					rl.emit(&IRConst{Dst: cell, Value: b})
-					rl.emit(&IRPutc{Src: cell})
-				}
-			} else {
-				cell := rl.allocCell()
-				rl.emit(&IRLoadFrame{Dst: cell, Slot: captures[ci].slot, FrameSize: rl.rc.frameSize})
-				rl.emitPrintByte(cell)
-				ci++
-			}
-		}
-		if fn.Name == "println" {
-			cell := rl.allocCell()
-			rl.emit(&IRConst{Dst: cell, Value: '\n'})
-			rl.emit(&IRPutc{Src: cell})
-		}
+	case "putchar", "print", "println":
 	default:
-		rl.nodes = saved
 		return fmt.Errorf("unsupported defer call in recursive function: %s", fn.Name)
 	}
-	block := &IRBlock{Nodes: rl.nodes}
-	rl.nodes = saved
+
+	// Capture non-string args into pre-allocated frame slots. (Slots are
+	// outside rc.locals so storeAllLocals won't overwrite them.) String
+	// literals are emitted directly at replay time, no capture needed.
+	var slots []int
+	for _, arg := range s.Call.Args {
+		if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			continue
+		}
+		slot := rl.rc.deferCaptureSlots[rl.rc.deferCaptureIdx]
+		rl.rc.deferCaptureIdx++
+		r, err := rl.lowerExpr(arg)
+		if err != nil {
+			return err
+		}
+		rl.emit(&IRStoreFrame{Slot: slot, Src: r.cell, FrameSize: rl.rc.frameSize})
+		slots = append(slots, slot)
+	}
+
+	// Replay block: bind each captured frame slot to a synthetic name in
+	// rc.locals so rl.lowerExpr's frame path loads the value lazily, then
+	// delegate to the regular builtin lowering. The names are removed from
+	// rc.locals after the call so they don't bleed into surrounding code.
+	block, err := rl.captureBlock(func() error {
+		replayArgs := make([]ast.Expr, 0, len(s.Call.Args))
+		var addedNames []string
+		ci := 0
+		for _, arg := range s.Call.Args {
+			if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				replayArgs = append(replayArgs, arg)
+				continue
+			}
+			name := fmt.Sprintf("$defer_arg_%d", ci+1)
+			rl.rc.locals[name] = recLocalInfo{slot: slots[ci]}
+			addedNames = append(addedNames, name)
+			replayArgs = append(replayArgs, ast.NewIdent(name))
+			ci++
+		}
+		_, err := rl.lowerBuiltinCall(fn.Name, replayArgs, rl.lowerExpr)
+		for _, name := range addedNames {
+			if cell, ok := rl.loadedMap[rl.rc.locals[name].slot]; ok {
+				rl.freeCell(cell)
+				delete(rl.loadedMap, rl.rc.locals[name].slot)
+			}
+			delete(rl.rc.locals, name)
+		}
+		return err
+	})
+	if err != nil {
+		return err
+	}
 	rl.rc.deferredCalls = append(rl.rc.deferredCalls, block)
 	return nil
 }
@@ -1785,6 +2012,21 @@ func (rl *recLowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 	case *ast.BasicLit:
 		return rl.lowerLiteral(e)
 	case *ast.Ident:
+		// Recursive-frame locals are looked up via the frame, bypassing
+		// the base lowerer's scope. The outer scope may contain stale
+		// bindings for the same name (e.g., `x := f(...)` in main pre-
+		// allocates an intBinding for x before the call lowers, leaking
+		// into f's body), so we must not consult lookupBinding here.
+		if li, ok := rl.rc.locals[e.Name]; ok {
+			cell, err := rl.lookupVar(e.Name)
+			if err != nil {
+				return exprResult{}, err
+			}
+			if li.intSize >= 2 {
+				return exprResult{cell: cell, exprShape: exprShape{size: li.intSize, intSize: li.intSize}}, nil
+			}
+			return exprResult{cell: cell}, nil
+		}
 		return rl.lowerIdent(e, rl.lookupVar)
 	case *ast.ParenExpr:
 		return rl.lowerExpr(e.X)
@@ -1811,6 +2053,13 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 			if err != nil {
 				return exprResult{}, err
 			}
+			ri := info.SingleReturn()
+			if ri.IntSize >= 2 {
+				// Multi-cell uintN return: cells must be contiguous so
+				// downstream consumers can index base+k.
+				return exprResult{cell: retCells[0], temp: true,
+					exprShape: exprShape{size: ri.IntSize, intSize: ri.IntSize}}, nil
+			}
 			for i := 1; i < len(retCells); i++ {
 				rl.freeCell(retCells[i])
 			}
@@ -1819,6 +2068,16 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 		if ok && info.Returns == 0 {
 			return exprResult{}, fmt.Errorf("function %s has no return value", fn.Name)
 		}
+		if ok && info.IsRecursive {
+			// Recursive (general or tail) functions cannot be called as
+			// inline expressions inside a recursive function: the rec
+			// lowerer has no way to set up a nested dispatch loop, and
+			// tail-rec inlining needs the regular lowerer's tail-call
+			// context which is not active here.
+			return exprResult{}, fmt.Errorf(
+				"unsupported recursive function in recursive function: %s", fn.Name)
+		}
+		return exprResult{}, fmt.Errorf("unsupported function in recursive function: %s", fn.Name)
 	}
-	return exprResult{}, fmt.Errorf("unsupported call in recursive expression: %T", e.Fun)
+	return exprResult{}, fmt.Errorf("unsupported call in recursive function: %T", e.Fun)
 }

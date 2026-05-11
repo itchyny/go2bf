@@ -27,12 +27,14 @@ loop:
   goto loop
 ```
 
-Struct and array parameters are supported in tail calls.
-`lowerTailCall` copies composite arguments to temporaries before
-assigning to parameter cells, avoiding overwrites when the same
-variable appears in both source and destination. Composite literal
-arguments (e.g., `return walk(Point{p.x+1, p.y+2}, n-1)`) are
-evaluated into temp cells before the parameter update.
+Recursive functions are scalar-only -- byte, `uint16`, and
+`uint32` for params, locals, and returns (no pointers, no
+composites). For multi-byte (uintN) params, `lowerTailCall`
+evaluates each arg into an `intSize`-cell temp block before
+the parameter update, avoiding overwrites when the same
+variable appears in both source and destination of the
+assignment (e.g., `return f(a + uint16(1), b)` would otherwise
+clobber `a` while computing `b`).
 
 When a tail-recursive function contains `defer`, the tail-call
 optimization is disabled. The loop rewrite would lose per-call
@@ -71,9 +73,10 @@ Each recursive call gets its own stack frame with this slot layout:
 
 ```text
 Slot 0:         phase number (which phase to execute next)
-Slot 1:         return value (also receives child's result)
-Slot 2..2+P-1:  parameters
-Slot 2+P..end:  local variables
+Slot 1:         return value (single-byte; uintN returns flow through retReg)
+Slot 2..:       parameters (1 cell per byte param,
+                intSize cells per uint16/uint32 param)
+Then:           local variables (same per-cell rules)
 ```
 
 ### Dispatch Loop
@@ -282,53 +285,210 @@ geometry.
 frame slots. Before each `return` (and frame pop), the deferred IR
 blocks are emitted in LIFO order.
 
-## Frame-Based Indexing
-
-The `recLowerer` uses frame-based indexing helpers that parallel
-the regular lowerer's `indexInto`/`writeInto`:
-
-- **`recIndexInto(baseSlot, count, indexExpr)`** -- reads a scalar
-  from a frame array. Constant index emits `IRLoadFrame` directly;
-  variable index uses an if-cascade via `emitFrameIndexRead`.
-- **`recWriteInto(baseSlot, count, indexExpr, val)`** -- writes a
-  scalar to a frame array. Same dispatch as `recIndexInto`.
-- **`recFieldIndexInto(baseSlot, info, offset, indexExpr)`** --
-  reads a struct field from a frame struct array (adds field offset
-  to `i*elemSize`).
-- **`recFieldWriteInto(baseSlot, info, offset, indexExpr, val)`** --
-  writes a struct field in a frame struct array.
-
-These replace per-call-site constant/variable dispatch and are used
-by `lowerIndexExpr`, `lowerArrayAssign`, `lowerArrayIncDec`,
-`lowerSelectorExpr`, and `lowerFieldAssign`.
-
-The `compositeSize(name)` helper resolves the total frame slot count
-for a variable by checking the `arrayInfo` and `structType` fields on
-its `recLocalInfo` entry in `recContext.locals`. It is used by
-`lowerRecVarInit` and `lowerDecl` to avoid duplicated map lookups.
+Only `putchar`, `print`, and `println` are accepted as deferred calls
+(other targets are rejected upfront). The replay block synthesizes one
+`$defer_arg_N` entry in `rc.locals` per non-string argument -- each
+entry binds a synthetic name to the captured frame slot. The replay
+then delegates to `lowerBuiltinCall` with these synthetic names as
+args, which routes back through `rl.lowerExpr` and the normal frame
+load path. After the call lowers, the synthetic entries are removed
+from `rc.locals` and the cells freed (via `IRFree` emitted into the
+replay block, so the runtime free is part of the deferred call).
+This delegation reuses the regular print/println separator + newline
++ string-literal expansion logic instead of re-implementing it.
 
 ## Supported Features
 
-Most Go features supported in regular functions also work in
-recursive functions. Key differences from regular lowering:
+Recursive functions are scalar-only. Allowed types for parameters,
+locals, and return values: `byte`, `uint16`, `uint32`. Pointers
+(`*byte`, `*uintN`), composite types (struct, array, slice,
+pointer-to-struct), `uint64`, mutual recursion, and recursive calls
+inside `for` loops are rejected at compile time. Tail and general
+recursion share the same scalar-only rule. The rejections live in
+two places:
 
-- **Variable-index arrays** use an if-cascade (checking each
-  possible index) instead of `IRDynLoad`/`IRDynStore`, since
-  frame slots are not directly addressable by the stack
-  counter-walk.
-- **Composite equality** (`a == b`, `p != q`) loads each
-  element pair from the frame before comparing.
-- **Non-recursive function calls** (expressions and
-  statements, including methods) are inlined with struct
-  and array parameters loaded from the frame.
-- **`for i, v := range arr`** resolves the range limit at
-  compile time from the frame's array metadata.
-- **`divmod` fusion** applies in recursive phases, matching
-  the regular lowerer.
+- **`inlineCall`** (`lowerer.go`) screens parameter and return
+  types when the callee is recursive.
+- **`rejectComposites`** (`lowerer_rec.go`) walks the body and
+  flags any `var x [N]T`, `var p Struct`, `:= [N]T{...}`,
+  `:= Struct{...}`, any `[]T` slice expression, or any bitwise
+  operator (`&`, `|`, `^`, `&^`, `&=`, `|=`, `^=`, `&^=`) before
+  phase splitting. Bitwise ops are rejected because their codegen
+  needs ~10 algorithm temps in addition to the 4 the dispatch loop
+  holds, and the algo-temp pool only has 16.
 
-### Limitations
+Within those constraints, most Go features work the same as in
+non-recursive functions:
+
+- **Non-recursive function calls** (expressions and statements,
+  including builtins) are inlined.
+- **`for` loops** with byte counters work, including
+  `break`/`continue` (with labels).
+
+`divmod` fusion (folding adjacent `q := x/y; r := x%y` into a
+single `IRDivMod`) does **not** apply inside recursive phases --
+fusion has to be re-checked across the noRetFlag guard wrapper
+on each statement, which adds complexity for a minor codegen win
+in a code path that is already a small fraction of recursive bodies.
+The two regular operations (`IRDiv` + `IRMod`) are emitted instead.
+
+## Multi-Byte Integers
+
+`uint16` and `uint32` are supported as recursive parameters,
+locals, and return values. The same lowering pieces handle both
+widths via the `intSize` field on `recLocalInfo`.
+
+### Frame Slot Allocation
+
+**Params.** `lowerGeneralRecursion`'s param loop reads
+`info.ParamTypes[i].IntSize`: byte params occupy 1
+frame slot (`intSize = 0`), `uint16`/`uint32` params occupy
+`intSize` consecutive slots. `paramSlot` advances by the param's
+slot count rather than always +1.
+
+**Locals.** `collectIntLocals` re-registers any local whose `:=`
+RHS is a `uintN(...)` conversion (or a binary op / ident that
+infers to `uintN`). Each multi-byte local gets `intSize`
+consecutive frame slots starting at the current `rc.frameSize`.
+The earlier single-slot entry from `collectLocals` becomes an
+unused orphan; this is wasteful by one slot per multi-byte local
+but keeps the slot-allocation pass simple.
+
+**Return result vars.** For a uintN return, `buildPhases`
+re-allocates the result variable of each call site (`r` in
+`r := f(...)`) at the end of the frame with `retSize` slots.
+
+### Argument Passing
+
+When the recursive function is called, the arg-evaluation loops
+(in `lowerGeneralRecursion` for the initial push, and in
+`buildRecPhaseWithCall` for nested phase pushes) read
+`ParamTypes[i].IntSize` and gather `intSize` contiguous cells per
+uintN arg. The frame-store loop then walks `paramSlot` by the
+arg's cell count so the bytes land in the child frame's
+multi-slot param region.
+
+For tail recursion, `lowerTailCall` does the same: it copies
+uintN args to a temp block first (so a self-reference like
+`f(a+1, b)` doesn't overwrite `a` mid-assignment), then moves
+the temp into the param's `intBinding.base..base+intSize-1`.
+
+### Loaded Cell Cache
+
+`recLowerer.lookupVar` allocates `intSize` contiguous cells via
+`allocCells(intSize)` on first reference, emits an `IRLoadFrame`
+per byte, and caches the base cell in `loadedMap[slot]`. Subsequent
+references in the same phase reuse the cached cells.
+
+`reloadAllLocals` and `storeAllLocals` walk `loadedMap` and call
+`slotSize(slot)` per cached slot to decide how many cells to
+load/store; uintN locals get `intSize` ops, byte locals get one.
+Both helpers route through the shared `loadFrame`/`storeFrame`
+range emitters (`emit n IRLoadFrame/IRStoreFrame nodes from a
+contiguous range`), which are also used by `lookupVar` and the
+named-return path in `lowerReturn`.
+
+### Return Path
+
+`retReg` is `phaseTempBase + 1` (default 26) and the return area
+spans `retReg`..`retReg+retSize-1`. `lowerReturn`'s uintN branch
+lowers the return expression, then emits an `IRMove` for each
+byte from the result cells to the corresponding `retReg+j`.
+After the dispatch loop exits, `lowerGeneralRecursion` allocates
+`retSize` contiguous cells via `allocCells(retSize)` (not separate
+`allocCell()` calls -- the free list does not guarantee
+contiguity, and downstream consumers like `emitPrintInt` access
+`base+k`).
+
+### Ident Lookup Bypass
+
+`recLowerer.lowerExpr` for `*ast.Ident` checks `rc.locals` first
+and short-circuits to `lookupVar`, bypassing the base lowerer's
+`lookupBinding`. Without this bypass, an outer-scope `intBinding`
+for the same name (e.g., `x := f(...)` in the caller pre-allocates
+`x` before lowering the recursive call) would shadow the frame
+slot and the recursive function would read the caller's cells.
+
+### Why `uint64` Is Rejected
+
+For an 8-byte return, `retReg` would span positions 26..33. Once
+`sentinelFwd` is bumped (to 40 or more), position 32 is a highway
+marker and must stay 1. Writing the high byte of a return through
+that cell corrupts navigation. The same constraint blocks
+`uint64` locals (their cell layout has the same span issue) and
+`uint64` parameters (the child-frame's argument-marshalling step
+funnels through cells that hit the same boundary). `inlineCall`
+rejects all three up front with distinct error messages.
+
+## Allocation Across Highway Markers
+
+`allocCells(n)` (used for multi-byte locals and for `retCells`
+materialization) checks whether the requested range straddles a
+highway marker. If so, it shifts the base past the marker and
+re-attempts. If the shifted range still reaches `sentinelFwd`,
+it sets `recAllocErr = errTooManyLocalsInRec`, which the compile
+driver in `compile()` catches and retries `Lower` with a bumped
+sentinel. Without the shift, a `uint16` local landing on cells 31
+and 32 (with `sentinelFwd = 40`) would overwrite the marker.
+
+## Helpers
+
+A few shared helpers reduce boilerplate across the `recLowerer` body:
+
+- `slotSize(slot)` -- 1 for byte slots, `intSize` for uintN slots.
+  Used by reload/store/named-return paths.
+- `loadFrame(dst, slot, n)` / `storeFrame(slot, src, n)` -- emit
+  `n` `IRLoadFrame`/`IRStoreFrame` nodes for a contiguous range.
+  Single helper used wherever a multi-cell frame transfer is needed.
+- `captureBlock(fn) (*IRBlock, error)` -- swaps `rl.nodes` to a
+  fresh list while `fn` runs, returns the captured block, restores
+  the prior list (even on error). Replaces a manual save/restore
+  pattern that previously appeared in 6 places and silently leaked
+  on the error paths.
+- `enterPhase(rc) func()` -- saves emission state and redirects
+  allocation to the phase-temp range. Returns a `defer`-able
+  restore. Used by both `buildRecPhase` and `buildRecPhaseWithCall`.
+- `allocReturnCells(info)` -- allocates `retSize` zeroed cells
+  contiguously when `retSize > 1`; non-contiguously otherwise.
+  Shared with regular `inlineCall` since downstream consumers
+  (`emitPrintInt`, `emitCopyOrMove` for uintN) require
+  contiguity for multi-cell returns.
+- `runInlinedFunc(info, retCells, body)` -- swaps in the
+  inline-call return context (`returnDst`, `returnFlag`,
+  `inFunc`) for `body`, restores afterward. Used by
+  `inlineCallInRec` so its body shrinks to arg eval + param
+  binding + delegation.
+
+## Limitations
 
 - Recursive calls inside `for` loops are not supported.
-- Pointers are not supported in recursive functions.
-- Slices are not supported in recursive functions, including
-  slice parameters, slice return types, and slice locals.
+- Composite types (struct, array, slice, pointer-to-struct)
+  are not supported as parameters, return values, or locals
+  in recursive functions. The frame-slot indirection plus
+  variable-index if-cascade made composite handling a large
+  fraction of `recLowerer` with limited real-world use --
+  iterative forms or top-level arrays cover most patterns.
+- `uint64` parameters, returns, and locals are rejected;
+  `uint16` and `uint32` work. See [Multi-Byte Integers](#multi-byte-integers)
+  for why eight-cell layouts collide with highway markers.
+- Bitwise operators (`&`, `|`, `^`, `&^`) and their compound
+  assigns are rejected in recursive function bodies. Their
+  codegen needs ~10 algorithm temps; the dispatch loop already
+  holds 4 of the 16 in the algo-temp pool, so any bitwise op
+  would overflow it.
+- Calling another recursive function from inside a recursive
+  function is not supported (only inlined non-recursive helpers).
+  Mutual recursion is rejected upfront.
+- Local variable shadowing (`x := ...; if cond { x := ...; ... }`)
+  flattens to a single frame slot; both writes hit the outer
+  slot. Honor the surrounding scope by using distinct names.
+- Recursion depth is capped at 255 stack frames at runtime.
+  `activeReg` is one byte; pushing the 256th frame wraps it to
+  zero and the dispatch loop exits silently (the result is
+  whatever `retReg` happened to hold). Linear recursion at
+  exactly `f(255)` reaches this boundary because the base case
+  needs the 256th frame.
+- Switch with multiple non-default cases each containing a
+  recursive call is rejected by the phase splitter as
+  `unsupported recursive call pattern`. Single-case-recurses or
+  default-recurses patterns do work.

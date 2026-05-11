@@ -96,6 +96,47 @@ fib(10) = 55
 </details>
 
 <details>
+<summary>Factorial numbers</summary>
+
+```go
+package main
+
+func factorial(n byte) uint32 {
+    if n == 0 {
+        return uint32(1)
+    }
+    return uint32(n) * factorial(n-1)
+}
+
+func main() {
+    for i := byte(0); i <= 12; i++ {
+        print(i)
+        print("! = ")
+        println(factorial(i))
+    }
+}
+```
+
+```text
+ $ go2bf run factorial.go
+0! = 1
+1! = 1
+2! = 2
+3! = 6
+4! = 24
+5! = 120
+6! = 720
+7! = 5040
+8! = 40320
+9! = 362880
+10! = 3628800
+11! = 39916800
+12! = 479001600
+```
+
+</details>
+
+<details>
 <summary>Structs with methods</summary>
 
 ```go
@@ -274,6 +315,10 @@ The generated Brainfuck uses a CPU-like execution model:
 - Tail-call recursion optimization
 - General recursion (via stack-based dispatch)
   including nested recursive calls (e.g., Ackermann function)
+- Multi-byte (`uint16`/`uint32`) parameters, locals, and
+  return values in recursive functions; binary recursion
+  (`fib`, Pascal's triangle via `choose`) and accumulator
+  patterns
 - `defer` for function calls
   (LIFO order; not supported inside loops)
 
@@ -396,9 +441,13 @@ go2bf extensions:
   not supported.
 - No `select`, `go`, or `goto` statements.
 - No closures or function pointers.
-- Recursive functions do not support recursive calls
-  inside `for` loops, mutual recursion, multi-byte
-  integers (`uintN`), pointers, or slices.
+- Recursive functions are scalar-only: parameters,
+  return values, and locals must be `byte`, `uint16`,
+  or `uint32`. Pointers, struct, array, slice, `uint64`,
+  mutual recursion, recursive calls inside `for` loops,
+  bitwise operators (`&`/`|`/`^`/`&^` and the compound
+  assigns), recursive calls to other recursive functions,
+  and lexical shadowing of locals are not supported.
 - Maximum 255 stack slots (variables + temporaries)
   per program. Slice backing arrays share this space;
   programs that allocate many or large slices at runtime

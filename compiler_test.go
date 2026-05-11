@@ -184,6 +184,38 @@ func main() { print(min(byte(7), byte(7))) }`,
 			"", "7",
 		},
 		{
+			"min uint16",
+			`package main
+func main() {
+	a := uint16(300)
+	b := uint16(500)
+	m := min(a, b)
+	print(m)
+}`,
+			"", "300",
+		},
+		{
+			"max uint32",
+			`package main
+func main() {
+	print(max(uint32(50000), uint32(80000)))
+}`,
+			"", "80000",
+		},
+		{
+			"max uint16 via function",
+			`package main
+func g(a, b uint16) uint16 { return max(a, b) }
+func main() { print(g(uint16(300), uint16(500))) }`,
+			"", "500",
+		},
+		{
+			"min uint32",
+			`package main
+func main() { print(min(uint32(70000), uint32(80000))) }`,
+			"", "70000",
+		},
+		{
 			"min max with variables",
 			`package main
 func main() {
@@ -2070,6 +2102,21 @@ func main() {
 			"", "15",
 		},
 		{
+			"tail recursive calls general recursive",
+			`package main
+func grec(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	r := grec(n - 1)
+	return r + uint16(n)
+}
+func trec(n byte, acc uint16) uint16 {
+	if n == 0 { return acc }
+	return trec(n-1, acc+grec(n))
+}
+func main() { print(trec(3, uint16(0))) }`,
+			"", "10",
+		},
+		{
 			"tail recursive return",
 			`package main
 func f(n byte, acc byte) byte {
@@ -2290,6 +2337,35 @@ func f(n byte) byte {
 }
 func main() { print(f(5)) }`,
 			"", "3", // f(0)=0, f(1)=1, f(2)=2, f(3)=3, f(4)=3, f(5)=3
+		},
+		{
+			"if-modify after recursive call",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	r := f(n - 1)
+	if n != 0 {
+		r = r + byte(1)
+	}
+	return r
+}
+func main() { print(f(5)) }`,
+			"", "5",
+		},
+		{
+			"if-modify uint16 result after recursive call",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	r := f(n - 1)
+	x := uint16(n) * uint16(100)
+	if x < uint16(300) {
+		r = r + uint16(1)
+	}
+	return r
+}
+func main() { print(f(5)) }`,
+			"", "2",
 		},
 		{
 			"recursive logical and in if",
@@ -2716,6 +2792,32 @@ func main() { print(f(3)) }`,
 			"", "6", // f(0)=0, f(1)=1, f(2)=3, f(3)=6
 		},
 		{
+			"const declaration in recursive function",
+			`package main
+func f(n byte) byte {
+	const inc = byte(10)
+	if n == 0 { return 0 }
+	return f(n - 1) + inc
+}
+func main() { print(f(3)) }`,
+			"", "30",
+		},
+		{
+			"const block with iota in recursive function",
+			`package main
+func f(n byte) byte {
+	const (
+		a = iota
+		b
+		c
+	)
+	if n == 0 { return byte(a + b + c) }
+	return f(n - 1) + byte(c)
+}
+func main() { print(f(3)) }`,
+			"", "9", // base = 0+1+2=3, then +2 three times: 3+2+2+2=9
+		},
+		{
 			"recursive paren expr",
 			`package main
 func f(n byte) byte {
@@ -2736,6 +2838,56 @@ func f(n byte) byte {
 }
 func main() { print(f(3)) }`,
 			"", "30", // f(0)=0, f(1)=10, f(2)=20, f(3)=30
+		},
+		{
+			"min in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	return min(f(n - 1) + 3, byte(5))
+}
+func main() { print(f(4)) }`,
+			"", "5", // saturates at 5: f(0)=0, f(1)=3, f(2)=5, f(3)=5, f(4)=5
+		},
+		{
+			"max in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 1 }
+	return max(f(n - 1), byte(n))
+}
+func main() { print(f(4)) }`,
+			"", "4", // f(0)=1, f(1..4)=n
+		},
+		{
+			"min with three args in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 10 }
+	return min(f(n - 1), byte(n) * 2, byte(15))
+}
+func main() { print(f(5)) }`,
+			"", "2", // f(0)=10, f(1)=min(10,2,15)=2, then f(k>=2)=2
+		},
+		{
+			"min uint16 in tail-recursive function",
+			`package main
+func f(n byte, acc uint16) uint16 {
+	if n == 0 { return acc }
+	return f(n-1, min(acc, uint16(n)*uint16(100)))
+}
+func main() { print(f(5, uint16(250))) }`,
+			"", "100",
+		},
+		{
+			"min uint16 in general-recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(500) }
+	return min(f(n - 1), uint16(n)*uint16(100))
+}
+func main() { print(f(5)) }`,
+			"", "100",
 		},
 		{
 			"recursive mul div mod",
@@ -3122,7 +3274,7 @@ func main() { print(f(3)) }`,
 			"", "45",
 		},
 		{
-			"named return with recursive expression assign",
+			"named return with recursive function assign",
 			`package main
 func fib(n byte) (r byte) {
 	if n <= 1 { return n }
@@ -3445,6 +3597,265 @@ func f(n byte) byte {
 }
 func main() { print(f(4)) }`,
 			"", "14",
+		},
+		{
+			"uint16 local in recursive function",
+			`package main
+func f(n byte) byte {
+	x := uint16(100)
+	if n == 0 { return byte(x / uint16(10)) }
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)) }`,
+			"", "10",
+		},
+		{
+			"uint16 return in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(1000) }
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(3)) }`,
+			"", "1000",
+		},
+		{
+			"uint16 add across recursive frames",
+			`package main
+func sum(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	r := sum(n - 1)
+	return r + uint16(n)
+}
+func main() { print(sum(10)) }`,
+			"", "55",
+		},
+		{
+			"uint16 fibonacci (binary recursion)",
+			`package main
+func fib(n byte) uint16 {
+	if n <= 1 { return uint16(n) }
+	return fib(n-1) + fib(n-2)
+}
+func main() { print(fib(15)) }`,
+			"", "610",
+		},
+		{
+			"uint32 sum across recursive frames",
+			`package main
+func sum(n byte) uint32 {
+	if n == 0 { return uint32(0) }
+	return sum(n - 1) + uint32(n)
+}
+func main() { print(sum(20)) }`,
+			"", "210",
+		},
+		{
+			"uint32 local in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return byte(0) }
+	x := uint32(100) + uint32(n)
+	r := f(n - 1)
+	return byte(x) + r
+}
+func main() { print(f(3)) }`,
+			"", "50",
+		},
+		{
+			"uint16 param in tail-recursive function",
+			`package main
+func f(n uint16) uint16 {
+	if n == uint16(0) { return uint16(42) }
+	return f(n - uint16(1))
+}
+func main() { print(f(uint16(5))) }`,
+			"", "42",
+		},
+		{
+			"uint16 param accumulator (tail-recursive)",
+			`package main
+func sum(n, acc uint16) uint16 {
+	if n == uint16(0) { return acc }
+	return sum(n-uint16(1), acc+n)
+}
+func main() { print(sum(uint16(100), uint16(0))) }`,
+			"", "5050",
+		},
+		{
+			"uint16 param in general recursion",
+			`package main
+func f(n uint16) uint16 {
+	if n == uint16(0) { return uint16(0) }
+	r := f(n - uint16(1))
+	return r + n
+}
+func main() {
+	print(f(uint16(10)))
+}`,
+			"", "55",
+		},
+		{
+			"uint16 param fibonacci (binary recursion)",
+			`package main
+func fib(n uint16) uint16 {
+	if n <= uint16(1) { return n }
+	return fib(n-uint16(1)) + fib(n-uint16(2))
+}
+func main() { print(fib(uint16(20))) }`,
+			"", "6765",
+		},
+		{
+			"mixed byte and uint16 params in recursion",
+			`package main
+func f(n byte, acc uint16) uint16 {
+	if n == 0 { return acc }
+	return f(n-1, acc+uint16(n))
+}
+func main() { print(f(10, uint16(1000))) }`,
+			"", "1055",
+		},
+		{
+			"uint32 param in recursion",
+			`package main
+func sum(n uint32) uint32 {
+	if n == uint32(0) { return uint32(0) }
+	return n + sum(n-uint32(1))
+}
+func main() { print(sum(uint32(50))) }`,
+			"", "1275",
+		},
+		{
+			"multiple uint16 locals in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return byte(0) }
+	a := uint16(100) + uint16(n)
+	b := uint16(200) - uint16(n)
+	r := f(n - 1)
+	return byte(a) + byte(b) + r
+}
+func main() { print(f(3)) }`,
+			"", "132",
+		},
+		{
+			"uint16 div and mod in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	x := uint16(1000) + uint16(n)
+	q := x / uint16(10)
+	r := x % uint16(10)
+	rec := f(n - 1)
+	return rec + q + r
+}
+func main() { print(f(5)) }`,
+			"", "515",
+		},
+		{
+			"uint16 return assigned to uint16 local in caller",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(7) }
+	x := uint16(3)
+	rec := f(n - 1)
+	return rec + x
+}
+func main() { print(f(3)) }`,
+			"", "16",
+		},
+		{
+			"uint16 incdec in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	x := uint16(100)
+	x++
+	x++
+	r := f(n - 1)
+	return r + x
+}
+func main() { print(f(3)) }`,
+			"", "306",
+		},
+		{
+			"uint16 inc with carry in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return byte(0) }
+	x := uint16(255)
+	x++
+	r := f(n - 1)
+	return byte(x>>byte(8)) + r
+}
+func main() { print(f(3)) }`,
+			"", "3",
+		},
+		{
+			"uint16-returning function inlined in recursive function",
+			`package main
+func g(n byte) uint16 { return uint16(n) * uint16(100) }
+func f(n byte) byte {
+	if n == 0 { return byte(0) }
+	x := g(n)
+	r := f(n - 1)
+	return byte(x>>byte(8)) + r
+}
+func main() { print(f(5)) }`,
+			"", "3",
+		},
+		{
+			"uint16-param function inlined in recursive function",
+			`package main
+func g(n uint16) uint16 { return n * uint16(10) }
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	r := f(n - 1)
+	return g(uint16(n)) + r
+}
+func main() { print(f(5)) }`,
+			"", "150",
+		},
+		{
+			"named uint16 return in recursive function",
+			`package main
+func f(n byte) (s uint16) {
+	if n == 0 { s = uint16(0); return }
+	r := f(n - 1)
+	s = r + uint16(n)
+	return
+}
+func main() { print(f(3)) }`,
+			"", "6",
+		},
+		{
+			"named uint16 return with non-zero high byte (bare return)",
+			`package main
+func f(n byte) (s uint16) {
+	if n == 0 { s = uint16(500); return }
+	r := f(n - 1)
+	s = r + uint16(100)
+	return
+}
+func main() { print(f(3)) }`,
+			"", "800",
+		},
+		{
+			"for loop with uint16 local in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return uint16(0) }
+	x := uint16(0)
+	for i := byte(0); i < n; i++ {
+		x = x + uint16(i)
+	}
+	r := f(n - 1)
+	return r + x
+}
+func main() { print(f(4)) }`,
+			"", "10",
 		},
 		// --- Defer ---
 		{
@@ -10153,26 +10564,38 @@ func main() { print(f(1)) }`,
 			"unsupported expression statement in recursive function",
 		},
 		{
-			"multi-byte return in recursive function",
+			"uint64 return in recursive function",
 			`package main
-func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+func f(n byte) uint64 {
+	if n == 0 { return uint64(0) }
 	r := f(n - 1)
 	return r
 }
 func main() { print(f(1)) }`,
-			"multi-byte integer return values are not supported in recursive function f",
+			"uint64 return type in recursive function f is not supported",
 		},
 		{
-			"multi-byte param in recursive function",
+			"uint64 local in recursive function",
 			`package main
-func f(n uint16) byte {
-	if n == uint16(0) { return byte(0) }
-	r := f(n - uint16(1))
+func f(n byte) byte {
+	if n == 0 { return byte(0) }
+	x := uint64(100)
+	r := f(n - 1)
+	return byte(x) + r
+}
+func main() { print(f(2)) }`,
+			"uint64 local x in recursive function is not supported",
+		},
+		{
+			"uint64 param in recursive function",
+			`package main
+func f(n uint64) byte {
+	if n == uint64(0) { return byte(0) }
+	r := f(n - uint64(1))
 	return r + byte(1)
 }
-func main() { print(f(uint16(2))) }`,
-			"multi-byte integer parameters are not supported in recursive function f",
+func main() { print(f(uint64(2))) }`,
+			"uint64 parameter n in recursive function f is not supported",
 		},
 		{
 			"pointer param in general recursion",
@@ -10321,6 +10744,20 @@ func main() { print(f(2)) }`,
 			"function g has no return value",
 		},
 		{
+			"range with value in recursive function",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 0 }
+	for i, v := range byte(5) {
+		_ = i; _ = v
+	}
+	r := f(n - 1)
+	return r
+}
+func main() { print(f(2)) }`,
+			"range with value in recursive function is not supported (no array locals)",
+		},
+		{
 			"undefined variable in recursive function",
 			`package main
 func f(n byte) byte {
@@ -10342,7 +10779,7 @@ func f(n byte) byte {
 	return r + x
 }
 func main() { print(f(2)) }`,
-			"unsupported call in recursive expression: *ast.FuncLit",
+			"unsupported call in recursive function: *ast.FuncLit",
 		},
 		{
 			"function literal call as statement in recursive function",
@@ -10532,7 +10969,7 @@ func main() {
 			"too many variables: 259 stack slots (max 255)",
 		},
 		{
-			"void function in recursive expression",
+			"void function in recursive function",
 			`package main
 func g() {}
 func f(n byte) byte {
@@ -10823,7 +11260,7 @@ func main() { a := [2]Point{Point{1, 2}, Point{3, 4}}; var i uint16 = 0; println
 			"cannot use multi-byte integer as array index, use byte() to truncate",
 		},
 		{
-			"unsupported call in recursive expression: *ast.Ident",
+			"unsupported function in recursive function",
 			`package main
 func f(n byte) byte {
 	if n == 0 { return 0 }
@@ -10831,19 +11268,22 @@ func f(n byte) byte {
 	return r + unknown(n)
 }
 func main() { print(f(1)) }`,
-			"unsupported call in recursive expression: *ast.Ident",
+			"unsupported function in recursive function: unknown",
 		},
 		{
-			"unsupported function call in recursive",
+			"recursive function called in recursive function",
 			`package main
+func g(n byte) byte {
+	if n == 0 { return 0 }
+	return g(n - 1) + byte(1)
+}
 func f(n byte) byte {
 	if n == 0 { return 0 }
-	unknown()
 	r := f(n - 1)
-	return r
+	return r + g(n)
 }
 func main() { print(f(1)) }`,
-			"unsupported function in recursive function: unknown",
+			"unsupported recursive function in recursive function: g",
 		},
 		{
 			"unsupported defer in recursive",
@@ -11124,6 +11564,7 @@ func TestTestdata(t *testing.T) {
 		{"testdata/bubblesort.go", "1 2 3 4 5\n"},
 		{"testdata/quicksort.go", "result: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15\n"},
 		{"testdata/sieve.go", "2 3 5 7 11 13 17 19 23 29 31 37 41 43 47\n"},
+		{"testdata/pascal.go", "1 12 66 220 495 792 924 792 495 220 66 12 1\n"},
 	}
 	for _, tt := range tests {
 		t.Run(filepath.Base(tt.file), func(t *testing.T) {
