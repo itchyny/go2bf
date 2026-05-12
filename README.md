@@ -103,7 +103,7 @@ package main
 
 func factorial(n byte) uint32 {
     if n == 0 {
-        return uint32(1)
+        return 1
     }
     return uint32(n) * factorial(n-1)
 }

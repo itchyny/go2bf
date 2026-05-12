@@ -604,15 +604,20 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							if count > 0 {
 								elemSize := 1
 								elemType := ""
+								elemIntSize := 0
 								if eid, ok := at.Elt.(*ast.Ident); ok {
 									if def, ok := result.Structs[eid.Name]; ok {
 										elemSize = def.Size
 										elemType = eid.Name
+									} else if n := intIdentSize(eid.Name); n > 0 {
+										elemSize = n
+										elemIntSize = n
 									}
 								}
 								pi.ElemCount = count
 								pi.ElemSize = elemSize
 								pi.ElemType = elemType
+								pi.ElemIntSize = elemIntSize
 							}
 						} else if id, ok := star.X.(*ast.Ident); ok {
 							if _, ok := result.Structs[id.Name]; ok {

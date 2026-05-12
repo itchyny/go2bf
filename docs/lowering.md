@@ -748,8 +748,30 @@ byte-level IR at lowering time -- no codegen changes needed.
 `lowerBinary` checks `intSize` and dispatches to
 `lowerBinaryInt` for all multi-byte operations. uint16,
 uint32, and uint64 share the same generalized N-byte code
-paths. Mixed types are a compile error; explicit casts
-required.
+paths.
+
+Integer literals are automatically widened to match the surrounding
+`uintN` context. `widenIntegerLiteral` recognises a `BasicLit`
+INT operand whose lowered width is smaller than its peer's,
+frees the original cell(s), and re-emits the literal at the
+target size as zero-padded little-endian cells. Any other byte-
+typed expression (variables, byte-returning calls, struct
+fields, etc.) still needs an explicit `uintN(...)` cast at mixed
+widths. The lowering paths that call it:
+
+- `lowerBinary` for both sides of a binary op
+- `min` / `max` / `append` builtin arguments
+- array / slice element assigns
+- struct field assigns on both value and pointer receivers
+- function / method call arguments in `inlineCall`
+- non-recursive `return` of an explicit multi-value tuple
+- recursive lowerer's `return` statement
+- `*p = lit` where `p` is a pointer to `uintN`
+
+`widenIntegerLiteral` is a no-op when the literal is already
+at or beyond the target width (`lowerLiteral` picks the
+smallest-fitting width, so e.g. `1000` arrives as `uint16`
+even when the target is `uint32`).
 
 ### Arithmetic
 
@@ -836,25 +858,31 @@ narrower type would silently lose bytes: assigning a
 wider integer to a narrower variable, multi-byte values
 in `putchar` / byte parameters / `[]byte` composite
 literals, mismatched element widths in array/slice
-writes (`a[i] = 50000` for `[]uint32`), `return` type
-mismatch, wider integers as array/slice indices, and
-`make` sizes that exceed the byte-sized capacity cell
-(constant or runtime).
+writes from a non-literal source (`a[i] = b` with
+`a [N]uint32` and `b byte`), `return` of a non-literal
+byte from a `uint16`/`uint32` function, wider integers
+as array/slice indices, and `make` sizes that exceed
+the byte-sized capacity cell (constant or runtime).
+Byte integer literals at these same sites auto-widen
+instead (see `widenIntegerLiteral` above).
 
 ### Function parameters and returns
 
 Function parameters and returns of `uint16`/`uint32`/`uint64`
 occupy N cells. `inlineCall` copies all N cells for
-multi-byte params and zero-extends smaller args.
-`info.ReturnSizes` tracks per-return-value cell counts
-for multi-return functions. `info.Returns` equals the
-total cell count across all return values.
+multi-byte params; byte args to a `uintN` param are zero-
+extended, and narrower-`uintN` integer literals (e.g.
+`1000` passed to a `uint32` param) go through
+`widenIntegerLiteral` first so the param-store loop
+walks the full N cells. `info.ReturnSizes` tracks
+per-return-value cell counts for multi-return functions.
+`info.Returns` equals the total cell count across all
+return values.
 
-Multi-byte integers are not supported in recursive
-functions (tail-call or general recursion) -- the
-phase dispatch and frame push/pop mechanisms only
-handle byte-sized cells. Using uint16/uint32/uint64 in
-recursive functions may crash at runtime.
+Recursive functions support `uint16` and `uint32` for
+parameters, locals, and returns; `uint64` is rejected
+because the 8-cell layout collides with stride-8 highway
+markers (see [`recursion.md`](recursion.md)).
 
 Typed `*uint16`/`*uint32`/`*uint64` pointer parameters
 are supported. The analyzer records the pointed-to width

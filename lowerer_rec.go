@@ -78,10 +78,8 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		// cells). Pointer/composite/uint64/slice params are rejected at
 		// inlineCall before reaching here.
 		size, intSize := 1, 0
-		if i < len(info.ParamTypes) {
-			if n := info.ParamTypes[i].IntSize; n >= 2 {
-				size, intSize = n, n
-			}
+		if n := info.ParamTypes[i].IntSize; n >= 2 {
+			size, intSize = n, n
 		}
 		rc.locals[name] = recLocalInfo{slot: paramSlot, intSize: intSize}
 		paramSlot += size
@@ -171,6 +169,10 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		r, err := l.lowerExpr(expr)
 		if err != nil {
 			return nil, err
+		}
+		paramIntSize := info.ParamTypes[i].IntSize
+		if r.intSize < paramIntSize {
+			r = l.widenIntegerLiteral(r, paramIntSize)
 		}
 		if r.intSize >= 2 {
 			cells := make([]Cell, r.intSize)
@@ -1124,11 +1126,11 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 		if err != nil {
 			return nil, err
 		}
-		intSize := 0
-		if i < len(info.ParamTypes) {
-			intSize = info.ParamTypes[i].IntSize
-		}
+		intSize := info.ParamTypes[i].IntSize
 		if intSize >= 2 {
+			if r.intSize < intSize {
+				r = rl.widenIntegerLiteral(r, intSize)
+			}
 			cells := make([]Cell, intSize)
 			for j := range intSize {
 				cells[j] = r.cell + j
@@ -1422,10 +1424,7 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 	defer rl.popScope()
 	sc := rl.currentScope()
 	for j, name := range info.Params {
-		intSize := 0
-		if j < len(info.ParamTypes) {
-			intSize = info.ParamTypes[j].IntSize
-		}
+		intSize := info.ParamTypes[j].IntSize
 		if intSize >= 2 {
 			base := rl.allocCells(intSize)
 			for k := range intSize {
@@ -1933,6 +1932,9 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 			r, err := rl.lowerExpr(s.Results[0])
 			if err != nil {
 				return err
+			}
+			if r.intSize < rl.rc.retSize {
+				r = rl.widenIntegerLiteral(r, rl.rc.retSize)
 			}
 			if r.intSize != rl.rc.retSize {
 				return fmt.Errorf("intSize mismatch in return: got %d, want %d", r.intSize, rl.rc.retSize)

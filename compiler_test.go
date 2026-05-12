@@ -187,8 +187,7 @@ func main() { print(min(byte(7), byte(7))) }`,
 			"min uint16",
 			`package main
 func main() {
-	a := uint16(300)
-	b := uint16(500)
+	a, b := uint16(300), uint16(500)
 	m := min(a, b)
 	print(m)
 }`,
@@ -206,13 +205,13 @@ func main() {
 			"max uint16 via function",
 			`package main
 func g(a, b uint16) uint16 { return max(a, b) }
-func main() { print(g(uint16(300), uint16(500))) }`,
+func main() { print(g(300, 500)) }`,
 			"", "500",
 		},
 		{
 			"min uint32",
 			`package main
-func main() { print(min(uint32(70000), uint32(80000))) }`,
+func main() { print(min(70000, 80000)) }`,
 			"", "70000",
 		},
 		{
@@ -481,12 +480,12 @@ func main() {
 			`package main
 func main() {
 	for i := byte(0); i < 3; i++ {
-		j := uint16(i) * uint16(100)
-		print(j)
-		print(" ")
+		if i > 0 { print(" ") }
+		i := uint16(i) * 200
+		print(i)
 	}
 }`,
-			"", "0 100 200 ",
+			"", "0 200 400",
 		},
 		{
 			"for-range body declares same name as range variable",
@@ -494,8 +493,8 @@ func main() {
 func main() {
 	v := byte(99)
 	for _, v := range []byte{1, 2, 3} {
-		x := uint16(v) * uint16(100)
-		print(x)
+		v := uint16(v) * 100
+		print(v)
 		print(" ")
 	}
 	println(v)
@@ -508,7 +507,7 @@ func main() {
 func main() {
 	v := byte(99)
 	for _, v := range []byte{1, 2, 3} {
-		v := uint16(v) * uint16(100)
+		v := uint16(v) * 100
 		print(v)
 		print(" ")
 	}
@@ -1737,6 +1736,34 @@ func main() {
 			"", "3 2\n",
 		},
 		{
+			"widen narrower integer literal to uintN function param",
+			`package main
+func addN(d uint32) uint32 { return d + 1 }
+func twoN(a, b uint32) uint32 { return a + b }
+type Counter struct{ n uint32 }
+func (c *Counter) AddN(d uint32) { c.n += d }
+func main() {
+	println(addN(500))
+	println(twoN(1000, 2000))
+	c := Counter{n: 1000}
+	(&c).AddN(500)
+	println(c.n)
+}`,
+			"", "501\n3000\n1500\n",
+		},
+		{
+			"widen narrower integer literal in mixed-width multi-return",
+			`package main
+func split() (byte, uint32, uint64) {
+	return 5, 1000, 100000
+}
+func main() {
+	a, b, c := split()
+	println(a, b, c)
+}`,
+			"", "5 1000 100000\n",
+		},
+		{
 			"blank identifier",
 			`package main
 func divmod(a, b byte) (byte, byte) { return a / b, a % b }
@@ -2176,7 +2203,7 @@ func main() {
 			"tail recursive calls general recursive",
 			`package main
 func grec(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	r := grec(n - 1)
 	return r + uint16(n)
 }
@@ -2184,7 +2211,7 @@ func trec(n byte, acc uint16) uint16 {
 	if n == 0 { return acc }
 	return trec(n-1, acc+grec(n))
 }
-func main() { print(trec(3, uint16(0))) }`,
+func main() { print(trec(3, 0)) }`,
 			"", "10",
 		},
 		{
@@ -2223,6 +2250,16 @@ func f(n byte, acc byte) byte {
 }
 func main() { print(f(5, 0)) }`,
 			"", "15",
+		},
+		{
+			"tail recursive call widens narrower literal arg",
+			`package main
+func walk(n byte, acc uint32) uint32 {
+	if n == 0 { return acc }
+	return walk(n - 1, 1000)
+}
+func main() { println(walk(3, 0)) }`,
+			"", "1000\n",
 		},
 		// --- General recursion ---
 		{
@@ -2427,11 +2464,11 @@ func main() { print(f(5)) }`,
 			"if-modify uint16 result after recursive call",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	r := f(n - 1)
-	x := uint16(n) * uint16(100)
-	if x < uint16(300) {
-		r = r + uint16(1)
+	x := uint16(n) * 100
+	if x < 300 {
+		r = r + 1
 	}
 	return r
 }
@@ -2945,17 +2982,17 @@ func main() { print(f(5)) }`,
 			`package main
 func f(n byte, acc uint16) uint16 {
 	if n == 0 { return acc }
-	return f(n-1, min(acc, uint16(n)*uint16(100)))
+	return f(n-1, min(acc, uint16(n)*100))
 }
-func main() { print(f(5, uint16(250))) }`,
+func main() { print(f(5, 250)) }`,
 			"", "100",
 		},
 		{
 			"min uint16 in general-recursive function",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(500) }
-	return min(f(n - 1), uint16(n)*uint16(100))
+	if n == 0 { return 500 }
+	return min(f(n - 1), uint16(n)*100)
 }
 func main() { print(f(5)) }`,
 			"", "100",
@@ -2992,7 +3029,7 @@ func main() { print(f(3)) }`,
 			"uint16 xor in recursive function",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	return f(n - 1) + (uint16(0x1234) ^ uint16(0x00FF))
 }
 func main() { print(f(3)) }`,
@@ -3002,7 +3039,7 @@ func main() { print(f(3)) }`,
 			"uint32 xor in recursive function",
 			`package main
 func f(n byte) uint32 {
-	if n == 0 { return uint32(0) }
+	if n == 0 { return 0 }
 	return f(n - 1) + (uint32(0x12345678) ^ uint32(0x00FF00FF))
 }
 func main() { print(f(3)) }`,
@@ -3629,6 +3666,27 @@ func main() { print(f(123)) }`,
 			"", "6",
 		},
 		{
+			"general rec initial call widens narrower literal arg",
+			`package main
+func walk(n byte, acc uint32, mark byte) uint32 {
+	if n == 0 { return acc + uint32(mark) }
+	r := walk(n - 1, acc, mark)
+	return r
+}
+func main() { println(walk(2, 1000, 99)) }`,
+			"", "1099\n",
+		},
+		{
+			"general rec inner call widens narrower literal arg",
+			`package main
+func reset(n byte, acc uint32) uint32 {
+	if n == 0 { return acc }
+	return reset(n - 1, 1000) + 1
+}
+func main() { println(reset(3, 0)) }`,
+			"", "1003\n",
+		},
+		{
 			"switch with tag in recursive function",
 			`package main
 func f(n byte) byte {
@@ -3754,7 +3812,7 @@ func main() { print(f(3)) }`,
 			"uint16 add across recursive frames",
 			`package main
 func sum(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	r := sum(n - 1)
 	return r + uint16(n)
 }
@@ -3775,7 +3833,7 @@ func main() { print(fib(15)) }`,
 			"uint32 sum across recursive frames",
 			`package main
 func sum(n byte) uint32 {
-	if n == 0 { return uint32(0) }
+	if n == 0 { return 0 }
 	return sum(n - 1) + uint32(n)
 }
 func main() { print(sum(20)) }`,
@@ -3797,32 +3855,32 @@ func main() { print(f(3)) }`,
 			"uint16 param in tail-recursive function",
 			`package main
 func f(n uint16) uint16 {
-	if n == uint16(0) { return uint16(42) }
-	return f(n - uint16(1))
+	if n == 0 { return 42 }
+	return f(n - 1)
 }
-func main() { print(f(uint16(5))) }`,
+func main() { print(f(5)) }`,
 			"", "42",
 		},
 		{
 			"uint16 param accumulator (tail-recursive)",
 			`package main
 func sum(n, acc uint16) uint16 {
-	if n == uint16(0) { return acc }
-	return sum(n-uint16(1), acc+n)
+	if n == 0 { return acc }
+	return sum(n-1, acc+n)
 }
-func main() { print(sum(uint16(100), uint16(0))) }`,
+func main() { print(sum(100, 0)) }`,
 			"", "5050",
 		},
 		{
 			"uint16 param in general recursion",
 			`package main
 func f(n uint16) uint16 {
-	if n == uint16(0) { return uint16(0) }
-	r := f(n - uint16(1))
+	if n == 0 { return 0 }
+	r := f(n - 1)
 	return r + n
 }
 func main() {
-	print(f(uint16(10)))
+	print(f(10))
 }`,
 			"", "55",
 		},
@@ -3830,10 +3888,10 @@ func main() {
 			"uint16 param fibonacci (binary recursion)",
 			`package main
 func fib(n uint16) uint16 {
-	if n <= uint16(1) { return n }
-	return fib(n-uint16(1)) + fib(n-uint16(2))
+	if n <= 1 { return n }
+	return fib(n-1) + fib(n-2)
 }
-func main() { print(fib(uint16(20))) }`,
+func main() { print(fib(20)) }`,
 			"", "6765",
 		},
 		{
@@ -3843,17 +3901,17 @@ func f(n byte, acc uint16) uint16 {
 	if n == 0 { return acc }
 	return f(n-1, acc+uint16(n))
 }
-func main() { print(f(10, uint16(1000))) }`,
+func main() { print(f(10, 1000)) }`,
 			"", "1055",
 		},
 		{
 			"uint32 param in recursion",
 			`package main
 func sum(n uint32) uint32 {
-	if n == uint32(0) { return uint32(0) }
-	return n + sum(n-uint32(1))
+	if n == 0 { return 0 }
+	return n + sum(n-1)
 }
-func main() { print(sum(uint32(50))) }`,
+func main() { print(sum(50)) }`,
 			"", "1275",
 		},
 		{
@@ -3861,8 +3919,8 @@ func main() { print(sum(uint32(50))) }`,
 			`package main
 func f(n byte) byte {
 	if n == 0 { return byte(0) }
-	a := uint16(100) + uint16(n)
-	b := uint16(200) - uint16(n)
+	a := 100 + uint16(n)
+	b := 200 - uint16(n)
 	r := f(n - 1)
 	return byte(a) + byte(b) + r
 }
@@ -3873,10 +3931,10 @@ func main() { print(f(3)) }`,
 			"uint16 div and mod in recursive function",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
-	x := uint16(1000) + uint16(n)
-	q := x / uint16(10)
-	r := x % uint16(10)
+	if n == 0 { return 0 }
+	x := 1000 + uint16(n)
+	q := x / 10
+	r := x % 10
 	rec := f(n - 1)
 	return rec + q + r
 }
@@ -3887,7 +3945,7 @@ func main() { print(f(5)) }`,
 			"uint16 return assigned to uint16 local in caller",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(7) }
+	if n == 0 { return 7 }
 	x := uint16(3)
 	rec := f(n - 1)
 	return rec + x
@@ -3899,7 +3957,7 @@ func main() { print(f(3)) }`,
 			"uint16 incdec in recursive function",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	x := uint16(100)
 	x++
 	x++
@@ -3925,7 +3983,7 @@ func main() { print(f(3)) }`,
 		{
 			"uint16-returning function inlined in recursive function",
 			`package main
-func g(n byte) uint16 { return uint16(n) * uint16(100) }
+func g(n byte) uint16 { return uint16(n) * 100 }
 func f(n byte) byte {
 	if n == 0 { return byte(0) }
 	x := g(n)
@@ -3938,9 +3996,9 @@ func main() { print(f(5)) }`,
 		{
 			"uint16-param function inlined in recursive function",
 			`package main
-func g(n uint16) uint16 { return n * uint16(10) }
+func g(n uint16) uint16 { return n * 10 }
 func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	r := f(n - 1)
 	return g(uint16(n)) + r
 }
@@ -3951,7 +4009,7 @@ func main() { print(f(5)) }`,
 			"named uint16 return in recursive function",
 			`package main
 func f(n byte) (s uint16) {
-	if n == 0 { s = uint16(0); return }
+	if n == 0 { s = 0; return }
 	r := f(n - 1)
 	s = r + uint16(n)
 	return
@@ -3963,9 +4021,9 @@ func main() { print(f(3)) }`,
 			"named uint16 return with non-zero high byte (bare return)",
 			`package main
 func f(n byte) (s uint16) {
-	if n == 0 { s = uint16(500); return }
+	if n == 0 { s = 500; return }
 	r := f(n - 1)
-	s = r + uint16(100)
+	s = r + 100
 	return
 }
 func main() { print(f(3)) }`,
@@ -3975,7 +4033,7 @@ func main() { print(f(3)) }`,
 			"for loop with uint16 local in recursive function",
 			`package main
 func f(n byte) uint16 {
-	if n == 0 { return uint16(0) }
+	if n == 0 { return 0 }
 	x := uint16(0)
 	for i := byte(0); i < n; i++ {
 		x = x + uint16(i)
@@ -4973,17 +5031,6 @@ func main() {
 			"", "1245",
 		},
 		{
-			"range over string literal",
-			`package main
-func main() {
-	count := byte(0)
-	for _, c := range "hello" {
-		putchar(c)
-	}
-}`,
-			"", "hello",
-		},
-		{
 			"var array zeroed in loop",
 			`package main
 func main() {
@@ -5321,7 +5368,7 @@ func main() {
 	var a [2][2]uint16
 	for i := byte(0); i < 2; i++ {
 		for j := byte(0); j < 2; j++ {
-			a[i][j] = uint16(i)*uint16(100) + uint16(j)*uint16(10)
+			a[i][j] = uint16(i)*100 + uint16(j)*10
 		}
 	}
 	for i := byte(0); i < 2; i++ {
@@ -5960,6 +6007,23 @@ func main() {
 			"", "1 2\n3 4\n5 6\n",
 		},
 		{
+			"slice of struct uintN field write widens narrower literal",
+			`package main
+type R struct {
+	v uint32
+	tag byte
+}
+func main() {
+	s := []R{{v: 1000, tag: 1}, {v: 100000, tag: 2}}
+	s[0].v = 500
+	s[1].v = 999
+	for i := byte(0); i < 2; i++ {
+		println(s[i].v, s[i].tag)
+	}
+}`,
+			"", "500 1\n999 2\n",
+		},
+		{
 			"slice of structs field inc",
 			`package main
 type Point struct { x, y byte }
@@ -5978,8 +6042,8 @@ func main() {
 type Item struct { count uint16; tag byte }
 func main() {
 	s := make([]Item, 2)
-	s[0].count = uint16(1000); s[0].tag = 7
-	s[1].count = uint16(50000); s[1].tag = 8
+	s[0].count = 1000; s[0].tag = 7
+	s[1].count = 50000; s[1].tag = 8
 	println(s[0].count, s[0].tag)
 	println(s[1].count, s[1].tag)
 }`,
@@ -7309,9 +7373,9 @@ func main() {
 	s1 := S{a: [3]byte{1, 2, 3}, b: 4}
 	s2 := S{a: [3]byte{1, 2, 3}, b: 4}
 	s3 := S{a: [3]byte{1, 2, 9}, b: 4}
-	t1 := T{v: uint16(1000), tag: 7}
-	t2 := T{v: uint16(1000), tag: 7}
-	t3 := T{v: uint16(2000), tag: 7}
+	t1 := T{v: 1000, tag: 7}
+	t2 := T{v: 1000, tag: 7}
+	t3 := T{v: 2000, tag: 7}
 	n1 := N{g: [2][3]byte{{1,2,3},{4,5,6}}, k: 7}
 	n2 := N{g: [2][3]byte{{1,2,3},{4,5,6}}, k: 7}
 	n3 := N{g: [2][3]byte{{1,2,3},{9,5,6}}, k: 7}
@@ -7733,9 +7797,9 @@ func main() {
 			`package main
 type P struct { x [3]uint16 }
 func mutate(p *P) {
-	p.x[0] = uint16(100)
-	p.x[1] = uint16(40000)
-	p.x[2] = uint16(60000)
+	p.x[0] = 100
+	p.x[1] = 40000
+	p.x[2] = 60000
 }
 func main() {
 	var p P
@@ -7803,17 +7867,17 @@ func main() {
 	println(x)
 	x--
 	println(x)
-	println(a * uint16(200))
-	println(uint16(1000) / uint16(7))
-	println(uint16(10000) % uint16(7))
+	println(a * 200)
+	println(uint16(1000) / 7)
+	println(uint16(10000) % 7)
 	var max16 uint16 = 65535
 	println(^max16)
 	var five uint16 = 5
 	println(-five)
-	x = uint16(1000)
-	x += uint16(500)
+	x = 1000
+	x += 500
 	println(x)
-	x -= uint16(200)
+	x -= 200
 	println(x)
 }`,
 			"", "700\n65535\n256\n255\n60000\n142\n4\n0\n65531\n1500\n1300\n",
@@ -7849,6 +7913,17 @@ func main() {
 			"", "511\n3840\n61680\n61440\n256\n256\n",
 		},
 		{
+			"uint16 shift assigned to variable",
+			`package main
+func main() {
+	x := uint16(1) << 8
+	y := uint16(256) >> 4
+	z := uint16(3) << 4
+	println(x, y, z)
+}`,
+			"", "256 16 48\n",
+		},
+		{
 			"uint16 function",
 			`package main
 func add16(a, b uint16) uint16 { return a + b }
@@ -7858,7 +7933,7 @@ func main() {
 	println(add16(1000, 2000))
 	var a uint16 = 150
 	println(double(a))
-	println(double(uint16(500)))
+	println(double(500))
 }`,
 			"", "300\n3000\n300\n1000\n",
 		},
@@ -7886,8 +7961,8 @@ func main() {
 	q := a / b
 	r := a % b
 	println(q, r)
-	q2 := uint16(50000) / uint16(1000)
-	r2 := uint16(50000) % uint16(1000)
+	q2 := uint16(50000) / 1000
+	r2 := uint16(50000) % 1000
 	println(q2, r2)
 }`,
 			"", "142 6\n50 0\n",
@@ -7899,9 +7974,7 @@ func main() {
 	var a uint16 = 0
 	var b uint16 = 1
 	for range byte(24) {
-		c := a + b
-		a = b
-		b = c
+		a, b = b, a + b
 	}
 	println(a)
 }`,
@@ -7925,12 +7998,12 @@ func main() {
 			`package main
 type Sensor struct { id byte; value uint16; max uint16 }
 func main() {
-	s := Sensor{id: 1, value: uint16(500), max: uint16(1000)}
+	s := Sensor{id: 1, value: 500, max: 1000}
 	println(s.id, s.value)
-	s.value = uint16(255)
+	s.value = 255
 	s.value++
 	println(s.value)
-	s.value += uint16(100)
+	s.value += 100
 	println(s.value)
 	if s.value < s.max {
 		println(s.max - s.value)
@@ -7945,7 +8018,7 @@ func main() {
 	x := uint16(1000)
 	p := &x
 	println(*p)
-	*p = uint16(2000)
+	*p = 2000
 	println(x)
 	*p++
 	println(x)
@@ -7965,7 +8038,7 @@ func swap(p *Pair) {
 }
 func inc(p *Pair) { p.a++ }
 func main() {
-	q := Pair{a: uint16(255), b: uint16(2000)}
+	q := Pair{a: 255, b: 2000}
 	inc(&q)
 	println(q.a)
 	swap(&q)
@@ -7979,9 +8052,9 @@ func main() {
 func swap16(a, b uint16) (uint16, uint16) { return b, a }
 func divmod16(a, b uint16) (uint16, uint16) { return a / b, a % b }
 func main() {
-	x, y := swap16(uint16(1000), uint16(2000))
+	x, y := swap16(1000, 2000)
 	println(x, y)
-	println(divmod16(uint16(50000), uint16(7)))
+	println(divmod16(50000, 7))
 }`,
 			"", "2000 1000\n7142 6\n",
 		},
@@ -8000,9 +8073,9 @@ func main() {
 func main() {
 	x := uint16(300)
 	switch x {
-	case uint16(100):
+	case 100:
 		print("A")
-	case uint16(300):
+	case 300:
 		print("B")
 	default:
 		print("C")
@@ -8016,14 +8089,14 @@ func main() {
 func double(x uint16) uint16 { return x + x }
 func main() {
 	a := uint16(100)
-	b := a + uint16(50)
+	b := a + 50
 	println(b)
 	c := -a
 	println(c)
 	d := double(a)
 	println(d)
 	type S struct { v uint16 }
-	s := S{v: uint16(500)}
+	s := S{v: 500}
 	e := s.v
 	println(e)
 	p := uint16(10)
@@ -8061,9 +8134,9 @@ func main() {
 func main() {
 	const big uint16 = 10000
 	var x uint16 = big
-	println(x + uint16(10))
-	if x > uint16(100) {
-		println(x - uint16(256))
+	println(x + 10)
+	if x > 100 {
+		println(x - 256)
 	}
 }`,
 			"", "10010\n9744\n",
@@ -8087,7 +8160,7 @@ func main() {
 func main() {
 	x := uint16(50000)
 	_ = x
-	_ = x + uint16(7)
+	_ = x + 7
 	print("ok")
 }`,
 			"", "ok",
@@ -8134,11 +8207,11 @@ func main() {
 			`package main
 func main() {
 	println(uint32(300) * uint32(200))
-	q := uint32(1000) / uint32(7)
-	r := uint32(1000) % uint32(7)
+	q := uint32(1000) / 7
+	r := uint32(1000) % (7)
 	println(q, r)
-	q2 := uint32(1000000) / uint32(10000)
-	r2 := uint32(1000000) % uint32(10000)
+	q2 := uint32(1000000) / 10000
+	r2 := uint32(1000000) % 10000
 	println(q2, r2)
 }`,
 			"", "60000\n142 6\n100 0\n",
@@ -8152,15 +8225,16 @@ func main() {
 			"", "256\n",
 		},
 		{
-			"uint16 shift assigned to variable",
+			"uint32 fibonacci",
 			`package main
 func main() {
-	x := uint16(1) << 8
-	y := uint16(256) >> 4
-	z := uint16(3) << 4
-	println(x, y, z)
+	a, b := uint32(0), uint32(1)
+	for range byte(45) {
+		a, b = b, a + b
+	}
+	println(a)
 }`,
-			"", "256 16 48\n",
+			"", "1134903170\n",
 		},
 		{
 			"uint32 constant",
@@ -8178,11 +8252,11 @@ func main() {
 			`package main
 func main() {
 	a := make([]uint32, 2)
-	a[0] = uint32(50000)
-	a[1] = uint32(100)
+	a[0] = 50000
+	a[1] = 100
 	println(a[0], a[1])
 	var b [2]uint32
-	b[0] = uint32(70000)
+	b[0] = 70000
 	b[1] = uint32(byte(50))
 	println(b[0], b[1])
 }`,
@@ -8193,7 +8267,7 @@ func main() {
 			`package main
 type Counter struct { val uint32 }
 func main() {
-	c := Counter{val: uint32(65535)}
+	c := Counter{val: 65535}
 	c.val++
 	println(c.val)
 	c.val--
@@ -8206,7 +8280,7 @@ func main() {
 			`package main
 type Item struct { id byte; val uint32 }
 func main() {
-	a := [2]Item{Item{id: 1, val: uint32(100000)}, Item{id: 2, val: uint32(200000)}}
+	a := [2]Item{Item{id: 1, val: 100000}, Item{id: 2, val: 200000}}
 	for i := range byte(2) {
 		println(a[i].val)
 	}
@@ -8218,7 +8292,7 @@ func main() {
 			`package main
 type Pair struct { a uint32; b uint32 }
 func main() {
-	p := Pair{a: uint32(100000), b: uint32(200000)}
+	p := Pair{a: 100000, b: 200000}
 	ptr := &p
 	println(ptr.a, ptr.b)
 }`,
@@ -8228,7 +8302,7 @@ func main() {
 			"uint32 function param and return",
 			`package main
 func double(x uint32) uint32 { return x + x }
-func main() { println(double(uint32(500000))) }`,
+func main() { println(double(500000)) }`,
 			"", "1000000\n",
 		},
 		{
@@ -8242,6 +8316,17 @@ func main() {
 }`,
 			"", "150000",
 		},
+		{
+			"uintN pointer deref widens narrower literal",
+			`package main
+func main() {
+	var x uint32 = 0
+	p := &x
+	*p = 1000
+	println(*p)
+}`,
+			"", "1000\n",
+		},
 		// --- uint64 ---
 		{
 			"uint64 basics",
@@ -8250,7 +8335,7 @@ func main() {
 	x := uint64(4294967295)
 	x++
 	println(x)
-	x += uint64(1000)
+	x += 1000
 	println(x)
 	println(uint64(18446744073709551615))
 }`,
@@ -8275,9 +8360,7 @@ func main() {
 	a := uint64(0)
 	b := uint64(1)
 	for range byte(80) {
-		c := a + b
-		a = b
-		b = c
+		a, b = b, a + b
 	}
 	println(a)
 }`,
@@ -8288,13 +8371,13 @@ func main() {
 			`package main
 type Big struct { val uint64 }
 func main() {
-	s := Big{val: uint64(4294967296)}
+	s := Big{val: 4294967296}
 	s.val++
 	println(s.val)
-	s.val += uint64(100)
+	s.val += 100
 	println(s.val)
 	p := &s.val
-	*p += uint64(1000)
+	*p += 1000
 	println(s.val)
 }`,
 			"", "4294967297\n4294967397\n4294968397\n",
@@ -8352,8 +8435,10 @@ func main() {
 		x := byte(1)
 		print(x)
 	}
+	print(" ")
+	print(x)
 }`,
-			"", "1",
+			"", "1 5",
 		},
 		{
 			"inner var shadows outer uint16 const",
@@ -8391,11 +8476,11 @@ const small uint64 = 100
 const big uint64 = 5000000000
 const huge = 18000000000
 func main() {
-	println(small + uint64(50000))
-	println(big + uint64(1))
+	println(small + 50000)
+	println(big + 1)
 	const local uint64 = 200
-	println(local * uint64(3))
-	println(huge + uint64(1))
+	println(local * 3)
+	println(huge + 1)
 }`,
 			"", "50100\n5000000001\n600\n18000000001\n",
 		},
@@ -8403,7 +8488,7 @@ func main() {
 			"short decl from multi-byte array element",
 			`package main
 func main() {
-	a := [3]uint32{uint32(50000), uint32(100), uint32(2000000)}
+	a := [3]uint32{50000, 100, 2000000}
 	x := a[0]
 	y := a[1]
 	if x > y { print("yes ") } else { print("no ") }
@@ -8440,9 +8525,9 @@ func main() {
 			`package main
 func main() {
 	var a [3]uint16
-	a[0] = uint16(60000)
-	a[1] = uint16(40000)
-	a[2] = uint16(1000)
+	a[0] = 60000
+	a[1] = 40000
+	a[2] = 1000
 	for i, v := range a {
 		if i > 0 { print(" ") }
 		print(v)
@@ -8454,7 +8539,7 @@ func main() {
 			"uint16 array literal",
 			`package main
 func main() {
-	a := [3]uint16{uint16(100), uint16(2000), uint16(60000)}
+	a := [3]uint16{100, 2000, 60000}
 	println(a[0], a[1], a[2])
 }`,
 			"", "100 2000 60000\n",
@@ -8464,9 +8549,9 @@ func main() {
 			`package main
 func f() [3]uint16 {
 	var a [3]uint16
-	a[0] = uint16(100)
-	a[1] = uint16(1000)
-	a[2] = uint16(30000)
+	a[0] = 100
+	a[1] = 1000
+	a[2] = 30000
 	return a
 }
 func main() {
@@ -8479,19 +8564,20 @@ func main() {
 			"uint32 slice with append and range",
 			`package main
 func main() {
-	s := []uint32{uint32(100000), uint32(200000)}
-	s = append(s, uint32(3000000000))
+	s := []uint32{100000, 200000}
+	s = append(s, 3000000000)
+	s = append(s, 0)
 	for i, v := range s {
 		if i > 0 { print(" ") }
 		print(v)
 	}
 }`,
-			"", "100000 200000 3000000000",
+			"", "100000 200000 3000000000 0",
 		},
 		{
 			"uint16 slice param and return",
 			`package main
-func makeSlice() []uint16 { return []uint16{uint16(100), uint16(40000), uint16(60000)} }
+func makeSlice() []uint16 { return []uint16{100, 40000, 60000} }
 func sum(s []uint16) uint16 {
 	r := uint16(0)
 	for _, v := range s { r += v }
@@ -8503,7 +8589,7 @@ func main() { println(sum(makeSlice())) }`,
 		{
 			"index into call result",
 			`package main
-func makeSlice() []uint16 { return []uint16{uint16(100), uint16(40000), uint16(60000)} }
+func makeSlice() []uint16 { return []uint16{100, 40000, 60000} }
 func main() {
 	x := makeSlice()[1]
 	println(x)
@@ -8515,8 +8601,8 @@ func main() {
 			`package main
 func main() {
 	var a [2][3]uint16
-	a[0][1] = uint16(200)
-	a[1][2] = uint16(60000)
+	a[0][1] = 200
+	a[1][2] = 60000
 	x := a[0][1]
 	y := a[1][2]
 	println(x, y)
@@ -8530,7 +8616,7 @@ func main() {
 	var a [2][3]uint16
 	for i := byte(0); i < 2; i++ {
 		for j := byte(0); j < 3; j++ {
-			a[i][j] = uint16(i)*uint16(10) + uint16(j)
+			a[i][j] = uint16(i)*10 + uint16(j)
 		}
 	}
 	for i := byte(0); i < 2; i++ {
@@ -8548,9 +8634,9 @@ func main() {
 			`package main
 func main() {
 	var a [3][2]uint16
-	a[0][0] = uint16(11); a[0][1] = uint16(22)
-	a[1][0] = uint16(33); a[1][1] = uint16(44)
-	a[2][0] = uint16(55); a[2][1] = uint16(66)
+	a[0][0] = 11; a[0][1] = 22
+	a[1][0] = 33; a[1][1] = 44
+	a[2][0] = 55; a[2][1] = 66
 	for i := byte(0); i < 3; i++ {
 		println(a[i][0], a[i][1])
 	}
@@ -8561,7 +8647,7 @@ func main() {
 			"parenthesized index of multi-byte slice",
 			`package main
 func main() {
-	a := []uint16{uint16(100), uint16(40000), uint16(60000)}
+	a := []uint16{100, 40000, 60000}
 	x := (a[1])
 	y := ((a)[2])
 	println(x, y)
@@ -8572,7 +8658,7 @@ func main() {
 			"slice through parens",
 			`package main
 func main() {
-	a := []uint16{uint16(100), uint16(200), uint16(300)}
+	a := []uint16{100, 200, 300}
 	t := (a)[1:]
 	println(t[0], t[1])
 }`,
@@ -8582,7 +8668,7 @@ func main() {
 			"slice cast identity",
 			`package main
 func main() {
-	a := []uint16{uint16(100), uint16(200), uint16(300)}
+	a := []uint16{100, 200, 300}
 	t := []uint16(a)
 	println(t[0], t[1], t[2])
 }`,
@@ -8591,7 +8677,7 @@ func main() {
 		{
 			"slice on call result multi-byte",
 			`package main
-func mk16() []uint16 { return []uint16{uint16(100), uint16(200), uint16(300), uint16(400), uint16(500)} }
+func mk16() []uint16 { return []uint16{100, 200, 300, 400, 500} }
 func main() {
 	t := mk16()[1:4]
 	println(t[0], t[1], t[2])
@@ -8606,7 +8692,7 @@ func main() {
 			`package main
 type P struct { x [3]uint16 }
 func main() {
-	p := P{x: [3]uint16{uint16(100), uint16(40000), uint16(60000)}}
+	p := P{x: [3]uint16{100, 40000, 60000}}
 	println(p.x[0], p.x[1], p.x[2])
 }`,
 			"", "100 40000 60000\n",
@@ -8615,7 +8701,7 @@ func main() {
 			"nested multi-byte array literal init",
 			`package main
 func main() {
-	a := [2][3]uint16{{uint16(100), uint16(200), uint16(300)}, {uint16(400), uint16(500), uint16(600)}}
+	a := [2][3]uint16{{100, 200, 300}, {400, 500, 600}}
 	println(a[0][1], a[1][2])
 }`,
 			"", "200 600\n",
@@ -8653,8 +8739,8 @@ func main() {
 type Q struct { grid [2][3]uint16 }
 func main() {
 	q := Q{}
-	q.grid[0][0] = uint16(100)
-	q.grid[1][2] = uint16(60000)
+	q.grid[0][0] = 100
+	q.grid[1][2] = 60000
 	println(q.grid[0][0], q.grid[1][2])
 	a := q.grid
 	println(a[0][0], a[1][2])
@@ -8692,9 +8778,9 @@ func main() {
 			"address of multi-byte array",
 			`package main
 func main() {
-	a := [3]uint16{uint16(100), uint16(200), uint16(300)}
+	a := [3]uint16{100, 200, 300}
 	pa := &a
-	pa[1] = uint16(500)
+	pa[1] = 500
 	println(a[0], a[1], a[2])
 	println(pa[0], pa[1], pa[2])
 }`,
@@ -8704,7 +8790,7 @@ func main() {
 			"address of multi-byte array element",
 			`package main
 func main() {
-	a := [3]uint64{uint64(100), uint64(8000000000), uint64(99)}
+	a := [3]uint64{100, 8000000000, 99}
 	p := &a[1]
 	*p = *p + uint64(1000)
 	for i, v := range a { if i > 0 { print(" ") }; print(v) }
@@ -8716,10 +8802,10 @@ func main() {
 			`package main
 func main() {
 	var a [2][2]uint16
-	a[0][0] = uint16(100)
-	a[0][1] = uint16(40000)
-	a[1][0] = uint16(60000)
-	a[1][1] = uint16(1)
+	a[0][0] = 100
+	a[0][1] = 40000
+	a[1][0] = 60000
+	a[1][1] = 1
 	println(a[0][0], a[0][1], a[1][0], a[1][1])
 }`,
 			"", "100 40000 60000 1\n",
@@ -8730,9 +8816,9 @@ func main() {
 type S struct { vals [3]uint16 }
 func main() {
 	s := S{}
-	s.vals[0] = uint16(1000)
-	s.vals[1] = uint16(40000)
-	s.vals[2] = uint16(60000)
+	s.vals[0] = 1000
+	s.vals[1] = 40000
+	s.vals[2] = 60000
 	for i, v := range s.vals { if i > 0 { print(" ") }; print(v) }
 }`,
 			"", "1000 40000 60000",
@@ -8742,7 +8828,7 @@ func main() {
 			`package main
 type Pt struct { x, y uint32 }
 func main() {
-	a := [2]Pt{Pt{x: uint32(100000), y: uint32(200000)}, Pt{x: uint32(3000000000), y: uint32(50)}}
+	a := [2]Pt{Pt{x: 100000, y: 200000}, Pt{x: 3000000000, y: 50}}
 	for i, p := range a {
 		if i > 0 { print(" ") }
 		print(p.x); print(":"); print(p.y)
@@ -8757,7 +8843,7 @@ type R struct { val uint32 }
 func main() {
 	rs := [2]R{{val: 100}, {val: 200}}
 	for i := 0; i < 2; i++ {
-		rs[i].val = rs[i].val + uint32(1)
+		rs[i].val = rs[i].val + 1
 	}
 	print(rs[0].val)
 	print(" ")
@@ -8769,7 +8855,7 @@ func main() {
 			"keyed multi-byte array literal",
 			`package main
 func main() {
-	a := [5]uint32{0: uint32(100), 2: uint32(2000000), 4: uint32(99999)}
+	a := [5]uint32{0: 100, 2: 2000000, 4: 99999}
 	for i, v := range a {
 		if i > 0 { print(" ") }
 		print(v)
@@ -8781,7 +8867,7 @@ func main() {
 			"slice of multi-byte array",
 			`package main
 func main() {
-	a := [4]uint64{uint64(10), uint64(8000000000), uint64(15000000000000000000), uint64(99)}
+	a := [4]uint64{10, 8000000000, 15000000000000000000, 99}
 	s := a[1:3]
 	for i, v := range s { if i > 0 { print(" ") }; print(v) }
 }`,
@@ -8791,7 +8877,7 @@ func main() {
 			"range without value over multi-byte slice",
 			`package main
 func main() {
-	s := []uint16{uint16(100), uint16(40000), uint16(60000)}
+	s := []uint16{100, 40000, 60000}
 	cnt := byte(0)
 	for range s { cnt++ }
 	println(cnt)
@@ -8802,7 +8888,7 @@ func main() {
 			"address of multi-byte slice element",
 			`package main
 func main() {
-	s := []uint16{uint16(100), uint16(40000), uint16(60000)}
+	s := []uint16{100, 40000, 60000}
 	p := &s[1]
 	*p = *p + uint16(1)
 	for i, v := range s { if i > 0 { print(" ") }; print(v) }
@@ -8822,7 +8908,7 @@ func minmax(a []uint64) (uint64, uint64) {
 	return mn, mx
 }
 func main() {
-	mn, mx := minmax([]uint64{uint64(8000000000), uint64(100), uint64(15000000000000000000), uint64(2000)})
+	mn, mx := minmax([]uint64{8000000000, 100, 15000000000000000000, 2000})
 	println(mn, mx)
 }`,
 			"", "100 15000000000000000000\n",
@@ -8832,7 +8918,7 @@ func main() {
 			`package main
 func inc16(p *uint16) { *p++ }
 func add32(p *uint32, v uint32) { *p += v }
-func dbl64(p *uint64) { *p *= uint64(2) }
+func dbl64(p *uint64) { *p *= 2 }
 func main() {
 	a := uint16(65534)
 	inc16(&a)
@@ -8977,10 +9063,10 @@ func main() {
 			"string and byte-slice conversion of literals and concat",
 			`package main
 func main() {
-	t := []byte("hello"); t[0] = 'X'; println(t)
+	t := []byte("hello"); t[0] = 'X'; println(string(t))
 	u := string("world"); println(u)
 	a := "foo"; b := "bar"
-	v := []byte(a + b); v[0] = 'Y'; println(v)
+	v := []byte(a + b); v[0] = 'Y'; println(string(v))
 }`,
 			"", "Xello\nworld\nYoobar\n",
 		},
@@ -9045,10 +9131,10 @@ func main() {
 			`package main
 type S struct { xs []uint16 }
 func main() {
-	s := S{xs: []uint16{uint16(100), uint16(40000), uint16(60000)}}
+	s := S{xs: []uint16{100, 40000, 60000}}
 	println(s.xs[0], s.xs[1], s.xs[2])
-	s.xs[1] = uint16(50000)
-	s.xs = append(s.xs, uint16(99))
+	s.xs[1] = 50000
+	s.xs = append(s.xs, 99)
 	println(s.xs[1], s.xs[3], len(s.xs))
 }`,
 			"", "100 40000 60000\n50000 99 4\n",
@@ -9069,7 +9155,7 @@ func main() {
 			`package main
 type S struct { vals []uint16 }
 func main() {
-	s := S{vals: []uint16{uint16(100), uint16(200)}}
+	s := S{vals: []uint16{100, 200}}
 	t := s.vals
 	println(len(t), t[0], t[1])
 }`,
@@ -9911,6 +9997,21 @@ func main() {
 			"", "20 40 60\n",
 		},
 		{
+			"pointer to uintN array element write widens narrower literal",
+			`package main
+func setAll(p *[3]uint32) {
+	for i := byte(0); i < 3; i++ {
+		p[i] = 1000
+	}
+}
+func main() {
+	var a [3]uint32
+	setAll(&a)
+	println(a[0], a[1], a[2])
+}`,
+			"", "1000 1000 1000\n",
+		},
+		{
 			"pointer to struct field",
 			`package main
 type P struct { x byte; y byte }
@@ -10012,7 +10113,7 @@ func main() {
 	y := po.m.d.w
 	println(x, y)
 	po.m.d.v = 99
-	po.m.d.w = uint16(50000)
+	po.m.d.w = 50000
 	println(o.m.d.v, o.m.d.w)
 }`,
 			"", "3 30000\n99 50000\n",
@@ -10696,7 +10797,7 @@ func main() { print(f(1)) }`,
 			"uint64 return in recursive function",
 			`package main
 func f(n byte) uint64 {
-	if n == 0 { return uint64(0) }
+	if n == 0 { return 0 }
 	r := f(n - 1)
 	return r
 }
@@ -10707,7 +10808,7 @@ func main() { print(f(1)) }`,
 			"uint64 local in recursive function",
 			`package main
 func f(n byte) byte {
-	if n == 0 { return byte(0) }
+	if n == 0 { return 0 }
 	x := uint64(100)
 	r := f(n - 1)
 	return byte(x) + r
@@ -10719,11 +10820,11 @@ func main() { print(f(2)) }`,
 			"uint64 param in recursive function",
 			`package main
 func f(n uint64) byte {
-	if n == uint64(0) { return byte(0) }
-	r := f(n - uint64(1))
+	if n == 0 { return 0 }
+	r := f(n - 1)
 	return r + byte(1)
 }
-func main() { print(f(uint64(2))) }`,
+func main() { print(f(2)) }`,
 			"uint64 parameter n in recursive function f is not supported",
 		},
 		{
@@ -11327,12 +11428,6 @@ func main() { var x uint16 = 1; putchar(x) }`,
 			"cannot use uint16 as argument to putchar, use byte() to truncate",
 		},
 		{
-			"uint16 switch mixed type",
-			`package main
-func main() { var x uint16 = 1; switch x { case 1: println(1) } }`,
-			"mismatched integer sizes in ==, use explicit conversion",
-		},
-		{
 			"uint16 return from byte function",
 			`package main
 func f() byte { var x uint16 = 1; return x }
@@ -11343,13 +11438,7 @@ func main() { println(f()) }`,
 			"uint16 mixed type",
 			`package main
 func main() { var x uint16 = 1; y := byte(2); println(x + y) }`,
-			"mismatched integer sizes in +, use explicit conversion",
-		},
-		{
-			"uint32 slice element assigned narrow literal",
-			`package main
-func main() { a := make([]uint32, 1); a[0] = 50000; println(a[0]) }`,
-			"mismatched integer sizes in element assignment, use explicit conversion",
+			"mismatched integer sizes in x + y, use explicit conversion",
 		},
 		{
 			"uint16 array element assigned byte var",
@@ -11411,7 +11500,7 @@ func main() { print(f(1)) }`,
 			`package main
 func g(n byte) byte {
 	if n == 0 { return 0 }
-	return g(n - 1) + byte(1)
+	return g(n - 1) + 1
 }
 func f(n byte) byte {
 	if n == 0 { return 0 }
