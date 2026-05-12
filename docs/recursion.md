@@ -482,7 +482,12 @@ A few shared helpers reduce boilerplate across the `recLowerer` body:
   in recursive functions. The frame-slot indirection plus
   variable-index if-cascade made composite handling a large
   fraction of `recLowerer` with limited real-world use --
-  iterative forms or top-level arrays cover most patterns.
+  iterative forms cover most patterns.
+- Top-level (global) variables are not accessible from
+  recursive functions. `recLowerer.lookupVar` only resolves
+  frame-bound locals; references to globals raise a clear
+  error so the user knows to refactor (pass globals as
+  arguments, or convert the recursion to iteration).
 - `uint64` parameters, returns, and locals are rejected;
   `uint16` and `uint32` work. See [Multi-Byte Integers](#multi-byte-integers)
   for why eight-cell layouts collide with highway markers.

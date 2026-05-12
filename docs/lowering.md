@@ -119,6 +119,19 @@ shadowing -- an inner `x := byte(1)` overrides an outer
 `const x = 5`. `type` declarations register in `l.result.Structs`
 since struct types are package-level after analysis.
 
+### Top-level Var Declarations
+
+The analyzer collects top-level (global) `var` declarations into
+`AnalysisResult.GlobalVars`, rejecting any non-scalar type upfront.
+`Lower` processes them right after the constant-binding phase by
+wrapping each `*ast.GenDecl` in a synthetic `ast.DeclStmt` and
+dispatching through the same `lowerDecl` path used for locals.
+Allocation, binding, and initializer code all reuse the existing
+machinery; globals end up in the outermost scope and resolve via
+the regular `lookupBinding` walk from anywhere except inside
+recursive functions, where `recLowerer.lookupVar` deliberately
+does not fall through (see [`recursion.md`](recursion.md)).
+
 ### Field Assignment
 
 `lowerFieldAssign` resolves the base via `lowerExpr(sel.X)`, then

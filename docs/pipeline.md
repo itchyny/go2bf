@@ -28,6 +28,8 @@ Walks the AST to build a function table (`FuncInfo` for each function):
 - Evaluates constant expressions (integer literals, character literals,
   `+`, `-`, `*`, `/`, `%`, `^` (complement), `iota` in const blocks,
   `byte()` conversion, string literal constants for `print`/`println`)
+- Collects top-level (global) scalar `var` declarations into
+  `GlobalVars` and rejects non-scalar or typeless globals upfront
 - Validates method receivers and desugars `func (p T) m()` to `T.m`
 
 ## 3. Lower (`lowerer.go`, `lowerer_rec.go`)
@@ -35,6 +37,8 @@ Walks the AST to build a function table (`FuncInfo` for each function):
 Converts the AST into a structured IR (see [`ir.md`](ir.md)).
 
 - Allocates abstract **cells** for variables and temporaries
+- Emits initializer code for top-level (global) `var` declarations
+  ahead of main so globals carry their initial value when main starts
 - Lowers expressions to register-transfer operations
   (e.g., `x + y` becomes `IRAdd{dst, cellX, cellY}`)
 - Inlines non-recursive function calls at each call site, pushing a new

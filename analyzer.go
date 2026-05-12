@@ -19,6 +19,7 @@ type AnalysisResult struct {
 	IntConsts    map[string]uint64 // compile-time multi-byte integer constants (uint16/uint32/uint64)
 	IntConstSize map[string]int    // constant name -> integer size (2, 4, or 8)
 	StringConsts map[string]string // compile-time string constants
+	GlobalVars   []*ast.GenDecl    // top-level scalar var declarations, in source order
 	fset         *token.FileSet
 }
 
@@ -345,10 +346,14 @@ func intIdentSize(name string) int {
 	return 0
 }
 
-// intTypeSize returns the byte size for a uintN type expression
-// (2, 4, or 8), or 0 for any other expression.
+// intTypeSize returns the byte size for an integer type expression
+// (1 for byte/uint8, 2/4/8 for uintN), or 0 for a non-integer
+// expression (including a nil type for untyped consts).
 func intTypeSize(expr ast.Expr) int {
 	if id, ok := expr.(*ast.Ident); ok {
+		if id.Name == "byte" || id.Name == "uint8" {
+			return 1
+		}
 		return intIdentSize(id.Name)
 	}
 	return 0
@@ -358,7 +363,7 @@ func intTypeSize(expr ast.Expr) int {
 // an integer constant, given its declared type size (intSize == 0 for untyped)
 // and value. Returns an error if val is outside the resolved type's range.
 // Untyped constants are promoted to the smallest size that fits the value.
-func classifyIntConst(name string, val, intSize int) (int, error) {
+func classifyIntConst(name string, val uint64, intSize int) (int, error) {
 	if intSize == 0 {
 		switch {
 		case val > math.MaxUint32:
@@ -371,8 +376,10 @@ func classifyIntConst(name string, val, intSize int) (int, error) {
 			intSize = 1
 		}
 	}
+	// For intSize==8 the shift overflows uint64 to 0, so maxVal wraps to
+	// MaxUint64 and any value is within range.
 	maxVal := uint64(1)<<(intSize*8) - 1
-	if val < 0 || uint64(val) > maxVal {
+	if val > maxVal {
 		typeName := "byte"
 		if intSize >= 2 {
 			typeName = fmt.Sprintf("uint%d", intSize*8)
@@ -406,7 +413,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 		for _, decl := range file.Decls {
 			// Parse const declarations (supports iota, char literals, const blocks).
 			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.CONST {
-				iota := 0
+				iota := uint64(0)
 				var lastExprs []ast.Expr // repeat previous expressions for iota
 				for _, spec := range gd.Specs {
 					vs, ok := spec.(*ast.ValueSpec)
@@ -436,7 +443,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 								return nil, err
 							}
 							if size > 1 {
-								result.IntConsts[name.Name] = uint64(val) // #nosec G115
+								result.IntConsts[name.Name] = val
 								result.IntConstSize[name.Name] = size
 							} else {
 								result.ByteConsts[name.Name] = byte(val) // #nosec G115
@@ -483,6 +490,31 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 					}
 					result.Structs[def.Name] = def
 				}
+				continue
+			}
+
+			// Top-level var declarations. Only scalar byte/uint8/uint16/
+			// uint32/uint64 are supported; composite globals are rejected
+			// upfront with a clear error.
+			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.VAR {
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					if vs.Type == nil {
+						return nil, fmt.Errorf(
+							"%s: top-level var requires an explicit type",
+							fset.Position(spec.Pos()))
+					}
+					id, ok := vs.Type.(*ast.Ident)
+					if !ok || (id.Name != "byte" && id.Name != "uint8" && intIdentSize(id.Name) == 0) {
+						return nil, fmt.Errorf(
+							"%s: only scalar top-level var declarations are supported",
+							fset.Position(spec.Pos()))
+					}
+				}
+				result.GlobalVars = append(result.GlobalVars, gd)
 				continue
 			}
 
@@ -729,29 +761,29 @@ func evalStringConstExpr(expr ast.Expr, lookup func(string) (string, bool)) (str
 }
 
 // evalConstExpr evaluates a constant expression to an integer value.
-func evalConstExpr(expr ast.Expr, iota int, consts map[string]byte) (int, error) {
+// All arithmetic is done in uint64 (two's-complement wrap on under/overflow),
+// matching go2bf's unsigned-only domain. Negative-looking expressions like
+// `-5` lower to `0 - 5` and wrap to MaxUint64-4; rejection then happens at
+// `classifyIntConst` against the target type's range.
+func evalConstExpr(expr ast.Expr, iota uint64, consts map[string]byte) (uint64, error) {
 	switch e := expr.(type) {
 	case *ast.BasicLit:
 		switch e.Kind {
 		case token.INT:
-			val, err := strconv.ParseInt(e.Value, 0, 64)
-			if err != nil {
-				return 0, err
-			}
-			return int(val), nil
+			return strconv.ParseUint(e.Value, 0, 64)
 		case token.CHAR:
 			ch, _, _, err := strconv.UnquoteChar(e.Value[1:len(e.Value)-1], '\'')
 			if err != nil {
 				return 0, err
 			}
-			return int(ch), nil
+			return uint64(ch), nil // #nosec G115
 		}
 	case *ast.Ident:
 		if e.Name == "iota" {
 			return iota, nil
 		}
 		if val, ok := consts[e.Name]; ok {
-			return int(val), nil
+			return uint64(val), nil
 		}
 	case *ast.BinaryExpr:
 		left, err := evalConstExpr(e.X, iota, consts)
@@ -793,9 +825,13 @@ func evalConstExpr(expr ast.Expr, iota int, consts map[string]byte) (int, error)
 			return left >> right, nil
 		}
 	case *ast.CallExpr:
-		// Handle byte() type conversion.
-		if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "byte" && len(e.Args) == 1 {
-			return evalConstExpr(e.Args[0], iota, consts)
+		// Integer type conversions are pass-throughs at the uint64 level;
+		// the destination type's classifyIntConst handles range checks.
+		if id, ok := e.Fun.(*ast.Ident); ok && len(e.Args) == 1 {
+			switch id.Name {
+			case "byte", "uint8", "uint16", "uint32", "uint64":
+				return evalConstExpr(e.Args[0], iota, consts)
+			}
 		}
 	case *ast.UnaryExpr:
 		val, err := evalConstExpr(e.X, iota, consts)

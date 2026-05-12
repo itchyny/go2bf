@@ -2121,6 +2121,41 @@ func main() {
 }`,
 			"", "3 3 2 1\n",
 		},
+		{
+			"global var byte/uintN, with and without initializer",
+			`package main
+var a byte = 10
+var b uint16 = 1000
+var c uint32 = 100000
+var d uint64 = 5000000000
+var z byte
+func main() {
+	a++
+	b += 7
+	c *= 2
+	d++
+	z = 9
+	println(a, b, c, d, z)
+}`,
+			"", "11 1007 200000 5000000001 9\n",
+		},
+		{
+			"global var block declaration with const-expression init",
+			`package main
+const K = 7
+var ( x uint16 = K * K + 1; y byte = K )
+func main() { println(x, y) }`,
+			"", "50 7\n",
+		},
+		{
+			"global accessed from non-recursive helpers",
+			`package main
+var n uint16 = 100
+func add(d uint16) { n += d }
+func get() uint16 { return n }
+func main() { add(250); add(325); print(get()) }`,
+			"", "675",
+		},
 		// --- Type conversion ---
 		{
 			"string conversion in print",
@@ -8485,6 +8520,34 @@ func main() {
 			"", "50100\n5000000001\n600\n18000000001\n",
 		},
 		{
+			"uint64 const above int64 range",
+			`package main
+const (
+	MaxU64    uint64 = 18446744073709551615
+	JustAbove uint64 = 9223372036854775808
+)
+func main() {
+	println(MaxU64)
+	println(JustAbove)
+	println(MaxU64 - JustAbove)
+}`,
+			"", "18446744073709551615\n9223372036854775808\n9223372036854775807\n",
+		},
+		{
+			"uintN type cast in const expression",
+			`package main
+const (
+	A uint16 = uint16(1000)
+	B uint32 = uint32(100000)
+	C uint64 = uint64(10000000000)
+	D uint32 = uint32(1000) + uint32(500)
+)
+func main() {
+	println(A, B, C, D)
+}`,
+			"", "1000 100000 10000000000 1500\n",
+		},
+		{
 			"short decl from multi-byte array element",
 			`package main
 func main() {
@@ -10639,6 +10702,32 @@ func main() { putchar(x) }`,
 			"undefined variable: x",
 		},
 		{
+			"global scalar with composite type rejected",
+			`package main
+var a [3]byte
+func main() { putchar(a[0]) }`,
+			"input.go:2:5: only scalar top-level var declarations are supported",
+		},
+		{
+			"global typeless var rejected",
+			`package main
+var n = 5
+func main() { print(n) }`,
+			"input.go:2:5: top-level var requires an explicit type",
+		},
+		{
+			"global accessed from recursive function rejected",
+			`package main
+var counter uint16
+func f(n byte) {
+	if n == 0 { return }
+	counter++
+	f(n - 1)
+}
+func main() { f(3) }`,
+			"global variable counter is not accessible from recursive function",
+		},
+		{
 			"unsupported function in expression: unknown",
 			`package main
 func main() { foo() }`,
@@ -11273,6 +11362,20 @@ func main() {
 const x uint32 = 4294967296
 func main() {}`,
 			"const x: value 4294967296 out of uint32 range (0-4294967295)",
+		},
+		{
+			"const byte negative wraps to out-of-range",
+			`package main
+const x byte = byte(0) - 1
+func main() {}`,
+			"const x: value 18446744073709551615 out of byte range (0-255)",
+		},
+		{
+			"const uint8 negative wraps to out-of-range",
+			`package main
+const x uint8 = uint8(0) - 1
+func main() {}`,
+			"const x: value 18446744073709551615 out of byte range (0-255)",
 		},
 		{
 			"const division by zero",

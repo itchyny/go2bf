@@ -273,6 +273,15 @@ func Lower(result *AnalysisResult) (*Program, error) {
 		sc[name] = &stringConstBinding{value: v}
 	}
 
+	// Top-level var declarations. Allocate cells, bind in the outermost
+	// scope, and emit any initializers ahead of main so globals carry
+	// their initial value when main starts.
+	for _, gd := range result.GlobalVars {
+		if err := l.lowerDecl(&ast.DeclStmt{Decl: gd}); err != nil {
+			return nil, err
+		}
+	}
+
 	// Set up return flag if the body contains return statements, or any
 	// goto -- the goto dispatch loop uses returnFlag to skip the rest of
 	// a segment after a jump.
@@ -3353,7 +3362,7 @@ func (l *Lowerer) lowerCopy(args []ast.Expr) error {
 func (l *Lowerer) lowerLocalConsts(gd *ast.GenDecl) error {
 	sc := l.currentScope()
 	allConsts := l.allByteConsts()
-	iota := 0
+	iota := uint64(0)
 	var lastExprs []ast.Expr
 	for _, spec := range gd.Specs {
 		vs, ok := spec.(*ast.ValueSpec)
@@ -3384,7 +3393,7 @@ func (l *Lowerer) lowerLocalConsts(gd *ast.GenDecl) error {
 					return err
 				}
 				if size > 1 {
-					sc[name.Name] = &intConstBinding{value: uint64(val), size: size} // #nosec G115
+					sc[name.Name] = &intConstBinding{value: val, size: size}
 				} else {
 					sc[name.Name] = &constBinding{value: byte(val)} // #nosec G115
 					allConsts[name.Name] = byte(val)                // #nosec G115
