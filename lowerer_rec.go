@@ -144,7 +144,9 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		pos := rc.phaseCodeBase
 		dispatchCells := make([]Cell, 0, 4)
 		for len(dispatchCells) < 4 {
-			if pos > 0 && pos%highwayStride == 0 {
+			// Skip highway markers and the codegen-reserved interleaved
+			// algo-temp slots just below them (see currentAlgoTemps).
+			if isMarkerOrAlgoTemp(pos) {
 				pos++
 				continue
 			}

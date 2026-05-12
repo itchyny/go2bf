@@ -330,8 +330,9 @@ func (l *Lowerer) allocCell() Cell {
 	}
 	c := l.nextCell
 	l.nextCell++
-	// Skip highway marker positions (multiples of highwayStride) during phase temp allocation.
-	if l.recFrameSize > 0 && c > 0 && c%highwayStride == 0 && c < sentinelFwd {
+	// Skip highway markers and the codegen-reserved interleaved
+	// algo-temp slots just below them (see currentAlgoTemps).
+	for isMarkerOrAlgoTemp(c) {
 		c = l.nextCell
 		l.nextCell++
 	}
@@ -350,11 +351,14 @@ func (l *Lowerer) allocCells(n int) Cell {
 	base := l.nextCell
 	l.nextCell += n
 	if l.recFrameSize > 0 {
-		for j := range n {
-			if base+j > 0 && (base+j)%highwayStride == 0 && base+j < sentinelFwd {
-				base = base + j + 1
+		// Skip a range that straddles a highway marker or the
+		// codegen-reserved position just below a marker.
+	L:
+		for p := base; p < base+n; p++ {
+			if isMarkerOrAlgoTemp(p) {
+				base = p + 1
 				l.nextCell = base + n
-				break
+				goto L
 			}
 		}
 		if base+n-1 >= sentinelFwd {

@@ -21,6 +21,35 @@ var algoTempPositions = []int{
 	17, 18, 19, 20, 21, 22, 23, // group 2
 }
 
+// currentAlgoTemps returns the active algo-temp pool: the fixed set
+// plus the position just below each highway marker that falls in
+// [phaseTempBase, sentinelFwd). The interleaved positions give
+// near-temps for far phase-temp operands (e.g. an operand at position
+// 49 finds a temp at 47, distance 2, instead of 23 from the regular
+// pool, distance 26). The lowerer's allocCell skips these positions
+// so they stay available for codegen scratch.
+func currentAlgoTemps() []int {
+	temps := append([]int{}, algoTempPositions...)
+	for m := highwayStride; m <= sentinelFwd; m += highwayStride {
+		if m-1 >= phaseTempBase {
+			temps = append(temps, m-1)
+		}
+	}
+	return temps
+}
+
+// isMarkerOrAlgoTemp reports whether tape position p is either
+// a highway marker (a multiple of highwayStride below sentinelFwd,
+// must stay at value 1 for navigation) or the codegen-managed
+// interleaved algo-temp slot just below a marker (see
+// currentAlgoTemps). The lowerer's phase-temp allocation paths skip
+// such positions so navigation stays sound and the interleaved slots
+// remain available as codegen scratch.
+func isMarkerOrAlgoTemp(p int) bool {
+	return p > 0 && p < sentinelFwd &&
+		(p%highwayStride == 0 || (p+1)%highwayStride == 0)
+}
+
 const (
 	numRegs          = 5
 	sentinelBack     = 0  // backward sentinel
@@ -308,7 +337,7 @@ func stackValuePos(slot int) int {
 func Generate(prog *Program, debug bool) string {
 	numSlots := prog.CellsUsed - (sentinelFwd + 1)
 	g := &Generator{
-		temps:     newPosAllocator(algoTempPositions),
+		temps:     newPosAllocator(currentAlgoTemps()),
 		frameSize: numSlots,
 		debug:     debug,
 	}
@@ -426,7 +455,7 @@ func (g *Generator) allocTemp(pos int) (int, func()) {
 	if pos == 1 {
 		return sentinelBack, func() {}
 	}
-	t := g.temps.alloc()
+	t := g.temps.allocNear(pos)
 	return t, func() { g.temps.free(t) }
 }
 

@@ -43,18 +43,20 @@ After two bumps (`sentinelFwd = 40`):
 
 ```text
 Position:  0  1 .. 23 24 25 26 27 28 29 30 31
-Content:   0  R ..  T  1 [   phase temps    ]
-                       ^ marker
+Content:   0  R ..  T  1 [  phase temps  ]  T
+                       ^ marker             ^ algorithm temp
 
 Position: 32 33 34 35 36 37 38 39 40 41 42 43 44 ...
-Content:   1 [   phase temps    ]  0 [pad] [stack...]
-           ^ marker                ^ forward sentinel
+Content:   1 [  phase temps  ]  T  0 [pad] [stack...]
+           ^ marker             ^  ^ forward sentinel
+                                algorithm temp
 ```
 
 Phase temps occupy positions `phaseTempBase = 25` through `sentinelFwd-1`,
 skipping any markers (multiples of `highwayStride = 8`) that fall in
-that range. The pad cells and stack always begin two cells past the
-forward sentinel.
+that range AND the position just below each marker (reserved as an
+interleaved algo-temp slot; see Algorithm temps above). The pad cells
+and stack always begin two cells past the forward sentinel.
 
 ## Regions
 
@@ -76,13 +78,24 @@ Interleaved with algorithm temps at positions 3 and 6 so that every
 register has at least one adjacent neighbor for the neighbor register
 optimization (see [`codegen.md`](codegen.md)).
 
-### Algorithm temps (positions 3, 6, 9-15, 17-23)
+### Algorithm temps (positions 3, 6, 9-15, 17-23, interleaved)
 
 Scratch cells for codegen primitives. `copy` needs a temp cell, comparison
 needs flags, `divmod` needs 6 consecutive cells. Managed by a position
 allocator (`alloc`/`free`). Positions 3 and 6 are between registers,
-enabling distance-1 neighbor allocation. There are 16 algorithm temp
-positions in total.
+enabling distance-1 neighbor allocation. There are 16 fixed algorithm
+temp positions in total.
+
+When `sentinelFwd` grows past the default 24, the position just below
+each new marker is also added to the algo-temp pool (positions 31, 39,
+47, 55, ... up to but not below `sentinelFwd`). These interleaved
+slots sit in the middle of the phase-temp range, so a `copy` /
+`add` / `move` between two high phase-temp operands can pick a scratch
+two or three cells away instead of walking 25+ cells back to position
+23. The lowerer's `isMarkerOrAlgoTemp` check keeps these positions
+free of phase-code allocations. `allocTemp` uses `allocNear(operand)`
+to pick the closest free slot, so the interleaved positions naturally
+get chosen when an operand is in the phase-temp range.
 
 ### Highway markers (positions 8, 16, ...)
 
@@ -100,7 +113,7 @@ just at stride 8 -- which has constant source size and leaves the
 cursor one cell before the forward sentinel, shortening the subsequent
 `moveToSentinel` to a single `>`.
 
-### Phase temps (`phaseTempBase` through `sentinelFwd-1`, skipping markers)
+### Phase temps (`phaseTempBase` through `sentinelFwd-1`, skipping markers and algorithm temps)
 
 Reserved for recursive dispatch code (see [`recursion.md`](recursion.md)).
 Separated from algorithm temps so dispatch code doesn't interfere
@@ -111,9 +124,13 @@ compile driver bumps `sentinelFwd` to fit a recursive function.
 When present:
 
 - Position 25: `activeReg` (recursion depth counter)
-- Position 26: `retReg` (return value transfer between phases)
-- Positions 27 onward (skipping markers at 32, 40, ...): available for
-  phase code (`noRetFlag`, condition variables, argument preparation).
+- Position 26: `retReg` (return value transfer between phases; spans
+  `retSize` cells for uintN returns)
+- Positions past `retReg`, skipping markers (32, 40, ...) AND the
+  interleaved algo-temp slot just below each marker (31, 39, 47, ...):
+  available for phase code (`noRetFlag`, condition variables,
+  argument preparation, and -- for bitwise-using functions -- the
+  four dispatch-loop working cells).
 
 ### Padding (two cells past `sentinelFwd`)
 

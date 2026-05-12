@@ -256,7 +256,9 @@ base lowerer.
 
 Recursive dispatch uses phase temp cells (tape positions starting at
 `phaseTempBase = 25`, up to but not including `sentinelFwd`, skipping
-highway markers) instead of stack slots for dispatch control variables:
+highway markers AND the position just below each marker -- those are
+reserved as interleaved algo-temp slots; see
+[`tape.md`](tape.md)) instead of stack slots for dispatch control variables:
 
 | Position | Purpose |
 | -------- | ------- |
