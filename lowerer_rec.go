@@ -412,6 +412,24 @@ func (l *Lowerer) collectIntLocals(rc *recContext, body *ast.BlockStmt) error {
 				}
 			}
 		}
+		// Multi-LHS define from a function call: x, y := f(...). Each
+		// LHS picks up its position's return width from the callee's
+		// ReturnTypes.
+		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE && len(assign.Lhs) > 1 && len(assign.Rhs) == 1 {
+			if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+				if fn, ok := call.Fun.(*ast.Ident); ok {
+					if info, ok := l.result.Funcs[fn.Name]; ok {
+						for i, lhs := range assign.Lhs {
+							if id, ok := lhs.(*ast.Ident); ok && i < len(info.ReturnTypes) {
+								if size := info.ReturnTypes[i].IntSize; size >= 2 {
+									register(id.Name, size)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 		return true
 	})
 	return firstErr
@@ -575,21 +593,34 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 	// Phase 0 = preStmts of callSite 0 (if any), otherwise the whole body.
 	// Phase K (for K>0) = continuation after callSite K-1.
 
-	// For multi-cell uintN returns, result variables need N contiguous frame
-	// slots. Re-allocate them at the end of the frame, overriding the single-
-	// slot allocation from collectLocals.
+	// For multi-cell returns, result variables need contiguous frame slots
+	// sized per the callee's ReturnTypes, overriding the single-slot
+	// allocation from collectLocals. The loop covers single-LHS receives
+	// (single uintN return: one name, intSize cells) and tuple receives
+	// (`b, u = walk(...)`: each LHS sized to its return position) uniformly,
+	// so the retSize-wide store at the start of each post-call phase writes
+	// into each LHS at the right offset.
 	if rc.retSize > 1 {
-		retIntSize := info.SingleReturn().IntSize
 		allocated := make(map[string]bool)
 		for _, cs := range callSites {
-			info := rc.locals[cs.resultVar]
-			if !allocated[cs.resultVar] {
-				info.slot = rc.frameSize
-				rc.frameSize += rc.retSize
-				allocated[cs.resultVar] = true
+			base := rc.frameSize
+			moved := false
+			for i, name := range cs.resultVars {
+				if allocated[name] {
+					continue
+				}
+				intSize := 0
+				if i < len(info.ReturnTypes) && info.ReturnTypes[i].IntSize >= 2 {
+					intSize = info.ReturnTypes[i].IntSize
+				}
+				rc.locals[name] = recLocalInfo{slot: base, intSize: intSize}
+				allocated[name] = true
+				base += max(intSize, 1)
+				moved = true
 			}
-			info.intSize = retIntSize
-			rc.locals[cs.resultVar] = info
+			if moved {
+				rc.frameSize = base
+			}
 		}
 	}
 
@@ -607,7 +638,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 			return err
 		}
 		// Prepend: load retReg into the result variable of callSite[i-1].
-		prevSlot := rc.locals[callSites[i-1].resultVar].slot
+		prevSlot := rc.locals[callSites[i-1].resultVars[0]].slot
 		var loadRet []IRNode
 		for j := range rc.retSize {
 			loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg + j, FrameSize: rc.frameSize})
@@ -628,7 +659,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 		return err
 	}
 	// Prepend: load retReg into last result variable.
-	prevSlot := rc.locals[lastCallSite.resultVar].slot
+	prevSlot := rc.locals[lastCallSite.resultVars[0]].slot
 	var loadRet []IRNode
 	for j := range rc.retSize {
 		loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg + j, FrameSize: rc.frameSize})
@@ -648,10 +679,16 @@ func endsWithReturn(stmts []ast.Stmt) bool {
 }
 
 type recCallSite struct {
-	argExprs  []ast.Expr
-	resultVar string
-	preStmts  []ast.Stmt
-	condVar   string // if set, call is conditional on this frame variable being nonzero
+	argExprs []ast.Expr
+	// resultVars names every LHS receiving the call's return values
+	// (one entry for `a := f(...)` or the synthetic `$tailret`/`$void`
+	// placeholders, multiple for `b, u = walk(...)`). The frame-
+	// reallocation pass lays the names out contiguously per the
+	// callee's ReturnTypes, and the post-call prepend stores the full
+	// retSize from retReg starting at the first name's slot.
+	resultVars []string
+	preStmts   []ast.Stmt
+	condVar    string // if set, call is conditional on this frame variable being nonzero
 }
 
 // processRecStmt tries to process a single statement containing recursive calls
@@ -667,11 +704,22 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 		if !ok {
 			return nil, nil, false
 		}
+		resultVars := []string{id.Name}
+		if len(assign.Lhs) > 1 {
+			resultVars = make([]string, len(assign.Lhs))
+			for i, lhs := range assign.Lhs {
+				lid, ok := lhs.(*ast.Ident)
+				if !ok {
+					return nil, nil, false
+				}
+				resultVars[i] = lid.Name
+			}
+		}
 		return []recCallSite{{
-			argExprs:  calls[0].Args,
-			resultVar: id.Name,
-			preStmts:  preStmts,
-			condVar:   condVar,
+			argExprs:   calls[0].Args,
+			resultVars: resultVars,
+			preStmts:   preStmts,
+			condVar:    condVar,
 		}}, nil, true
 	}
 	// Assignment with expression containing recursive calls: x = f(n-1) + f(n-2)
@@ -683,10 +731,10 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 				cur := preStmts
 				for _, ext := range extracted {
 					sites = append(sites, recCallSite{
-						argExprs:  ext.call.Args,
-						resultVar: ext.tmpName,
-						preStmts:  cur,
-						condVar:   condVar,
+						argExprs:   ext.call.Args,
+						resultVars: []string{ext.tmpName},
+						preStmts:   cur,
+						condVar:    condVar,
 					})
 					cur = nil
 				}
@@ -707,10 +755,10 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 				rc.frameSize++
 			}
 			return []recCallSite{{
-					argExprs:  calls[0].Args,
-					resultVar: "$tailret",
-					preStmts:  preStmts,
-					condVar:   condVar,
+					argExprs:   calls[0].Args,
+					resultVars: []string{"$tailret"},
+					preStmts:   preStmts,
+					condVar:    condVar,
 				}}, []ast.Stmt{
 					&ast.ReturnStmt{Results: []ast.Expr{ast.NewIdent("$tailret")}},
 				}, true
@@ -724,10 +772,10 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 			cur := preStmts
 			for _, ext := range extracted {
 				sites = append(sites, recCallSite{
-					argExprs:  ext.call.Args,
-					resultVar: ext.tmpName,
-					preStmts:  cur,
-					condVar:   condVar,
+					argExprs:   ext.call.Args,
+					resultVars: []string{ext.tmpName},
+					preStmts:   cur,
+					condVar:    condVar,
 				})
 				cur = nil
 			}
@@ -743,10 +791,10 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 				rc.frameSize++
 			}
 			return []recCallSite{{
-				argExprs:  calls[0].Args,
-				resultVar: "$void",
-				preStmts:  preStmts,
-				condVar:   condVar,
+				argExprs:   calls[0].Args,
+				resultVars: []string{"$void"},
+				preStmts:   preStmts,
+				condVar:    condVar,
 			}}, []ast.Stmt{}, true
 		}
 	}
@@ -1930,7 +1978,40 @@ func (rl *recLowerer) emitCondTo(dst Cell, cond ast.Expr) error {
 }
 
 func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
-	if len(s.Results) >= 1 {
+	info := rl.result.Funcs[rl.rc.funcName]
+	if len(s.Results) > 1 {
+		// Explicit multi-return values: `return e1, e2, ...`. Lower each
+		// expression and place it at the right offset of retReg, widening
+		// integer literals to the declared per-position cell count.
+		off := 0
+		for i, expr := range s.Results {
+			n := 1
+			if i < len(info.ReturnSizes) {
+				n = info.ReturnSizes[i]
+			}
+			r, err := rl.lowerExpr(expr)
+			if err != nil {
+				return err
+			}
+			if r.intSize < n {
+				r = rl.widenIntegerLiteral(r, n)
+			}
+			if n >= 2 {
+				if r.intSize != n {
+					return fmt.Errorf("intSize mismatch in return value %d: got %d, want %d", i, r.intSize, n)
+				}
+				for j := range n {
+					rl.emit(&IRMove{Dst: rl.rc.retReg + off + j, Src: r.cell + j})
+				}
+				if r.temp {
+					rl.freeCellRange(r.cell, n)
+				}
+			} else {
+				rl.emitCopyOrMove(rl.rc.retReg+off, r)
+			}
+			off += n
+		}
+	} else if len(s.Results) == 1 {
 		if rl.rc.retSize > 1 {
 			// Multi-cell uintN return: lower the expression, copy N cells
 			// to retReg. Struct/array returns are rejected upfront.

@@ -1764,6 +1764,26 @@ func main() {
 			"", "5 1000 100000\n",
 		},
 		{
+			"named returns with mixed widths",
+			`package main
+func split(n uint16) (lo byte, hi uint16) {
+	lo = byte(n)
+	hi = n >> 8
+	return
+}
+func combine(lo byte, hi uint16) (a byte, b uint16, c uint32) {
+	a = lo
+	b = hi
+	c = uint32(hi)<<8 | uint32(lo)
+	return
+}
+func main() {
+	println(split(0xABCD))
+	println(combine(0x12, uint16(0xFE)))
+}`,
+			"", "205 171\n18 254 65042\n",
+		},
+		{
 			"blank identifier",
 			`package main
 func divmod(a, b byte) (byte, byte) { return a / b, a % b }
@@ -3720,6 +3740,61 @@ func reset(n byte, acc uint32) uint32 {
 }
 func main() { println(reset(3, 0)) }`,
 			"", "1003\n",
+		},
+		{
+			"general rec multi-return byte tuple via explicit values",
+			`package main
+func sumMax(n byte) (byte, byte) {
+	if n == 0 { return 0, 0 }
+	s, m := sumMax(n - 1)
+	s += n
+	if n > m { m = n }
+	return s, m
+}
+func main() { println(sumMax(10)) }`,
+			"", "55 10\n",
+		},
+		{
+			"general rec multi-return uintN tuple via explicit values",
+			`package main
+func evensOdds(n byte) (uint16, uint16) {
+	if n == 0 { return 0, 0 }
+	e, o := evensOdds(n - 1)
+	if n%2 == 0 { e++ } else { o++ }
+	return e, o
+}
+func main() { println(evensOdds(100)) }`,
+			"", "50 50\n",
+		},
+		{
+			"general rec multi-return mixed-width named with tuple assign",
+			`package main
+func walk(n byte) (b byte, u uint16) {
+	if n == 0 {
+		b = 1
+		u = 100
+		return
+	}
+	b, u = walk(n - 1)
+	b++
+	u += 10
+	return
+}
+func main() { println(walk(5)) }`,
+			"", "6 150\n",
+		},
+		{
+			"general rec multi-return mixed-width define then accumulate",
+			`package main
+func split(n byte) (byte, uint16) {
+	if n == 0 { return 0, 1000 }
+	b, u := split(n - 1)
+	return b + 1, u + 7
+}
+func main() {
+	println(split(8))
+}`,
+			"", "8 1056\n",
 		},
 		{
 			"switch with tag in recursive function",

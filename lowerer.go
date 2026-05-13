@@ -3967,10 +3967,7 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 	}
 	off := 0
 	for i, lhs := range s.Lhs {
-		n := 1
-		if i < len(info.ReturnSizes) {
-			n = info.ReturnSizes[i]
-		}
+		n := info.ReturnSizes[i]
 		switch target := lhs.(type) {
 		case *ast.Ident:
 			if si, ok := l.lookupStruct(target.Name); ok {
@@ -6446,10 +6443,17 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				elemIntSize: info.SingleReturn().ElemIntSize,
 			}}
 		} else {
+			// Walk names alongside per-position sizes; uintN names get
+			// an intBinding spanning intSize cells, others a byteBinding.
+			off := 0
 			for i, name := range info.ReturnNames {
-				if i < len(retCells) {
-					sc.defineByte(name, retCells[i])
+				size := info.ReturnSizes[i]
+				if i < len(info.ReturnTypes) && info.ReturnTypes[i].IntSize >= 2 {
+					sc[name] = &intBinding{base: retCells[off], size: info.ReturnTypes[i].IntSize}
+				} else {
+					sc.defineByte(name, retCells[off])
 				}
+				off += size
 			}
 		}
 	}

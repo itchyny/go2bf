@@ -369,9 +369,21 @@ The earlier single-slot entry from `collectLocals` becomes an
 unused orphan; this is wasteful by one slot per multi-byte local
 but keeps the slot-allocation pass simple.
 
-**Return result vars.** For a uintN return, `buildPhases`
-re-allocates the result variable of each call site (`r` in
-`r := f(...)`) at the end of the frame with `retSize` slots.
+**Return result vars.** Each recursive call site records every LHS
+that receives its return values in `recCallSite.resultVars` -- one
+name for `r := f(...)` (and the synthetic `$tailret`/`$void`
+placeholders) and the full list for tuple receives like `b, u =
+walk(n-1)`. When `retSize > 1`, `buildPhases` re-lays each call
+site's `resultVars` at the end of the frame as a contiguous group
+sized per the callee's `ReturnTypes`. The `retSize`-wide store at
+the start of each post-call phase then writes from `retReg` into
+those slots, so single-LHS uintN, multi-LHS tuple, and the synthetic
+placeholders all use the same code path.
+
+`lowerReturn` is the mirror image: when a return has multiple result
+expressions (`return s, m`), it iterates `info.ReturnSizes` and
+places each value at the matching `retReg` offset, widening integer
+literals to the per-position cell count.
 
 ### Argument Passing
 
