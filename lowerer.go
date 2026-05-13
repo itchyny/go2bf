@@ -615,9 +615,12 @@ func (l *Lowerer) exprIntSize(expr ast.Expr, sc scope) int {
 			if n := intIdentSize(fn.Name); n > 0 {
 				return n
 			}
-			if info, ok := l.result.Funcs[fn.Name]; ok && info.SingleReturn().IntSize >= 2 {
-				return info.SingleReturn().IntSize
-			}
+		}
+		// resolveCall handles both `f(...)` and `recv.M(...)`, so a uintN
+		// method return propagates to `r := c.Get()` shape inference.
+		funcName, _ := l.resolveCall(e)
+		if info, ok := l.result.Funcs[funcName]; ok && info.SingleReturn().IntSize >= 2 {
+			return info.SingleReturn().IntSize
 		}
 	case *ast.BinaryExpr:
 		return max(l.exprIntSize(e.X, sc), l.exprIntSize(e.Y, sc))

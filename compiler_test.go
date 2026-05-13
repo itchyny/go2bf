@@ -7638,6 +7638,30 @@ func main() {
 			"", "4 6\n",
 		},
 		{
+			"method returning uintN infers shape for :=",
+			`package main
+type Counter struct{ n uint16 }
+func (c Counter) Get() uint16 { return c.n }
+type Big struct{ a uint32; b uint64 }
+func (b Big) GetA() uint32 { return b.a }
+func (b Big) GetB() uint64 { return b.b }
+func main() {
+	c := Counter{n: 1000}
+	r := c.Get()
+	r += 50
+	println(r)
+
+	big := Big{a: 100000, b: 10000000000}
+	x := big.GetA()
+	x *= 2
+	println(x)
+	y := big.GetB()
+	y++
+	println(y)
+}`,
+			"", "1050\n200000\n10000000001\n",
+		},
+		{
 			"method call on function return",
 			`package main
 type Point struct { x byte; y byte }
