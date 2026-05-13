@@ -359,15 +359,38 @@ func (l *Lowerer) allocCell() Cell {
 	return c
 }
 
+// allocCells returns the base of n contiguous cells. Multi-cell results
+// (uint16/uint32/uint64 values, struct/array fields) need their cells
+// laid out sequentially so downstream code can index `base + k`.
 func (l *Lowerer) allocCells(n int) Cell {
+	// Try to satisfy from the free list: sort in place and scan for n
+	// adjacent cell numbers. Freed cells never sit on marker or algo-
+	// temp positions (allocCell skipped those when first growing
+	// nextCell), so a sorted run of n adjacent entries is always a
+	// safe contiguous range.
+	if n > 1 && len(l.freeCells) >= n {
+		slices.Sort(l.freeCells)
+		for i := 0; i+n <= len(l.freeCells); i++ {
+			if base := l.freeCells[i]; l.freeCells[i+n-1]-base == Cell(n-1) { // #nosec G115
+				l.freeCells = slices.Delete(l.freeCells, i, i+n)
+				return base
+			}
+		}
+	}
 	base := l.nextCell
 	l.nextCell += n
 	if l.recFrameSize > 0 {
 		// Skip a range that straddles a highway marker or the
-		// codegen-reserved position just below a marker.
+		// codegen-reserved position just below a marker. Non-marker
+		// cells in the abandoned prefix are returned to the free list
+		// so a subsequent allocCell (or smaller allocCells) can pick
+		// them up instead of leaking phase-temp slots.
 	L:
 		for p := base; p < base+n; p++ {
 			if isMarkerOrAlgoTemp(p) {
+				for q := base; q < p; q++ {
+					l.freeCells = append(l.freeCells, q)
+				}
 				base = p + 1
 				l.nextCell = base + n
 				goto L
