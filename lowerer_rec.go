@@ -22,14 +22,14 @@ import (
 // Pointer, composite (struct, array, slice), and uint64 params/returns
 // are rejected upfront -- the rec lowerer has no dereference path or
 // composite layout. See `inlineCall` (lowerer.go) and `rejectComposites`
-// / `collectIntLocals` (lowerer_rec.go) for the entry-point checks.
+// / `collectLocals` (lowerer_rec.go) for the entry-point checks.
 
 // recLocalInfo holds slot index plus per-local type metadata for a variable
 // in a recursive function frame. Recursive functions are scalar-only, so
 // the only metadata beyond `slot` is the multi-byte integer width.
 type recLocalInfo struct {
 	slot    int
-	intSize int // 0 for byte; 2/4 for uint16/uint32
+	intSize int // 1/2/4 for uint8/uint16/uint32
 }
 
 // recContext holds state for lowering a recursive function. Recursive
@@ -38,17 +38,18 @@ type recLocalInfo struct {
 // returns). Pointer, struct, array, slice, and `uint64` types are
 // rejected upfront, so this struct does not track that metadata.
 type recContext struct {
-	funcName  string
-	frameSize int
-	slotPhase int                     // always 0 (dispatch phase number)
-	slotRet   int                     // always 1 (single-byte return slot; multi-byte uintN returns flow through retReg)
-	paramBase int                     // always 2 (params start here, one cell each)
-	localBase int                     // 2 + len(params); locals and synthetic temps start here
-	locals    map[string]recLocalInfo // name -> slot + intSize (also covers params, named returns, and synthetic temps like $cond/$switch)
-	phases    []*IRBlock              // dispatch phases produced by buildPhases
-	activeReg Cell                    // phase-temp cell holding the recursion depth counter
-	retReg    Cell                    // phase-temp cell at retReg..retReg+retSize-1 carrying child return values
-	retSize   int                     // number of return cells (1 for byte, 2 or 4 for uint16/uint32)
+	funcName   string
+	frameSize  int
+	slotPhase  int                     // always 0 (dispatch phase number)
+	slotRet    int                     // always 1 (single-byte return slot; multi-byte uintN returns flow through retReg)
+	paramBase  int                     // always 2 (params start here, one cell each)
+	localBase  int                     // 2 + len(params); locals and synthetic temps start here
+	locals     map[string]recLocalInfo // name -> slot + intSize (also covers params, named returns, and synthetic temps like $cond/$switch)
+	phases     []*IRBlock              // dispatch phases produced by buildPhases
+	activeReg  Cell                    // phase-temp cell holding the recursion depth counter
+	retReg     []Cell                  // phase-temp cells (one per return cell) carrying child return values; non-contiguous to skip codegen algo-temps/markers
+	retSize    int                     // number of return cells (1 for byte, 2 or 4 for uintN, or sum for multi-return)
+	retIntSize int                     // intSize of the (single) return value: 1 for byte, 2 for uint16, 4 for uint32; 1 for void/multi-return as a placeholder
 
 	dispatchPhase, dispatchPr    Cell     // dispatch-loop working state, reserved in the phase-temp area so
 	dispatchFlag, dispatchActive Cell     // they don't compete with phase code for codegen's algo-temp pool.
@@ -56,20 +57,26 @@ type recContext struct {
 	noRetFlag                    Cell     // phase temp: 1 if no return happened in this phase, 0 after return
 	returnNames                  []string // named return value names (empty if unnamed)
 
-	deferCaptureSlots []int      // pre-allocated frame slots for defer captures
-	deferCaptureIdx   int        // index into deferCaptureSlots during lowering
+	deferCaptureSlots []int      // pre-allocated base frame slots for defer captures (one per arg)
+	deferCaptureSizes []int      // intSize for each defer capture (parallel to deferCaptureSlots)
+	deferCaptureIdx   int        // index into deferCaptureSlots/Sizes during lowering
 	deferredCalls     []*IRBlock // IR blocks emitted before each return's frame pop
 }
 
-func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error) {
-	// Compute frame layout.
-	localNames := collectLocals(info.Body, info.Params)
+// lowerGeneralRecursion lowers a non-tail-recursive call. When spreadArgs
+// is non-nil, args were already evaluated by the multi-return spread path
+// in inlineCall (f(g()) where g matches f's arity); skip the per-expr
+// eval loop and consume those results directly.
+func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr, spreadArgs []exprResult) ([]Cell, error) {
+	// Compute frame layout. Params are registered first (at fixed
+	// positions starting at paramBase), then named returns, then body
+	// locals -- collectLocals walks the body and registers each new
+	// local with its correct intSize in a single pass.
 	rc := &recContext{
 		funcName:  info.Name,
 		slotPhase: 0,
 		slotRet:   1,
 		paramBase: 2,
-		localBase: 2 + len(info.Params),
 		locals:    make(map[string]recLocalInfo),
 	}
 	paramSlot := rc.paramBase
@@ -77,41 +84,27 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		// Params are scalars: byte (1 cell) or uint16/uint32 (intSize
 		// cells). Pointer/composite/uint64/slice params are rejected at
 		// inlineCall before reaching here.
-		size, intSize := 1, 0
-		if n := info.ParamTypes[i].IntSize; n >= 2 {
-			size, intSize = n, n
-		}
+		intSize := info.ParamTypes[i].IntSize
 		rc.locals[name] = recLocalInfo{slot: paramSlot, intSize: intSize}
-		paramSlot += size
+		paramSlot += intSize
 	}
 	rc.localBase = paramSlot
-	for i, name := range localNames {
-		rc.locals[name] = recLocalInfo{slot: rc.localBase + i}
-	}
-	rc.frameSize = rc.localBase + len(localNames)
+	rc.frameSize = rc.localBase
 
 	// Named return values are mapped to frame slots like locals. For
 	// uintN named returns, allocate intSize cells so reads/writes through
 	// the returned name span the full multi-byte value.
 	rc.returnNames = info.ReturnNames
 	for i, name := range info.ReturnNames {
-		if _, exists := rc.locals[name]; exists {
-			continue
-		}
-		intSize := 0
-		if i < len(info.ReturnTypes) {
-			if n := info.ReturnTypes[i].IntSize; n >= 2 {
-				intSize = n
-			}
-		}
+		intSize := info.ReturnTypes[i].IntSize
 		rc.locals[name] = recLocalInfo{slot: rc.frameSize, intSize: intSize}
-		rc.frameSize += max(intSize, 1)
+		rc.frameSize += intSize
 	}
 
 	if err := l.rejectComposites(info.Body); err != nil {
 		return nil, err
 	}
-	if err := l.collectIntLocals(rc, info.Body); err != nil {
+	if err := l.collectLocals(rc, info); err != nil {
 		return nil, err
 	}
 
@@ -121,13 +114,28 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	// uintN returns are the only multi-cell case; struct/array returns are
 	// rejected before reaching this point.
 	retSize := info.Returns
-	if ri := info.SingleReturn(); ri.IntSize >= 2 {
+	rc.retIntSize = 1
+	if ri := info.SingleReturn(); ri.IntSize > 0 {
 		retSize = ri.IntSize
+		rc.retIntSize = ri.IntSize
 	}
 	rc.retSize = retSize
 
-	rc.activeReg = phaseTempBase  // tape position 25
-	rc.retReg = phaseTempBase + 1 // tape position 26 (base of return area)
+	rc.activeReg = phaseTempBase // tape position 25
+	// Allocate retReg cells one position at a time, skipping highway
+	// markers and the codegen-reserved interleaved algo-temp positions
+	// (see currentAlgoTemps). A retSize that crosses an algo-temp (e.g.
+	// retSize=6 places retReg+5 at position 31, an algo-temp) would
+	// otherwise be silently overwritten by codegen scratch.
+	pos := phaseTempBase + 1
+	rc.retReg = make([]Cell, retSize)
+	for j := range retSize {
+		for isMarkerOrAlgoTemp(pos) {
+			pos++
+		}
+		rc.retReg[j] = Cell(pos)
+		pos++
+	}
 
 	// By default the dispatch loop's four working cells (phase, pr,
 	// flag, activeTemp) come from the codegen's algo-temp pool --
@@ -137,9 +145,8 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 	// relocate the dispatch cells into the phase-temp area, freeing
 	// the algo-temp pool at the cost of pushing phase code's frame
 	// slots four positions higher (more `<>` navigation per access).
-	rc.phaseCodeBase = phaseTempBase + 1 + retSize
+	rc.phaseCodeBase = pos
 	if hasBitwise(info.Body) {
-		pos := rc.phaseCodeBase
 		dispatchCells := make([]Cell, 0, 4)
 		for len(dispatchCells) < 4 {
 			// Skip highway markers and the codegen-reserved interleaved
@@ -164,29 +171,33 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		cells []Cell
 		temps bool
 	}
-	args := make([]argCells, len(argExprs))
-	for i, expr := range argExprs {
-		r, err := l.lowerExpr(expr)
-		if err != nil {
-			return nil, err
+	args := make([]argCells, len(info.Params))
+	for i := range info.Params {
+		var r exprResult
+		if spreadArgs != nil {
+			r = spreadArgs[i]
+		} else {
+			var err error
+			r, err = l.lowerExpr(argExprs[i])
+			if err != nil {
+				return nil, err
+			}
 		}
 		paramIntSize := info.ParamTypes[i].IntSize
 		if r.intSize < paramIntSize {
 			r = l.widenIntegerLiteral(r, paramIntSize)
 		}
-		if r.intSize >= 2 {
-			cells := make([]Cell, r.intSize)
-			for j := range r.intSize {
-				cells[j] = r.cell + j
-			}
-			args[i] = argCells{cells, r.temp}
-		} else {
-			args[i] = argCells{[]Cell{r.cell}, r.temp}
+		cells := make([]Cell, r.intSize)
+		for j := range r.intSize {
+			cells[j] = r.cell + j
 		}
+		args[i] = argCells{cells, r.temp}
 	}
 
 	// Pre-allocate frame slots for defer captures. This must happen before
-	// buildPhases so that all IRStoreFrame/IRLoadFrame use the final frameSize.
+	// buildPhases so that all IRStoreFrame/IRLoadFrame use the final
+	// frameSize. uintN args occupy intSize contiguous slots; the base
+	// slot and size are recorded so the use site can stride correctly.
 	ast.Inspect(info.Body, func(n ast.Node) bool {
 		ds, ok := n.(*ast.DeferStmt)
 		if !ok {
@@ -196,8 +207,10 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 			if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 				continue
 			}
+			intSize := max(l.inferRecExprIntSize(rc, arg), 1)
 			rc.deferCaptureSlots = append(rc.deferCaptureSlots, rc.frameSize)
-			rc.frameSize++
+			rc.deferCaptureSizes = append(rc.deferCaptureSizes, intSize)
+			rc.frameSize += intSize
 		}
 		return true
 	})
@@ -254,12 +267,12 @@ func (l *Lowerer) lowerGeneralRecursion(info *FuncInfo, argExprs []ast.Expr) ([]
 		base := l.allocCells(rc.retSize)
 		for j := range rc.retSize {
 			retCells[j] = base + j
-			l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg + j})
+			l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg[j]})
 		}
 	} else {
 		for j := range rc.retSize {
 			retCells[j] = l.allocCell()
-			l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg + j})
+			l.emit(&IRCopy{Dst: retCells[j], Src: rc.retReg[j]})
 		}
 	}
 
@@ -328,137 +341,84 @@ func (l *Lowerer) rejectComposites(body *ast.BlockStmt) error {
 	return err
 }
 
-// collectIntLocals scans the body for uintN variable declarations
-// (`var x uint16`, `x := uint16(...)`, `b := a` where a is uintN, etc.)
-// and reallocates their frame slots to hold IntSize cells. Returns an
-// error when a `uint64` local is found: the eight-cell layout would
-// span the highway marker at position 32 once `sentinelFwd` is bumped,
-// the same constraint that blocks `uint64` returns.
-func (l *Lowerer) collectIntLocals(rc *recContext, body *ast.BlockStmt) error {
-	seen := make(map[string]bool)
+// inferRecExprIntSize walks an expression tree to determine its integer
+// width in the context of a recursive function frame: 1 for byte/uint8,
+// 2/4 for uint16/uint32 (uint64 is rejected elsewhere), 0 for
+// non-integer expressions. A uintN(...) conversion is N; a local lookup
+// returns its registered intSize; a call to a uintN-returning function
+// picks up the callee's return width; a binary op inherits the wider of
+// its operands.
+func (l *Lowerer) inferRecExprIntSize(rc *recContext, e ast.Expr) int {
+	switch x := e.(type) {
+	case *ast.ParenExpr:
+		return l.inferRecExprIntSize(rc, x.X)
+	case *ast.CallExpr:
+		if fn, ok := x.Fun.(*ast.Ident); ok {
+			if size := intIdentSize(fn.Name); size > 0 {
+				return size
+			}
+			if info, ok := l.result.Funcs[fn.Name]; ok {
+				return info.SingleReturn().IntSize
+			}
+		}
+	case *ast.Ident:
+		if src, ok := rc.locals[x.Name]; ok {
+			return src.intSize
+		}
+	case *ast.UnaryExpr:
+		return l.inferRecExprIntSize(rc, x.X)
+	case *ast.BinaryExpr:
+		return max(l.inferRecExprIntSize(rc, x.X), l.inferRecExprIntSize(rc, x.Y))
+	}
+	return 1
+}
+
+// collectLocals walks the function body once, registering every new
+// local (`:=` LHS, `var` declaration, range key/value, `$switch` tag)
+// into rc.locals with its correct intSize: 1 for byte/uint8, 2/4 for
+// uint16/uint32. uint64 locals are rejected -- the eight-cell layout
+// spans the highway marker at position 32 once `sentinelFwd` is bumped,
+// the same constraint that blocks uint64 returns. Params and named
+// returns are registered by the caller before this runs.
+func (l *Lowerer) collectLocals(rc *recContext, info *FuncInfo) error {
+	paramSet := make(map[string]bool)
+	for _, p := range info.Params {
+		paramSet[p] = true
+	}
 	var firstErr error
 	register := func(name string, intSize int) {
-		if seen[name] || intSize < 2 {
+		if name == "_" || paramSet[name] {
+			return
+		}
+		if _, exists := rc.locals[name]; exists {
 			return
 		}
 		if intSize >= 8 && firstErr == nil {
 			firstErr = fmt.Errorf("uint64 local %s in recursive function is not supported", name)
 			return
 		}
-		seen[name] = true
 		rc.locals[name] = recLocalInfo{slot: rc.frameSize, intSize: intSize}
 		rc.frameSize += intSize
 	}
-	intSizeOf := func(typ ast.Expr) int {
-		if id, ok := typ.(*ast.Ident); ok {
-			return intIdentSize(id.Name)
-		}
-		return 0
-	}
-	// inferExprIntSize walks an expression tree to determine its uintN
-	// width: uintN(...) conversion is N; a uintN local lookup returns
-	// its size; a call to a uintN-returning function picks up the
-	// callee's return width; binary op of two uintN operands inherits
-	// the width.
-	var inferExprIntSize func(e ast.Expr) int
-	inferExprIntSize = func(e ast.Expr) int {
-		switch x := e.(type) {
-		case *ast.ParenExpr:
-			return inferExprIntSize(x.X)
-		case *ast.CallExpr:
-			if fn, ok := x.Fun.(*ast.Ident); ok {
-				if size := intIdentSize(fn.Name); size >= 2 {
-					return size
-				}
-				if info, ok := l.result.Funcs[fn.Name]; ok {
-					if n := info.SingleReturn().IntSize; n >= 2 {
-						return n
-					}
-				}
-			}
-		case *ast.Ident:
-			if src, ok := rc.locals[x.Name]; ok && src.intSize >= 2 {
-				return src.intSize
-			}
-		case *ast.BinaryExpr:
-			if l := inferExprIntSize(x.X); l >= 2 {
-				return l
-			}
-			return inferExprIntSize(x.Y)
-		}
-		return 0
-	}
-	ast.Inspect(body, func(n ast.Node) bool {
+	ast.Inspect(info.Body, func(n ast.Node) bool {
 		if firstErr != nil {
 			return false
 		}
-		if decl, ok := n.(*ast.DeclStmt); ok {
-			if gd, ok := decl.Decl.(*ast.GenDecl); ok {
-				for _, spec := range gd.Specs {
-					if vs, ok := spec.(*ast.ValueSpec); ok {
-						if size := intSizeOf(vs.Type); size >= 2 {
-							for _, name := range vs.Names {
-								register(name.Name, size)
-							}
-						}
+		// Switch tag: the desugared `$switch := tag` happens later in
+		// buildPhases, but the frame slot has to be sized up front. Pick
+		// up the tag's int width here so a uint16/uint32 tag gets the
+		// right number of cells; otherwise mixed-size case literals trip
+		// the cmp size check downstream.
+		if sw, ok := n.(*ast.SwitchStmt); ok {
+			if init, ok := sw.Init.(*ast.AssignStmt); ok && init.Tok == token.DEFINE {
+				for i, lhs := range init.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && i < len(init.Rhs) {
+						register(id.Name, l.inferRecExprIntSize(rc, init.Rhs[i]))
 					}
 				}
 			}
-		}
-		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
-			if id, ok := assign.Lhs[0].(*ast.Ident); ok {
-				if size := inferExprIntSize(assign.Rhs[0]); size >= 2 {
-					register(id.Name, size)
-				}
-			}
-		}
-		// Multi-LHS define from a function call: x, y := f(...). Each
-		// LHS picks up its position's return width from the callee's
-		// ReturnTypes.
-		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE && len(assign.Lhs) > 1 && len(assign.Rhs) == 1 {
-			if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
-				if fn, ok := call.Fun.(*ast.Ident); ok {
-					if info, ok := l.result.Funcs[fn.Name]; ok {
-						for i, lhs := range assign.Lhs {
-							if id, ok := lhs.(*ast.Ident); ok && i < len(info.ReturnTypes) {
-								if size := info.ReturnTypes[i].IntSize; size >= 2 {
-									register(id.Name, size)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		return true
-	})
-	return firstErr
-}
-
-// collectLocals finds all := variable names in the function body that aren't parameters.
-func collectLocals(body *ast.BlockStmt, params []string) []string {
-	paramSet := make(map[string]bool)
-	for _, p := range params {
-		paramSet[p] = true
-	}
-	seen := make(map[string]bool)
-	var locals []string
-	ast.Inspect(body, func(n ast.Node) bool {
-		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
-			for _, lhs := range assign.Lhs {
-				if id, ok := lhs.(*ast.Ident); ok {
-					if id.Name != "_" && !paramSet[id.Name] && !seen[id.Name] {
-						seen[id.Name] = true
-						locals = append(locals, id.Name)
-					}
-				}
-			}
-		}
-		// Switch with tag needs a $switch variable.
-		if sw, ok := n.(*ast.SwitchStmt); ok && sw.Tag != nil {
-			if !seen["$switch"] {
-				seen["$switch"] = true
-				locals = append(locals, "$switch")
+			if sw.Tag != nil {
+				register("$switch", l.inferRecExprIntSize(rc, sw.Tag))
 			}
 		}
 		// Var declarations. Const declarations are skipped: they're
@@ -468,13 +428,41 @@ func collectLocals(body *ast.BlockStmt, params []string) []string {
 			if gd, ok := decl.Decl.(*ast.GenDecl); ok && gd.Tok != token.CONST {
 				for _, spec := range gd.Specs {
 					if vs, ok := spec.(*ast.ValueSpec); ok {
+						size := intTypeSize(vs.Type)
 						for _, name := range vs.Names {
-							if !paramSet[name.Name] && !seen[name.Name] {
-								seen[name.Name] = true
-								locals = append(locals, name.Name)
-							}
+							register(name.Name, size)
 						}
 					}
+				}
+			}
+		}
+		if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+			// Multi-LHS define from a function call: x, y := f(...).
+			// Each LHS picks up its position's return width from the
+			// callee's ReturnTypes.
+			if len(assign.Lhs) > 1 && len(assign.Rhs) == 1 {
+				if call, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+					if fn, ok := call.Fun.(*ast.Ident); ok {
+						if calleeInfo, ok := l.result.Funcs[fn.Name]; ok {
+							for i, lhs := range assign.Lhs {
+								if id, ok := lhs.(*ast.Ident); ok && i < len(calleeInfo.ReturnTypes) {
+									register(id.Name, calleeInfo.ReturnTypes[i].IntSize)
+								}
+							}
+							return true
+						}
+					}
+				}
+				for _, lhs := range assign.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						register(id.Name, 1)
+					}
+				}
+				return true
+			}
+			for i, lhs := range assign.Lhs {
+				if id, ok := lhs.(*ast.Ident); ok {
+					register(id.Name, l.inferRecExprIntSize(rc, assign.Rhs[i]))
 				}
 			}
 		}
@@ -482,24 +470,18 @@ func collectLocals(body *ast.BlockStmt, params []string) []string {
 		if rs, ok := n.(*ast.RangeStmt); ok {
 			if rs.Key != nil {
 				if id, ok := rs.Key.(*ast.Ident); ok {
-					if !paramSet[id.Name] && !seen[id.Name] {
-						seen[id.Name] = true
-						locals = append(locals, id.Name)
-					}
+					register(id.Name, 1)
 				}
 			}
 			if rs.Value != nil {
 				if id, ok := rs.Value.(*ast.Ident); ok {
-					if !paramSet[id.Name] && !seen[id.Name] {
-						seen[id.Name] = true
-						locals = append(locals, id.Name)
-					}
+					register(id.Name, 1)
 				}
 			}
 		}
 		return true
 	})
-	return locals
+	return firstErr
 }
 
 // buildPhases splits the recursive function body into phases.
@@ -548,10 +530,6 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 					Tok: token.DEFINE,
 					Rhs: []ast.Expr{sw.Tag},
 				})
-				if _, exists := rc.locals["$switch"]; !exists {
-					rc.locals["$switch"] = recLocalInfo{slot: rc.frameSize}
-					rc.frameSize++
-				}
 			}
 			tagName := ""
 			if sw.Tag != nil {
@@ -609,13 +587,10 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 				if allocated[name] {
 					continue
 				}
-				intSize := 0
-				if i < len(info.ReturnTypes) && info.ReturnTypes[i].IntSize >= 2 {
-					intSize = info.ReturnTypes[i].IntSize
-				}
+				intSize := info.ReturnTypes[i].IntSize
 				rc.locals[name] = recLocalInfo{slot: base, intSize: intSize}
 				allocated[name] = true
-				base += max(intSize, 1)
+				base += intSize
 				moved = true
 			}
 			if moved {
@@ -641,7 +616,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 		prevSlot := rc.locals[callSites[i-1].resultVars[0]].slot
 		var loadRet []IRNode
 		for j := range rc.retSize {
-			loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg + j, FrameSize: rc.frameSize})
+			loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg[j], FrameSize: rc.frameSize})
 		}
 		phase.Nodes = append(loadRet, phase.Nodes...)
 		rc.phases = append(rc.phases, phase)
@@ -662,7 +637,7 @@ func (l *Lowerer) buildPhases(rc *recContext, info *FuncInfo) error {
 	prevSlot := rc.locals[lastCallSite.resultVars[0]].slot
 	var loadRet []IRNode
 	for j := range rc.retSize {
-		loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg + j, FrameSize: rc.frameSize})
+		loadRet = append(loadRet, &IRStoreFrame{Slot: prevSlot + j, Src: rc.retReg[j], FrameSize: rc.frameSize})
 	}
 	finalPhase.Nodes = append(loadRet, finalPhase.Nodes...)
 	rc.phases = append(rc.phases, finalPhase)
@@ -751,8 +726,8 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 	if ret, ok := stmt.(*ast.ReturnStmt); ok && len(ret.Results) == 1 {
 		if call, isCall := ret.Results[0].(*ast.CallExpr); isCall && len(calls) == 1 && call == calls[0] {
 			if _, exists := rc.locals["$tailret"]; !exists {
-				rc.locals["$tailret"] = recLocalInfo{slot: rc.frameSize}
-				rc.frameSize++
+				rc.locals["$tailret"] = recLocalInfo{slot: rc.frameSize, intSize: rc.retIntSize}
+				rc.frameSize += rc.retIntSize
 			}
 			return []recCallSite{{
 					argExprs:   calls[0].Args,
@@ -787,7 +762,7 @@ func processRecStmt(stmt ast.Stmt, calls []*ast.CallExpr, rc *recContext, preStm
 	if expr, ok := stmt.(*ast.ExprStmt); ok {
 		if _, isCall := expr.X.(*ast.CallExpr); isCall && len(calls) == 1 {
 			if _, exists := rc.locals["$void"]; !exists {
-				rc.locals["$void"] = recLocalInfo{slot: rc.frameSize}
+				rc.locals["$void"] = recLocalInfo{slot: rc.frameSize, intSize: 1}
 				rc.frameSize++
 			}
 			return []recCallSite{{
@@ -915,7 +890,7 @@ func flattenIfBothRec(ifStmt *ast.IfStmt, rc *recContext, preStmts, restStmts []
 	// Allocate frame variable for the condition.
 	condVar := fmt.Sprintf("$ifcond_%d", rc.frameSize)
 	if _, exists := rc.locals[condVar]; !exists {
-		rc.locals[condVar] = recLocalInfo{slot: rc.frameSize}
+		rc.locals[condVar] = recLocalInfo{slot: rc.frameSize, intSize: 1}
 		rc.frameSize++
 	}
 
@@ -1051,8 +1026,8 @@ func extractRecCalls(expr ast.Expr, rc *recContext) ([]extractedCall, ast.Expr) 
 				tmpName := fmt.Sprintf("$recursive_%d", counter)
 				counter++
 				if _, exists := rc.locals[tmpName]; !exists {
-					rc.locals[tmpName] = recLocalInfo{slot: rc.frameSize}
-					rc.frameSize++
+					rc.locals[tmpName] = recLocalInfo{slot: rc.frameSize, intSize: rc.retIntSize}
+					rc.frameSize += rc.retIntSize
 				}
 				extracted = append(extracted, extractedCall{
 					call:    &ast.CallExpr{Fun: call.Fun, Args: newArgs},
@@ -1175,18 +1150,14 @@ func (l *Lowerer) buildRecPhaseWithCall(rc *recContext, stmts []ast.Stmt, call r
 			return nil, err
 		}
 		intSize := info.ParamTypes[i].IntSize
-		if intSize >= 2 {
-			if r.intSize < intSize {
-				r = rl.widenIntegerLiteral(r, intSize)
-			}
-			cells := make([]Cell, intSize)
-			for j := range intSize {
-				cells[j] = r.cell + j
-			}
-			argVals[i] = argValue{cells}
-		} else {
-			argVals[i] = argValue{[]Cell{r.cell}}
+		if r.intSize < intSize {
+			r = rl.widenIntegerLiteral(r, intSize)
 		}
+		cells := make([]Cell, r.intSize)
+		for j := range r.intSize {
+			cells[j] = r.cell + j
+		}
+		argVals[i] = argValue{cells}
 	}
 
 	// Store all modified locals back to the frame before pushing child.
@@ -1306,7 +1277,7 @@ func (rl *recLowerer) lookupVar(name string) (Cell, error) {
 	if reg, ok := rl.loadedMap[slot]; ok {
 		return reg, nil
 	}
-	if info.intSize >= 2 {
+	if info.intSize > 1 {
 		base := rl.allocCells(info.intSize)
 		rl.loadFrame(base, slot, info.intSize)
 		rl.loadedMap[slot] = base
@@ -1322,7 +1293,7 @@ func (rl *recLowerer) lookupVar(name string) (Cell, error) {
 // cell; uint16/uint32 locals occupy intSize contiguous cells.
 func (rl *recLowerer) slotSize(slot int) int {
 	for _, info := range rl.rc.locals {
-		if info.slot == slot && info.intSize >= 2 {
+		if info.slot == slot && info.intSize > 0 {
 			return info.intSize
 		}
 	}
@@ -1471,14 +1442,16 @@ func (rl *recLowerer) inlineCallInRec(info *FuncInfo, args []ast.Expr) ([]Cell, 
 		if err != nil {
 			return nil, err
 		}
+		if intSize := info.ParamTypes[i].IntSize; r.intSize < intSize {
+			r = rl.widenIntegerLiteral(r, intSize)
+		}
 		results[i] = r
 	}
 	rl.pushScope()
 	defer rl.popScope()
 	sc := rl.currentScope()
 	for j, name := range info.Params {
-		intSize := info.ParamTypes[j].IntSize
-		if intSize >= 2 {
+		if intSize := info.ParamTypes[j].IntSize; intSize > 1 {
 			base := rl.allocCells(intSize)
 			for k := range intSize {
 				rl.emit(&IRCopy{Dst: base + k, Src: results[j].cell + k})
@@ -1507,6 +1480,7 @@ func (rl *recLowerer) runInlinedFunc(info *FuncInfo, retCells []Cell, body func(
 	savedRetDst := rl.returnDst
 	savedRetFlag := rl.returnFlag
 	savedInFunc := rl.inFunc
+	savedCurFunc := rl.curFunc
 	defer func() {
 		if rl.returnFlag != 0 {
 			rl.freeCell(rl.returnFlag)
@@ -1514,6 +1488,7 @@ func (rl *recLowerer) runInlinedFunc(info *FuncInfo, retCells []Cell, body func(
 		rl.returnDst = savedRetDst
 		rl.returnFlag = savedRetFlag
 		rl.inFunc = savedInFunc
+		rl.curFunc = savedCurFunc
 	}()
 	rl.returnDst = retCells
 	if hasReturn(info.Body) {
@@ -1523,6 +1498,7 @@ func (rl *recLowerer) runInlinedFunc(info *FuncInfo, retCells []Cell, body func(
 		rl.returnFlag = 0
 	}
 	rl.inFunc = true
+	rl.curFunc = info
 	return body()
 }
 
@@ -1551,7 +1527,7 @@ func (rl *recLowerer) lowerDecl(s *ast.DeclStmt) error {
 				}
 				rl.emitCopyOrMove(cell, r)
 			} else {
-				size := max(rl.rc.locals[name.Name].intSize, 1)
+				size := rl.rc.locals[name.Name].intSize
 				for j := range size {
 					rl.emit(&IRZero{Dst: cell + j})
 				}
@@ -1571,25 +1547,38 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 		}
 	}
 
-	// Multi-return: q, r := divmod(a, b)
+	// Multi-return: q, r := divmod(a, b). retCells is a flat slice of
+	// info.Returns cells laid out per ReturnSizes -- a (uint16, byte)
+	// return is three cells. Stride through by ReturnSizes when copying
+	// into each LHS slot, and copy intSize cells for uintN returns
+	// (IRMove moves one byte).
 	if len(s.Lhs) > 1 && len(s.Rhs) == 1 {
 		if call, ok := s.Rhs[0].(*ast.CallExpr); ok {
 			if fn, ok := call.Fun.(*ast.Ident); ok {
-				if info, ok := rl.result.Funcs[fn.Name]; ok && info.Returns == len(s.Lhs) && !info.IsRecursive {
+				if info, ok := rl.result.Funcs[fn.Name]; ok && len(info.ReturnTypes) == len(s.Lhs) && !info.IsRecursive {
 					retCells, err := rl.inlineCallInRec(info, call.Args)
 					if err != nil {
 						return err
 					}
+					off := 0
 					for i, lhs := range s.Lhs {
+						size := info.ReturnSizes[i]
 						id, ok := lhs.(*ast.Ident)
 						if !ok {
 							return fmt.Errorf("unsupported multi-return target in recursive function")
+						}
+						if id.Name == "_" {
+							off += size
+							continue
 						}
 						cell, err := rl.lookupVar(id.Name)
 						if err != nil {
 							return err
 						}
-						rl.emit(&IRMove{Dst: cell, Src: retCells[i]})
+						for k := range size {
+							rl.emit(&IRMove{Dst: cell + k, Src: retCells[off+k]})
+						}
+						off += size
 					}
 					return nil
 				}
@@ -1659,7 +1648,7 @@ func (rl *recLowerer) lowerIncDec(s *ast.IncDecStmt) error {
 	if err != nil {
 		return err
 	}
-	if li := rl.rc.locals[id.Name]; li.intSize >= 2 {
+	if li := rl.rc.locals[id.Name]; li.intSize > 1 {
 		if s.Tok == token.INC {
 			rl.emitIncInt(cell, li.intSize)
 		} else {
@@ -1996,18 +1985,26 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 			if r.intSize < n {
 				r = rl.widenIntegerLiteral(r, n)
 			}
-			if n >= 2 {
+			if n > 1 {
 				if r.intSize != n {
 					return fmt.Errorf("intSize mismatch in return value %d: got %d, want %d", i, r.intSize, n)
 				}
+				// Use IRCopy when the source isn't a temp (e.g., a param
+				// or local referenced in the return list); IRMove would
+				// destroy it and subsequent returns reading the same
+				// source would see zero.
 				for j := range n {
-					rl.emit(&IRMove{Dst: rl.rc.retReg + off + j, Src: r.cell + j})
+					if r.temp {
+						rl.emit(&IRMove{Dst: rl.rc.retReg[off+j], Src: r.cell + j})
+					} else {
+						rl.emit(&IRCopy{Dst: rl.rc.retReg[off+j], Src: r.cell + j})
+					}
 				}
 				if r.temp {
 					rl.freeCellRange(r.cell, n)
 				}
 			} else {
-				rl.emitCopyOrMove(rl.rc.retReg+off, r)
+				rl.emitCopyOrMove(rl.rc.retReg[off], r)
 			}
 			off += n
 		}
@@ -2026,7 +2023,7 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 				return fmt.Errorf("intSize mismatch in return: got %d, want %d", r.intSize, rl.rc.retSize)
 			}
 			for j := range rl.rc.retSize {
-				rl.emit(&IRMove{Dst: rl.rc.retReg + j, Src: r.cell + j})
+				rl.emit(&IRMove{Dst: rl.rc.retReg[j], Src: r.cell + j})
 			}
 			if r.temp {
 				rl.freeCellRange(r.cell, rl.rc.retSize)
@@ -2036,7 +2033,7 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 			if err != nil {
 				return err
 			}
-			rl.emitCopyOrMove(rl.rc.retReg, r)
+			rl.emitCopyOrMove(rl.rc.retReg[0], r)
 		}
 	} else if len(rl.rc.returnNames) > 0 {
 		// Bare return with named return values: store cached cells to
@@ -2047,17 +2044,17 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 		for _, name := range rl.rc.returnNames {
 			li := rl.rc.locals[name]
 			if reg, ok := rl.loadedMap[li.slot]; ok {
-				rl.storeFrame(li.slot, reg, max(li.intSize, 1))
+				rl.storeFrame(li.slot, reg, li.intSize)
 			}
 		}
 		off := 0
 		for _, name := range rl.rc.returnNames {
 			li := rl.rc.locals[name]
-			size := max(li.intSize, 1)
+			size := li.intSize
 			for j := range size {
 				cell := rl.allocCell()
 				rl.loadFrame(cell, li.slot+j, 1)
-				rl.emit(&IRMove{Dst: rl.rc.retReg + off + j, Src: cell})
+				rl.emit(&IRMove{Dst: rl.rc.retReg[off+j], Src: cell})
 				rl.freeCell(cell)
 			}
 			off += size
@@ -2087,19 +2084,27 @@ func (rl *recLowerer) lowerDefer(s *ast.DeferStmt) error {
 	// Capture non-string args into pre-allocated frame slots. (Slots are
 	// outside rc.locals so storeAllLocals won't overwrite them.) String
 	// literals are emitted directly at replay time, no capture needed.
-	var slots []int
+	// uintN args occupy intSize contiguous frame slots.
+	type captured struct {
+		slot, size int
+	}
+	var caps []captured
 	for _, arg := range s.Call.Args {
 		if lit, ok := arg.(*ast.BasicLit); ok && lit.Kind == token.STRING {
 			continue
 		}
-		slot := rl.rc.deferCaptureSlots[rl.rc.deferCaptureIdx]
+		idx := rl.rc.deferCaptureIdx
+		slot := rl.rc.deferCaptureSlots[idx]
+		size := rl.rc.deferCaptureSizes[idx]
 		rl.rc.deferCaptureIdx++
 		r, err := rl.lowerExpr(arg)
 		if err != nil {
 			return err
 		}
-		rl.emit(&IRStoreFrame{Slot: slot, Src: r.cell, FrameSize: rl.rc.frameSize})
-		slots = append(slots, slot)
+		for k := range size {
+			rl.emit(&IRStoreFrame{Slot: slot + k, Src: r.cell + k, FrameSize: rl.rc.frameSize})
+		}
+		caps = append(caps, captured{slot: slot, size: size})
 	}
 
 	// Replay block: bind each captured frame slot to a synthetic name in
@@ -2116,7 +2121,7 @@ func (rl *recLowerer) lowerDefer(s *ast.DeferStmt) error {
 				continue
 			}
 			name := fmt.Sprintf("$defer_arg_%d", ci+1)
-			rl.rc.locals[name] = recLocalInfo{slot: slots[ci]}
+			rl.rc.locals[name] = recLocalInfo{slot: caps[ci].slot, intSize: caps[ci].size}
 			addedNames = append(addedNames, name)
 			replayArgs = append(replayArgs, ast.NewIdent(name))
 			ci++
@@ -2163,10 +2168,10 @@ func (rl *recLowerer) lowerExpr(expr ast.Expr) (exprResult, error) {
 			if err != nil {
 				return exprResult{}, err
 			}
-			if li.intSize >= 2 {
+			if li.intSize > 1 {
 				return exprResult{cell: cell, exprShape: exprShape{size: li.intSize, intSize: li.intSize}}, nil
 			}
-			return exprResult{cell: cell}, nil
+			return exprResult{cell: cell, exprShape: exprShape{intSize: 1}}, nil
 		}
 		return rl.lowerIdent(e, rl.lookupVar)
 	case *ast.ParenExpr:
@@ -2194,8 +2199,7 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 			if err != nil {
 				return exprResult{}, err
 			}
-			ri := info.SingleReturn()
-			if ri.IntSize >= 2 {
+			if ri := info.SingleReturn(); ri.IntSize > 1 {
 				// Multi-cell uintN return: cells must be contiguous so
 				// downstream consumers can index base+k.
 				return exprResult{cell: retCells[0], temp: true,
@@ -2204,7 +2208,7 @@ func (rl *recLowerer) lowerCallExpr(e *ast.CallExpr) (exprResult, error) {
 			for i := 1; i < len(retCells); i++ {
 				rl.freeCell(retCells[i])
 			}
-			return exprResult{cell: retCells[0], temp: true}, nil
+			return exprResult{cell: retCells[0], temp: true, exprShape: exprShape{intSize: 1}}, nil
 		}
 		if ok && info.Returns == 0 {
 			return exprResult{}, fmt.Errorf("function %s has no return value", fn.Name)

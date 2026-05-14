@@ -91,7 +91,7 @@ The shape entry points compose:
   static info into a shape.
 
 `defineFromShape(sc, name, sh)` then dispatches on the shape: matches
-pointer-to-uintN (`isPointer && intSize >= 2`), `intSize >= 2`,
+pointer-to-uintN (`isPointer && intSize > 1`), `intSize > 1`,
 pointer-to-struct (`isPointer && structType != ""`), pointer-to-array
 (`isPointer && elemCount > 0`), slice (`isPointer`), struct array,
 byte array, struct, or byte default. This single dispatch replaces
@@ -183,10 +183,12 @@ alone. `FieldInfo`'s shape fields cover all field type combinations:
 
 - `Offset` -- cell offset within the struct.
 - `StructType` -- non-empty for struct-typed fields.
-- `IntSize` -- `>=2` for uintN fields.
-- `IsString` -- true for `string` and `[]byte` fields (byte-element
-  3-cell slice; the same byte-slice machinery handles both).
-- `IsSlice` -- true for any slice-typed field.
+- `IntSize` -- integer width of the field: `1` for byte/uint8, `2`/`4`/`8`
+  for uintN, `0` for non-integer fields.
+- `IsSlice` -- true for any slice-typed field. The `IsString()`
+  method is derived from `IsSlice && ElemIntSize == 1`, picking up
+  both `string` and `[]byte` fields (byte-element 3-cell slice;
+  the same byte-slice machinery handles both).
 - `ElemCount`, `ElemSize`, `ElemType`, `ElemIntSize`, `ElemSlice`
   -- element layout for array and slice fields (a field is at most
   one of array/slice, so these names are shared). `ElemCount > 0`
@@ -757,11 +759,16 @@ in little-endian order (low byte at `cell`, high byte at
 and `uint64` uses 8. All operations are decomposed into
 byte-level IR at lowering time -- no codegen changes needed.
 
-`exprResult.intSize` tracks the integer width (2, 4, or 8).
-`lowerBinary` checks `intSize` and dispatches to
-`lowerBinaryInt` for all multi-byte operations. uint16,
-uint32, and uint64 share the same generalized N-byte code
-paths.
+`exprResult.intSize` tracks the integer width: `1` for byte/uint8,
+`2`/`4`/`8` for uintN, `0` for non-integer results. Every byte
+producer (literals, idents, calls, indexes, struct fields, binary
+ops, etc.) is required to set `intSize: 1` -- this lets `uintN(...)`
+conversions take the zero-extend path uniformly, and lets cleanup
+paths like `freeCellRange(r.cell, r.intSize)` drop the right cell
+count without a `max(_, 1)` guard. `lowerBinary` checks `intSize > 1`
+and dispatches to `lowerBinaryInt` for all multi-byte operations;
+byte stays on the single-cell scalar path. uint16, uint32, and
+uint64 share the same generalized N-byte code paths.
 
 Integer literals are automatically widened to match the surrounding
 `uintN` context. `widenIntegerLiteral` recognises a `BasicLit`
@@ -938,9 +945,12 @@ For slices, the same pattern applies but uses
 `append`, `make`, range, and slice-literal init all use
 the `elemSize`-stride that was already in place for
 struct slices; multi-byte int slices are just the
-struct-slice path with `elemIntSize > 0` triggering a
+struct-slice path with `elemIntSize > 1` triggering a
 materialization step at the read boundary so the result
 is typed as a `uintN` rather than a 2/4/8-byte sub-array.
+(Byte-element slices carry `elemIntSize = 1`, matching
+the new uniform "integer width" convention but staying on
+the single-cell read path.)
 
 ### Nested composites
 

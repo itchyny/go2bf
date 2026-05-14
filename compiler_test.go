@@ -47,6 +47,16 @@ func main() {
 			"", "H",
 		},
 		{
+			"putchar byte struct field",
+			`package main
+type P struct{ n uint16; tag byte }
+func main() {
+	p := P{n: 100, tag: 65}
+	putchar(p.tag)
+}`,
+			"", "A",
+		},
+		{
 			"getchar",
 			`package main
 func main() {
@@ -1764,6 +1774,26 @@ func main() {
 			"", "5 1000 100000\n",
 		},
 		{
+			"uint16 of a byte-returning function call widens correctly",
+			`package main
+func count() byte { return 200 }
+func main() { println(uint16(count())) }`,
+			"", "200\n",
+		},
+		{
+			"uint16 of various byte-source forms widens correctly",
+			`package main
+type R struct{ v byte }
+type P struct{ x byte }
+func main() {
+	a := [3]byte{10, 20, 250}
+	p := P{x: 100}
+	s := [2]R{{v: 50}, {v: 99}}
+	println(uint16(a[2]) * 2, uint16(p.x) * 3, uint16(s[1].v) * 4)
+}`,
+			"", "500 300 396\n",
+		},
+		{
 			"named returns with mixed widths",
 			`package main
 func split(n uint16) (lo byte, hi uint16) {
@@ -3459,6 +3489,23 @@ func main() { print(f(5)) }`,
 			"", "3",
 		},
 		{
+			"switch with tag wider than byte in recursive function",
+			`package main
+func f(n uint16) byte {
+	if n == 0 { return 0 }
+	switch n {
+	case 100:
+		return 1
+	case 300:
+		return 2
+	default:
+		return f(n - 1)
+	}
+}
+func main() { println(f(300)) }`,
+			"", "2\n",
+		},
+		{
 			"named return in recursive function",
 			`package main
 func f(n byte) (r byte) {
@@ -3797,6 +3844,104 @@ func main() {
 			"", "8 1056\n",
 		},
 		{
+			"general rec multi-return three uint16 spans algo-temp",
+			`package main
+func three(n byte) (uint16, uint16, uint16) {
+	if n == 0 { return 100, 200, 300 }
+	a, b, c := three(n - 1)
+	return a + 1, b + 10, c + 100
+}
+func main() { println(three(2)) }`,
+			"", "102 220 500\n",
+		},
+		{
+			"general rec multi-return shares non-temp source",
+			`package main
+func f(n byte, x uint16) (uint16, uint16) {
+	if n == 0 { return x, x }
+	a, b := f(n-1, x)
+	return a, b
+}
+func main() { println(f(2, 13)) }`,
+			"", "13 13\n",
+		},
+		{
+			"multi-return spread feeding a recursive function",
+			`package main
+func three() (uint16, uint16, uint16) { return 100, 200, 300 }
+func consume(a, b, c uint16) (uint16, uint16, uint16) {
+	if a == 0 { return 0, 0, 0 }
+	x, y, z := consume(a-1, b, c)
+	return x + 1, y + 1, z + 1
+}
+func main() { println(consume(three())) }`,
+			"", "100 100 100\n",
+		},
+		{
+			"general rec uint16 local initialized from unary expression",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return 100 }
+	a := ^uint16(n)
+	r := f(n - 1)
+	mask := uint16(0xFF)
+	return r + (a & mask)
+}
+func main() {
+	for i := byte(0); i < 5; i++ { println(f(i)) }
+}`,
+			"", "100\n354\n607\n859\n1110\n",
+		},
+		{
+			"general rec inline-call with literal widened to uintN param",
+			`package main
+func add(a, b uint16) uint16 { return a + b }
+func mul(a, b uint16) uint16 { return a * b }
+func f(n byte) uint16 {
+	if n == 0 { return 1 }
+	r := f(n - 1)
+	return add(r, mul(uint16(n), 3))
+}
+func main() {
+	for i := byte(0); i < 5; i++ { println(f(i)) }
+}`,
+			"", "1\n4\n10\n19\n31\n",
+		},
+		{
+			"general rec with uint16 tail-style return inside branch",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return 1000 }
+	if n == 1 { return f(n - 1) }
+	return f(n-1) + uint16(n)
+}
+func main() {
+	for i := byte(0); i < 5; i++ { println(f(i)) }
+}`,
+			"", "1000\n1000\n1002\n1005\n1009\n",
+		},
+		{
+			"general rec mixed-width multi-return assigned inside body",
+			`package main
+func split(n byte) (uint16, byte) { return uint16(n) * 1000, n + 1 }
+func f(n byte) byte {
+	if n == 0 { return 99 }
+	a, b := split(n)
+	switch a {
+	case 1000:
+		return b
+	case 2000:
+		return b * 2
+	default:
+		return f(n - 1)
+	}
+}
+func main() {
+	for i := byte(0); i < 5; i++ { println(f(i)) }
+}`,
+			"", "99\n2\n6\n6\n6\n",
+		},
+		{
 			"switch with tag in recursive function",
 			`package main
 func f(n byte) byte {
@@ -3894,6 +4039,27 @@ func f(n byte) byte {
 }
 func main() { print(f(4)) }`,
 			"", "14",
+		},
+		{
+			"recursive switch with uint16 init-defined tag",
+			`package main
+func f(n byte) byte {
+	if n == 0 { return 99 }
+	switch x := uint16(n) * 100; x {
+	case 100:
+		return 1
+	case 200:
+		return 2
+	case 65535:
+		return 3
+	default:
+		return f(n-1)
+	}
+}
+func main() {
+	for i := byte(0); i < 5; i++ { println(f(i)) }
+}`,
+			"", "99\n1\n2\n2\n2\n",
 		},
 		{
 			"uint16 local in recursive function",
@@ -4350,6 +4516,31 @@ func main() { print(f(3)) }`,
 			"", "1 2\n2 4\n3 6\n6",
 		},
 		{
+			"defer with uint16 arg in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return 0 }
+	x := uint16(n) * 100
+	defer println(n, x)
+	return f(n - 1) + x
+}
+func main() { println(f(3)) }`,
+			"", "1 100\n2 200\n3 300\n600\n",
+		},
+		{
+			"defer with mixed-width args in recursive function",
+			`package main
+func f(n byte) uint16 {
+	if n == 0 { return 0 }
+	a := uint16(n) * 1000
+	b := byte(n) + 50
+	defer println(a, b, n, a+uint16(n))
+	return f(n - 1) + a
+}
+func main() { println(f(3)) }`,
+			"", "1000 51 1 1001\n2000 52 2 2002\n3000 53 3 3003\n6000\n",
+		},
+		{
 			"defer in tail-recursive function",
 			`package main
 func f(n byte) byte {
@@ -4396,6 +4587,68 @@ func main() {
 const n = 42
 func main() { println(n) }`,
 			"", "42\n",
+		},
+		{
+			"untyped const promoted to uint16",
+			`package main
+const n = 300
+func main() { println(n) }`,
+			"", "300\n",
+		},
+		{
+			"char literal widened into uint16 struct field",
+			`package main
+type Box struct { v uint16 }
+func main() {
+	other := uint16(0xABCD)
+	var b Box
+	b.v = 'A'
+	println(b.v)
+	println(other)
+}`,
+			"", "65\n43981\n",
+		},
+		{
+			"char literal widened into uint16 array element",
+			`package main
+func main() {
+	other := uint16(0xABCD)
+	var arr [3]uint16
+	arr[0] = 'A'
+	arr[1] = 'B'
+	arr[2] = 'C'
+	println(arr[0], arr[1], arr[2], other)
+}`,
+			"", "65 66 67 43981\n",
+		},
+		{
+			"char literal widened into uint16 return position",
+			`package main
+func get(k byte) uint16 {
+	if k == 0 { return 'A' }
+	if k == 1 { return 'B' }
+	return 'Z'
+}
+func main() {
+	other := uint16(0xABCD)
+	for i := byte(0); i < 3; i++ { println(get(i)) }
+	println(other)
+}`,
+			"", "65\n66\n90\n43981\n",
+		},
+		{
+			"byte-fitting untyped const widened into uint16 field",
+			`package main
+const X = 5
+type Box struct { v uint16 }
+func main() {
+	other := uint16(0xABCD)
+	var b Box
+	b.v = X
+	println(b.v)
+	println(other)
+}`,
+			"", "5\n43981\n",
 		},
 		{
 			"const in array size",
@@ -5459,6 +5712,37 @@ func main() {
 			"", "1 10\n2 11\n3 12\n",
 		},
 		{
+			"2d array of size-1 struct field write and read",
+			`package main
+type Cell struct { v byte }
+func main() {
+	var grid [2][2]Cell
+	grid[0][0].v = 1
+	grid[0][1].v = 2
+	grid[1][0].v = 3
+	grid[1][1].v = 4
+	for i := byte(0); i < 2; i++ {
+		for j := byte(0); j < 2; j++ {
+			println(grid[i][j].v)
+		}
+	}
+}`,
+			"", "1\n2\n3\n4\n",
+		},
+		{
+			"1d array of size-1 struct field assignment",
+			`package main
+type Cell struct { v byte }
+func main() {
+	var row [3]Cell
+	row[0].v = 10
+	row[1].v = 20
+	row[2].v = 30
+	println(row[0].v, row[1].v, row[2].v)
+}`,
+			"", "10 20 30\n",
+		},
+		{
 			"array of structs variable index inc/dec on uint16 field",
 			`package main
 type R struct{ v uint16 }
@@ -6132,6 +6416,26 @@ func main() {
 	}
 }`,
 			"", "500 1\n999 2\n",
+		},
+		{
+			"slice of struct field write preserves non-temp source",
+			`package main
+type R struct {
+	tag byte
+	v   uint32
+}
+func main() {
+	s := []R{{tag: 0, v: 0}, {tag: 0, v: 0}}
+	x := byte(42)
+	y := uint32(100000)
+	s[0].tag = x
+	s[1].tag = x
+	s[0].v = y
+	s[1].v = y
+	println(s[0].tag, s[1].tag, x)
+	println(s[0].v, s[1].v, y)
+}`,
+			"", "42 42 42\n100000 100000 100000\n",
 		},
 		{
 			"slice of structs field inc",
@@ -6985,6 +7289,63 @@ func main() {
 	for _, v := range f() { print(v); print(" ") }
 }`,
 			"", "3\n10 20 30 ",
+		},
+		{
+			"pointer to struct array return",
+			`package main
+type P struct { v byte }
+func f() *[2]P {
+	a := [2]P{{v: 10}, {v: 20}}
+	return &a
+}
+func main() {
+	p := f()
+	print(p[0].v); print(byte(' '))
+	print(p[1].v)
+	println()
+}`,
+			"", "103220\n",
+		},
+		{
+			"pointer to struct array param",
+			`package main
+type P struct { v byte }
+func sum(arr *[3]P) byte {
+	var s byte
+	for i := 0; i < 3; i++ { s += arr[i].v }
+	return s
+}
+func main() {
+	a := [3]P{{v: 10}, {v: 20}, {v: 30}}
+	print(sum(&a))
+}`,
+			"", "60",
+		},
+		{
+			"slice of slices return",
+			`package main
+func f() [][]byte { return [][]byte{{'a','b'}, {'c'}} }
+func main() {
+	xs := f()
+	for i := 0; i < len(xs); i++ {
+		for j := 0; j < len(xs[i]); j++ { putchar(xs[i][j]) }
+		putchar('\n')
+	}
+}`,
+			"", "ab\nc\n",
+		},
+		{
+			"slice of fixed arrays return",
+			`package main
+func f() [][3]byte { return [][3]byte{{1,2,3},{4,5,6}} }
+func main() {
+	xs := f()
+	for i := 0; i < len(xs); i++ {
+		for j := 0; j < 3; j++ { print(xs[i][j]); print(byte(' ')) }
+	}
+	println()
+}`,
+			"", "132232332432532632\n",
 		},
 		{
 			"slice nil comparison",
@@ -9486,6 +9847,18 @@ func main() {
 			"", "foo\nbar\n",
 		},
 		{
+			"struct with []string field",
+			`package main
+type S struct { items []string }
+func main() {
+	s := S{items: []string{"alpha", "beta", "gamma"}}
+	for i := 0; i < len(s.items); i++ {
+		println(s.items[i])
+	}
+}`,
+			"", "alpha\nbeta\ngamma\n",
+		},
+		{
 			"slice string field",
 			`package main
 type P struct { name string }
@@ -9867,6 +10240,27 @@ func main() {
 	printArr(a)
 }`,
 			"", "alpha\nbeta\ngamma\n",
+		},
+		{
+			"array of byte slices function parameter",
+			`package main
+func sum(p [3][]byte) byte {
+	var s byte
+	for i := 0; i < 3; i++ {
+		for j := 0; j < len(p[i]); j++ {
+			s += p[i][j]
+		}
+	}
+	return s
+}
+func main() {
+	var a [3][]byte
+	a[0] = []byte{1, 2}
+	a[1] = []byte{3, 4, 5}
+	a[2] = []byte{6}
+	print(sum(a))
+}`,
+			"", "21",
 		},
 		{
 			"array of byte slices",
@@ -10782,6 +11176,13 @@ func main() { _ = f() }`,
 			"input.go:2:10: zero-length arrays are not supported",
 		},
 		{
+			"zero-length array param",
+			`package main
+func f(p [0]byte) {}
+func main() { var a [0]byte; f(a) }`,
+			"input.go:2:10: zero-length arrays are not supported",
+		},
+		{
 			"zero-length array via const",
 			`package main
 const N = 0
@@ -11037,6 +11438,17 @@ func f(p P, n byte) byte {
 }
 func main() { print(f(P{1, 2}, 2)) }`,
 			"struct parameter p in recursive function f is not supported",
+		},
+		{
+			"recursive method on struct receiver",
+			`package main
+type Counter struct { val byte }
+func (c Counter) sum(n byte) uint16 {
+	if n == 0 { return uint16(c.val) }
+	return c.sum(n-1) + uint16(n)
+}
+func main() { print(Counter{val: 5}.sum(3)) }`,
+			"struct parameter c in recursive function Counter.sum is not supported",
 		},
 		{
 			"array param in recursive function",
@@ -11491,6 +11903,21 @@ func main() {}`,
 			"const x: modulo by zero in constant expression",
 		},
 		{
+			"const with unsupported unary expression",
+			`package main
+const x byte = +5
+func main() {}`,
+			"const x: unsupported constant expression",
+		},
+		{
+			"duplicate struct type",
+			`package main
+type P struct{ x byte }
+type P struct{ y byte }
+func main() {}`,
+			"duplicate type: P",
+		},
+		{
 			"unknown struct field",
 			`package main
 type Point struct { x byte; y byte }
@@ -11499,6 +11926,33 @@ func main() {
 	print(p.z)
 }`,
 			"unknown field z in struct Point",
+		},
+		{
+			"slice field with unknown element ident",
+			`package main
+type S struct{ f []T }
+func main() { var s S; _ = s }`,
+			"unknown field type: T",
+		},
+		{
+			"slice field with unsupported element shape",
+			`package main
+type Foo struct{ v byte }
+type S struct{ f []*Foo }
+func main() { var s S; _ = s }`,
+			"unknown field type: *Foo",
+		},
+		{
+			"wider int in slice literal",
+			`package main
+func main() { a := []uint16{uint32(1000)}; _ = a }`,
+			"cannot use uint32 value in []uint16 literal, use explicit conversion",
+		},
+		{
+			"wider int in array literal",
+			`package main
+func main() { a := [1]uint16{uint32(1000)}; _ = a }`,
+			"cannot use uint32 value in []uint16 literal, use explicit conversion",
 		},
 		{
 			"struct argument undefined",

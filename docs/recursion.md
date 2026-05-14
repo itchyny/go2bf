@@ -221,6 +221,14 @@ else { return f(n-1) + f(n-2) }
 The resulting if-else chain is then handled by the existing
 if-branch flattening machinery.
 
+When the switch has an init clause (`switch x := expr(); x { ... }`),
+`collectLocals` walks the init's defined locals **before** inferring
+the tag's `intSize`. Without this ordering, the tag's intSize lookup
+sees no entry for `x` (the assign in `sw.Init` hasn't been visited
+yet at the time the outer SwitchStmt handler runs) and falls back to
+byte, which then breaks any case literal that requires wider
+comparison.
+
 ## Loops in Recursive Functions
 
 `for` and `range` loops work inside recursive function phases.
@@ -263,9 +271,18 @@ reserved as interleaved algo-temp slots; see
 | Position | Purpose |
 | -------- | ------- |
 | 25 | `activeReg` - recursion depth counter |
-| 26..26+retSize-1 | `retReg` - return value transfer |
+| 26 onward | `retReg` - return value transfer (one position per return cell) |
 | next 4 (bitwise only) | `genDispatch`'s working state (`phase`, `pr`, `flag`, `activeTemp`) |
 | then onward | available for phase code (`noRetFlag`, `condVar`, etc.) |
+
+`retReg` is a slice of `retSize` cells, each placed at the next
+phase-temp position that is neither a highway marker nor a codegen-
+reserved algo-temp (the slots just below each highway marker; see
+[`tape.md`](tape.md)). For small `retSize` the cells are contiguous;
+once `retSize` reaches 6 the layout straddles the algo-temp at
+position 31, so the sixth cell shifts to position 33. Without this
+skip the return value's high byte would land on an algo-temp position
+and be silently overwritten by `storeToStack`'s scratch.
 
 `genDispatch`'s 4 working-state cells normally come from the codegen's
 algo-temp pool, close to the registers so frame loads in phase code
@@ -304,16 +321,24 @@ frame slots. Before each `return` (and frame pop), the deferred IR
 blocks are emitted in LIFO order.
 
 Only `putchar`, `print`, and `println` are accepted as deferred calls
-(other targets are rejected upfront). The replay block synthesizes one
-`$defer_arg_N` entry in `rc.locals` per non-string argument -- each
-entry binds a synthetic name to the captured frame slot. The replay
-then delegates to `lowerBuiltinCall` with these synthetic names as
-args, which routes back through `rl.lowerExpr` and the normal frame
-load path. After the call lowers, the synthetic entries are removed
-from `rc.locals` and the cells freed (via `IRFree` emitted into the
-replay block, so the runtime free is part of the deferred call).
-This delegation reuses the regular print/println separator + newline
-+ string-literal expansion logic instead of re-implementing it.
+(other targets are rejected upfront). The capture pre-allocation pass
+walks each `defer` arg in source order, infers its `intSize` via
+`inferRecExprIntSize`, and reserves `intSize` consecutive frame slots
+(byte = 1, uint16 = 2, uint32 = 4). The base slot and size for each arg
+are recorded in parallel `deferCaptureSlots`/`deferCaptureSizes` lists
+so the use site strides correctly when storing the arg value at defer
+time and reading it back at replay time.
+
+The replay block synthesizes one `$defer_arg_N` entry in `rc.locals`
+per non-string argument with the captured `intSize`, then delegates
+to `lowerBuiltinCall` with these synthetic names as args. The lookup
+routes back through `rl.lowerExpr` and the normal frame load path,
+which loads `intSize` cells for uintN-shaped names. After the call
+lowers, the synthetic entries are removed from `rc.locals` and the
+cells freed (via `IRFree` emitted into the replay block, so the
+runtime free is part of the deferred call). This delegation reuses
+the regular print/println separator + newline + string-literal
+expansion logic instead of re-implementing it.
 
 ## Supported Features
 
@@ -336,9 +361,15 @@ Within those constraints, most Go features work the same as in
 non-recursive functions:
 
 - **Non-recursive function calls** (expressions and statements,
-  including builtins) are inlined.
+  including builtins) are inlined. Mixed-width args are widened
+  to match the callee's param `intSize`.
 - **`for` loops** with byte counters work, including
   `break`/`continue` (with labels).
+- **`defer print` / `defer println` / `defer putchar`** with
+  byte, `uint16`, or `uint32` args. Each arg is captured into
+  its own `intSize`-cell frame region at defer time so the
+  argument snapshot survives subsequent reassignment of the
+  captured locals.
 
 `divmod` fusion (folding adjacent `q := x/y; r := x%y` into a
 single `IRDivMod`) does **not** apply inside recursive phases --
@@ -357,28 +388,33 @@ widths via the `intSize` field on `recLocalInfo`.
 
 **Params.** `lowerGeneralRecursion`'s param loop reads
 `info.ParamTypes[i].IntSize`: byte params occupy 1
-frame slot (`intSize = 0`), `uint16`/`uint32` params occupy
-`intSize` consecutive slots. `paramSlot` advances by the param's
-slot count rather than always +1.
+frame slot (`intSize = 1`), `uint16`/`uint32` params occupy
+`intSize` consecutive slots (2 or 4). `paramSlot` advances by
+the param's slot count rather than always +1.
 
-**Locals.** `collectIntLocals` re-registers any local whose `:=`
-RHS is a `uintN(...)` conversion (or a binary op / ident that
-infers to `uintN`). Each multi-byte local gets `intSize`
-consecutive frame slots starting at the current `rc.frameSize`.
-The earlier single-slot entry from `collectLocals` becomes an
-unused orphan; this is wasteful by one slot per multi-byte local
-but keeps the slot-allocation pass simple.
+**Locals.** `collectLocals` walks the body once and registers every
+new local (`:=` LHS, `var` declaration, range key/value, `$switch`
+tag) with its correct intSize. A local whose `:=` RHS is a
+`uintN(...)` conversion (or a binary op / ident that infers to
+`uintN`) gets `intSize` consecutive frame slots; every other local
+gets one slot. uint64 locals are rejected for the same layout
+reason that blocks uint64 returns.
 
 **Return result vars.** Each recursive call site records every LHS
 that receives its return values in `recCallSite.resultVars` -- one
-name for `r := f(...)` (and the synthetic `$tailret`/`$void`
-placeholders) and the full list for tuple receives like `b, u =
-walk(n-1)`. When `retSize > 1`, `buildPhases` re-lays each call
-site's `resultVars` at the end of the frame as a contiguous group
-sized per the callee's `ReturnTypes`. The `retSize`-wide store at
-the start of each post-call phase then writes from `retReg` into
-those slots, so single-LHS uintN, multi-LHS tuple, and the synthetic
-placeholders all use the same code path.
+name for `r := f(...)` (and the synthetic `$tailret`/`$void`/
+`$recursive_N` placeholders) and the full list for tuple receives
+like `b, u = walk(n-1)`. The synthetic placeholders are registered
+in `rc.locals` with `intSize = rc.retIntSize` (1 for byte returns,
+2 for uint16, 4 for uint32; 1 for void and multi-return as a
+neutral placeholder), so any later code that reads the placeholder's
+size sees the correct width. When `retSize > 1`, `buildPhases`
+re-lays each call site's `resultVars` at the end of the frame as a
+contiguous group sized per the callee's `ReturnTypes`. The
+`retSize`-wide store at the start of each post-call phase then
+writes from `retReg` into those slots, so single-LHS uintN,
+multi-LHS tuple, and the synthetic placeholders all use the same
+code path.
 
 `lowerReturn` is the mirror image: when a return has multiple result
 expressions (`return s, m`), it iterates `info.ReturnSizes` and
@@ -399,6 +435,16 @@ For tail recursion, `lowerTailCall` does the same: it copies
 uintN args to a temp block first (so a self-reference like
 `f(a+1, b)` doesn't overwrite `a` mid-assignment), then moves
 the temp into the param's `intBinding.base..base+intSize-1`.
+
+For inline non-recursive calls inside a recursive function
+(`inlineCallInRec`), each arg is widened to the param's `intSize`
+via `widenIntegerLiteral` before the param-copy loop. Without this
+step, a narrow arg like the byte literal `3` passed to a uint16
+param would have only one cell of source data and the copy loop
+would read `intSize` cells starting at that cell -- picking up
+garbage (or, worse, an adjacent loaded local) at `cell+1..cell+
+intSize-1`. Widening synthesizes the missing high bytes as zero
+constants.
 
 ### Loaded Cell Cache
 
