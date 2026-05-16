@@ -204,7 +204,7 @@ func findZeroLengthArray(typ ast.Expr, consts map[string]byte) (token.Pos, bool)
 	for {
 		switch t := typ.(type) {
 		case *ast.ArrayType:
-			if t.Len != nil && arrayTypeSizePart(t.Len, consts) == 0 {
+			if arrayTypeSizePart(t, consts) == 0 {
 				return t.Pos(), true
 			}
 			typ = t.Elt
@@ -499,27 +499,11 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 				continue
 			}
 
-			// Top-level var declarations. Only scalar byte/uint8/uint16/
-			// uint32/uint64 are supported; composite globals are rejected
-			// upfront with a clear error.
+			// Top-level var declarations. The lowerer handles scalar and
+			// composite (array/struct/slice) globals via the same path
+			// used for local `var` -- type may be omitted when a value is
+			// present (the shape is inferred from the RHS, same as `:=`).
 			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.VAR {
-				for _, spec := range gd.Specs {
-					vs, ok := spec.(*ast.ValueSpec)
-					if !ok {
-						continue
-					}
-					if vs.Type == nil {
-						return nil, fmt.Errorf(
-							"%s: top-level var requires an explicit type",
-							fset.Position(spec.Pos()))
-					}
-					id, ok := vs.Type.(*ast.Ident)
-					if !ok || intIdentSize(id.Name) == 0 {
-						return nil, fmt.Errorf(
-							"%s: only scalar top-level var declarations are supported",
-							fset.Position(spec.Pos()))
-					}
-				}
 				result.GlobalVars = append(result.GlobalVars, gd)
 				continue
 			}
@@ -638,7 +622,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 							}
 						}
 						if at, ok := star.X.(*ast.ArrayType); ok {
-							count := arrayTypeSizePart(at.Len, result.ByteConsts)
+							count := arrayTypeSizePart(at, result.ByteConsts)
 							if count > 0 {
 								elemSize := 1
 								elemType := ""
@@ -721,7 +705,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 				return false
 			}
 			if at, ok := n.(*ast.ArrayType); ok && at.Len != nil &&
-				arrayTypeSizePart(at.Len, result.ByteConsts) == 0 {
+				arrayTypeSizePart(at, result.ByteConsts) == 0 {
 				rejErr = fmt.Errorf("%s: zero-length arrays are not supported",
 					fset.Position(at.Pos()))
 				return false

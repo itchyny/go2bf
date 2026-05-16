@@ -288,8 +288,8 @@ The generated Brainfuck uses a CPU-like execution model:
   `string(byte)` in `print`/`println`
 - Constants: `const n = 10`, `const nl = '\n'`,
   `const msg = "hello"`, `const` blocks with `iota`
-- Top-level scalar `var`/`const` declarations of
-  `byte`, `uint8`, `uint16`, `uint32`, `uint64`.
+- Top-level `var` declarations of `byte`, `uintN`,
+  arrays, structs, and slices.
 
 ### Control flow
 
@@ -443,10 +443,9 @@ go2bf extensions:
   mutual recursion, recursive calls inside `for` loops,
   recursive calls to other recursive functions, and
   lexical shadowing of locals are not supported.
-- Top-level `var` declarations support scalar types
-  only (`byte`, `uintN`). They are not accessible from
-  recursive functions; pass them as arguments or use
-  iterative form.
+- Top-level `var`/`const` declarations are not
+  accessible from recursive functions; pass them as
+  arguments or use iterative form.
 - Maximum 255 stack slots (variables + temporaries)
   per program. Slice backing arrays share this space;
   programs that allocate many or large slices at runtime

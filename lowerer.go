@@ -1863,8 +1863,17 @@ func (l *Lowerer) shapeOf(expr ast.Expr, sc scope) exprShape {
 			return byteSliceShape()
 		}
 	case *ast.CompositeLit:
-		// [N]byte{...}, []T{...}, Point{...}.
+		// [N]byte{...}, []T{...}, Point{...}, [...]T{...}. Try the
+		// array-element path first so it can use comp.Elts to resolve
+		// `[...]`; fall back to the type-only inference otherwise.
 		if expr.Type != nil {
+			if ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(expr); ec > 0 {
+				return exprShape{
+					elemCount: ec, elemSize: es, elemType: et,
+					elemIntSize: eis, elemSlice: esl,
+					innerElemSize: ies, innerElemIntSize: ieis,
+				}
+			}
 			return l.shapeOfType(expr.Type)
 		}
 	case *ast.SliceExpr:
@@ -2344,6 +2353,28 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 	return nil
 }
 
+// lowerArrayExpr materializes an array composite literal into fresh
+// contiguous cells and returns its full layout. The caller owns the
+// cells. Returns an error if expr is not an array composite literal.
+// Mirrors lowerSliceExpr for the array case.
+func (l *Lowerer) lowerArrayExpr(expr ast.Expr) (arrayInfo, error) {
+	comp, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return arrayInfo{}, fmt.Errorf("not an array literal: %T", expr)
+	}
+	ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(comp)
+	if ec == 0 {
+		return arrayInfo{}, fmt.Errorf("not an array literal")
+	}
+	base := l.allocCells(ec * es)
+	arr := arrayInfo{base: base, elemCount: ec, elemSize: es, elemType: et,
+		elemIntSize: eis, elemSlice: esl, innerElemSize: ies, innerElemIntSize: ieis}
+	if err := l.lowerCompositeLitInto(arr, comp); err != nil {
+		return arrayInfo{}, err
+	}
+	return arr, nil
+}
+
 func (l *Lowerer) defineStruct(sc scope, name string, def *StructDef) {
 	base := l.allocCells(def.Size)
 	si := structInfo{base: base, def: def}
@@ -2367,16 +2398,9 @@ func (l *Lowerer) defineStructArray(sc scope, name string, elemCount, elemSize i
 }
 
 // arrayTypeSize returns N for [N]byte types, 0 for non-array types.
+// Accepts either an `*ast.ArrayType` or an `*ast.CompositeLit`.
 func arrayTypeSize(expr ast.Expr) int {
-	at, ok := expr.(*ast.ArrayType)
-	if !ok {
-		return 0
-	}
-	n := arrayTypeSizePart(at.Len, nil)
-	if n < 0 {
-		return 0
-	}
-	return n
+	return max(arrayTypeSizePart(expr, nil), 0)
 }
 
 func (l *Lowerer) arraySize(expr ast.Expr) int {
@@ -2395,11 +2419,19 @@ func (l *Lowerer) arraySize(expr ast.Expr) int {
 // Return-value order matches the field order in arrayInfo.
 func (l *Lowerer) arrayElementInfo(expr ast.Expr) (elemCount, elemSize int,
 	elemType string, elemIntSize int, elemSlice bool, innerElemSize, innerElemIntSize int) {
+	// expr may be the ArrayType directly or a CompositeLit that wraps
+	// one; unwrap so the element-type logic below has a single shape to
+	// work with.
 	at, ok := expr.(*ast.ArrayType)
 	if !ok {
+		if comp, ok := expr.(*ast.CompositeLit); ok {
+			at, _ = comp.Type.(*ast.ArrayType)
+		}
+	}
+	if at == nil {
 		return 0, 0, "", 0, false, 0, 0
 	}
-	elemCount = arrayTypeSizePart(at.Len, l.allByteConsts())
+	elemCount = arrayTypeSizePart(expr, l.allByteConsts())
 	if elemCount < 0 {
 		return 0, 0, "", 0, false, 0, 0
 	}
@@ -2452,19 +2484,46 @@ func arrayNestingDepth(expr ast.Expr) int {
 	}
 }
 
-// arrayTypeSizePart extracts the length from an array length expression.
-// Returns -1 if the expression is not a valid array length.
-func arrayTypeSizePart(lenExpr ast.Expr, consts map[string]byte) int {
-	if lit, ok := lenExpr.(*ast.BasicLit); ok && lit.Kind == token.INT {
-		n, err := strconv.Atoi(lit.Value)
-		if err != nil {
+// arrayTypeSizePart extracts the array length from `expr`, which
+// must be either an `*ast.ArrayType` or an `*ast.CompositeLit`
+// wrapping one. Callers pass the parent node, never a bare length
+// expression, so `[...]T{...}` can be resolved from `len(comp.Elts)`
+// when the `Len` is an ellipsis. The `Len` of the unwrapped
+// `ArrayType` is inspected directly (`*ast.BasicLit` INT, or
+// `*ast.Ident` resolving through `consts`).
+//
+// Returns -1 when the length can't be determined (unknown length
+// shape, bare `*ast.Ellipsis` outside a composite literal, or
+// `expr` of any other type).
+func arrayTypeSizePart(expr ast.Expr, consts map[string]byte) int {
+	if comp, ok := expr.(*ast.CompositeLit); ok {
+		at, ok := comp.Type.(*ast.ArrayType)
+		if !ok {
 			return -1
 		}
-		return n
+		if _, ok := at.Len.(*ast.Ellipsis); ok {
+			return len(comp.Elts)
+		}
+		expr = at
 	}
-	if id, ok := lenExpr.(*ast.Ident); ok && consts != nil {
-		if val, ok := consts[id.Name]; ok {
-			return int(val)
+	at, ok := expr.(*ast.ArrayType)
+	if !ok {
+		return -1
+	}
+	switch e := at.Len.(type) {
+	case *ast.BasicLit:
+		if e.Kind == token.INT {
+			n, err := strconv.Atoi(e.Value)
+			if err != nil {
+				return -1
+			}
+			return n
+		}
+	case *ast.Ident:
+		if consts != nil {
+			if val, ok := consts[e.Name]; ok {
+				return int(val)
+			}
 		}
 	}
 	return -1
@@ -3675,7 +3734,7 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 		if comp.Type != nil && arrayNestingDepth(comp.Type) > 3 {
 			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
 		}
-		size := l.arraySize(comp.Type)
+		size := l.arraySize(comp)
 		if size > 0 {
 			return l.lowerCompositeLit(name, comp)
 		}
@@ -5243,14 +5302,17 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	if s.Value != nil {
 		r, err := l.lowerExpr(s.X)
 		if err != nil {
-			// String/slice literal as range source: materialize to a slice header
-			// and synthesize a pointer-shape exprResult that mirrors the
-			// element layout of the materialized slice.
+			// Literal range source: lowerExpr can't handle composite
+			// literals, so route slice/string shapes through
+			// lowerSliceExpr and array shapes through lowerArrayExpr.
 			if si, sliceErr := l.lowerSliceExpr(s.X); sliceErr == nil {
 				r = exprResult{
 					cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true,
 					exprShape: exprShape{elemSize: si.elemSize, elemSlice: si.elemSlice, isPointer: true},
 				}
+				err = nil
+			} else if arr, arrErr := l.lowerArrayExpr(s.X); arrErr == nil {
+				r = exprResult{cell: arr.base, temp: true, exprShape: arrayShapeFrom(arr)}
 				err = nil
 			}
 		}
@@ -5266,6 +5328,8 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 				valCell = b.info.base
 			case *intBinding:
 				valCell = b.base
+			case *arrayBinding:
+				valCell = b.info.base
 			case *sliceBinding:
 				// `[]string` / `[][]byte` element: v is bound to a 3-cell
 				// slice header whose cells need not be contiguous.
@@ -6074,13 +6138,12 @@ func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
 			}
 			return base, def.Size, nil
 		}
-		if size := l.arraySize(comp.Type); size > 0 {
-			base := l.allocCells(size)
-			arr := arrayInfo{base: base, elemCount: size, elemSize: 1}
-			if err := l.lowerCompositeLitInto(arr, comp); err != nil {
+		if l.arraySize(comp) > 0 {
+			arr, err := l.lowerArrayExpr(comp)
+			if err != nil {
 				return 0, 0, err
 			}
-			return base, size, nil
+			return arr.base, arr.size(), nil
 		}
 		return 0, 0, fmt.Errorf("unsupported composite literal argument")
 	}
@@ -6244,16 +6307,12 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 					args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: def.Size}}
 					continue
 				}
-				size := l.arraySize(comp.Type)
-				if size > 0 {
-					base := l.allocCells(size)
-					ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(comp.Type)
-					arr := arrayInfo{base: base, elemCount: ec, elemSize: es, elemType: et,
-						elemIntSize: eis, elemSlice: esl, innerElemSize: ies, innerElemIntSize: ieis}
-					if err := l.lowerCompositeLitInto(arr, comp); err != nil {
+				if l.arraySize(comp) > 0 {
+					arr, err := l.lowerArrayExpr(comp)
+					if err != nil {
 						return nil, err
 					}
-					args[i] = exprResult{cell: base, temp: true, exprShape: exprShape{size: size}}
+					args[i] = exprResult{cell: arr.base, temp: true, exprShape: exprShape{size: arr.size()}}
 					continue
 				}
 			}
@@ -7171,14 +7230,13 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 			l.emit(&IRConst{Dst: t, Value: byte(slotOf(base))}) // #nosec G115
 			return exprResult{cell: t, temp: true, exprShape: exprShape{intSize: 1}}, nil
 		}
-		if size := l.arraySize(e.Type); size > 0 {
-			base := l.allocCells(size)
-			arr := arrayInfo{base: base, elemCount: size, elemSize: 1}
-			if err := l.lowerCompositeLitInto(arr, e); err != nil {
+		if l.arraySize(e) > 0 {
+			arr, err := l.lowerArrayExpr(e)
+			if err != nil {
 				return exprResult{}, err
 			}
 			t := l.allocCell()
-			l.emit(&IRConst{Dst: t, Value: byte(slotOf(base))}) // #nosec G115
+			l.emit(&IRConst{Dst: t, Value: byte(slotOf(arr.base))}) // #nosec G115
 			return exprResult{cell: t, temp: true, exprShape: exprShape{intSize: 1}}, nil
 		}
 		return exprResult{}, fmt.Errorf("cannot take address of %T", expr)

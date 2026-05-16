@@ -5370,6 +5370,130 @@ func main() {
 			"", "60\n",
 		},
 		{
+			"range over inline array literal",
+			`package main
+func main() {
+	s := byte(0)
+	for _, v := range [4]byte{1, 2, 4, 8} {
+		s += v
+	}
+	println(s)
+}`,
+			"", "15\n",
+		},
+		{
+			"range over inline slice literal",
+			`package main
+func main() {
+	s := uint16(0)
+	for _, v := range []uint16{100, 200, 300, 400} {
+		s += v
+	}
+	println(s)
+}`,
+			"", "1000\n",
+		},
+		{
+			"range over ellipsis-sized array literal",
+			`package main
+func main() {
+	s := byte(0)
+	for i, v := range [...]byte{2, 4, 8, 16, 32} {
+		s += v
+		println(i, v)
+	}
+	println(s)
+}`,
+			"", "0 2\n1 4\n2 8\n3 16\n4 32\n62\n",
+		},
+		{
+			"ellipsis-sized array as top-level var",
+			`package main
+var nums = [...]uint16{10, 20, 30, 40, 50}
+func main() {
+	var sum uint16
+	for _, n := range nums {
+		sum += n
+	}
+	println(sum)
+}`,
+			"", "150\n",
+		},
+		{
+			"ellipsis-sized struct array literal",
+			`package main
+type Pair struct { a, b byte }
+func main() {
+	for _, p := range [...]Pair{{1, 2}, {3, 4}, {5, 6}} {
+		println(p.a, p.b)
+	}
+}`,
+			"", "1 2\n3 4\n5 6\n",
+		},
+		{
+			"range over nested array literal",
+			`package main
+func main() {
+	for _, row := range [...][3]byte{{1, 2, 3}, {4, 5, 6}, {7, 8, 9}} {
+		for _, v := range row {
+			print(v)
+		}
+		println()
+	}
+}`,
+			"", "123\n456\n789\n",
+		},
+		{
+			"range over named nested array",
+			`package main
+var grid = [2][3]byte{{10, 20, 30}, {40, 50, 60}}
+func main() {
+	for _, row := range grid {
+		for _, v := range row {
+			print(v)
+			print(" ")
+		}
+		println()
+	}
+}`,
+			"", "10 20 30 \n40 50 60 \n",
+		},
+		{
+			"return uint16 array literal",
+			`package main
+func make4() [4]uint16 {
+	return [4]uint16{100, 200, 300, 400}
+}
+func main() {
+	a := make4()
+	println(a[0], a[1], a[2], a[3])
+}`,
+			"", "100 200 300 400\n",
+		},
+		{
+			"return struct array literal",
+			`package main
+type P struct { x, y byte }
+func makeBox() [2]P {
+	return [2]P{{1, 2}, {3, 4}}
+}
+func main() {
+	b := makeBox()
+	println(b[0].x, b[0].y, b[1].x, b[1].y)
+}`,
+			"", "1 2 3 4\n",
+		},
+		{
+			"address of uint16 array literal",
+			`package main
+func main() {
+	p := &[3]uint16{100, 200, 300}
+	_ = p
+	println("ok")
+}`,
+			"", "ok\n",
+		},
+		{
 			"range over array with break",
 			`package main
 func main() {
@@ -11200,20 +11324,6 @@ func main() { putchar(256) }`,
 			`package main
 func main() { putchar(x) }`,
 			"undefined variable: x",
-		},
-		{
-			"global scalar with composite type rejected",
-			`package main
-var a [3]byte
-func main() { putchar(a[0]) }`,
-			"input.go:2:5: only scalar top-level var declarations are supported",
-		},
-		{
-			"global typeless var rejected",
-			`package main
-var n = 5
-func main() { print(n) }`,
-			"input.go:2:5: top-level var requires an explicit type",
 		},
 		{
 			"global accessed from recursive function rejected",
