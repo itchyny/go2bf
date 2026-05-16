@@ -6399,6 +6399,89 @@ func main() {
 			"", "1 2 3 4 4\n",
 		},
 		{
+			"slice assigned from inner scope to outer var",
+			`package main
+func main() {
+	var outer []byte
+	for i := byte(0); i < 5; i++ {
+		inner := []byte{i, i + 1, i + 2}
+		outer = inner
+	}
+	println(outer[0], outer[1], outer[2])
+}`,
+			"", "4 5 6\n",
+		},
+		{
+			"slice expression aliases into outer scope",
+			`package main
+func main() {
+	var outer []byte
+	{
+		s := []byte{10, 20, 30, 40, 50}
+		outer = s[1:4]
+	}
+	println(outer[0], outer[1], outer[2])
+}`,
+			"", "20 30 40\n",
+		},
+		{
+			"slice stored in struct field across scopes",
+			`package main
+type Holder struct { data []byte }
+func main() {
+	var h Holder
+	for i := byte(0); i < 5; i++ {
+		s := []byte{i, i + 10, i + 20}
+		h.data = s
+	}
+	println(h.data[0], h.data[1], h.data[2])
+}`,
+			"", "4 14 24\n",
+		},
+		{
+			"slice stored in array element across scopes",
+			`package main
+func main() {
+	var arr [3][]byte
+	{
+		x := []byte{1, 2, 3}
+		arr[0] = x
+	}
+	println(arr[0][0], arr[0][1], arr[0][2])
+}`,
+			"", "1 2 3\n",
+		},
+		{
+			"composite literal captures inner-scope slices",
+			`package main
+type Pair struct { a, b []byte }
+func main() {
+	var p Pair
+	{
+		x := []byte{1, 2, 3}
+		y := []byte{4, 5, 6}
+		p = Pair{a: x, b: y}
+	}
+	println(p.a[0], p.a[1], p.a[2])
+	println(p.b[0], p.b[1], p.b[2])
+}`,
+			"", "1 2 3\n4 5 6\n",
+		},
+		{
+			"string concat across many loop iterations reclaims buffer",
+			`package main
+func main() {
+	total := byte(0)
+	for i := byte(0); i < 40; i++ {
+		s := ""
+		for j := byte(0); j < 5; j++ { s += "X" }
+		total += byte(len(s))
+	}
+	println(total)
+}`,
+			"", "200\n",
+		},
+		{
 			"slice literal as function argument",
 			`package main
 func sum(s []byte) byte {
@@ -12556,6 +12639,7 @@ func TestTestdata(t *testing.T) {
 		{"testdata/quicksort.go", "result: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15\n"},
 		{"testdata/sieve.go", "2 3 5 7 11 13 17 19 23 29 31 37 41 43 47\n"},
 		{"testdata/pascal.go", "1 12 66 220 495 792 924 792 495 220 66 12 1\n"},
+		{"testdata/roman.go", "1999 = MCMXCIX\n3888 = MMMDCCCLXXXVIII\n"},
 	}
 	for _, tt := range tests {
 		t.Run(filepath.Base(tt.file), func(t *testing.T) {

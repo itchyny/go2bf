@@ -92,7 +92,15 @@ type intBinding struct {
 }
 type arrayBinding struct{ info arrayInfo }
 type structBinding struct{ info structInfo }
-type sliceBinding struct{ info sliceInfo }
+type sliceBinding struct {
+	info sliceInfo
+	// escaped is set when the slice's header (ptr/len/cap) has been
+	// copied somewhere whose lifetime exceeds this binding's scope --
+	// a return statement, an outer-scope slice variable, or a function
+	// argument. popScope skips the heap reclaim for escaped slices so
+	// the consumer's ptr stays valid past scope exit.
+	escaped bool
+}
 type constBinding struct{ value byte }
 type intConstBinding struct {
 	value uint64
@@ -469,7 +477,66 @@ func (l *Lowerer) pushScope() {
 }
 
 func (l *Lowerer) popScope() {
+	// Reclaim heap-backed slice buffers for slices that didn't escape
+	// this scope. A slice is "escaped" when its ptr has been copied
+	// somewhere whose lifetime exceeds this scope (return, outer
+	// assignment, function call argument); freeing those would dangle
+	// the consumer's ptr. Tape cells aren't reclaimed here -- named
+	// returns alias return cells, defer captures outlive the scope,
+	// and pointer cells may be read after scope exit; the existing
+	// allocator handles their lifetime.
+	sc := l.scopes[len(l.scopes)-1]
+	for _, b := range sc {
+		if sb, ok := b.(*sliceBinding); ok && !sb.escaped {
+			l.freeIfHeapTop(sb.info)
+		}
+	}
 	l.scopes = l.scopes[:len(l.scopes)-1]
+}
+
+// markEscapedFromExpr walks expr and marks any slice variable
+// referenced via *ast.Ident as escaped. Conservative: marks every
+// slice the expression touches, including indirect references through
+// composite literals and binary expressions.
+func (l *Lowerer) markEscapedFromExpr(expr ast.Expr) {
+	if expr == nil {
+		return
+	}
+	ast.Inspect(expr, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if b, ok := l.lookupBinding(id.Name).(*sliceBinding); ok {
+			b.escaped = true
+		}
+		return true
+	})
+}
+
+// sliceExprAliasesBuffer reports whether evaluating rhs as a slice
+// produces a value that shares its backing buffer with an existing
+// slice binding. True for: plain ident (`t = s`), parenthesized
+// alias, slicing expression (`t = s[i:j]`), and `append(...)` (which
+// may extend in place or grow; treat conservatively as alias).
+// False for fresh allocations: string concat, make, byte-slice cast,
+// composite literals.
+func (l *Lowerer) sliceExprAliasesBuffer(rhs ast.Expr) bool {
+	switch e := rhs.(type) {
+	case *ast.Ident:
+		if _, ok := l.lookupBinding(e.Name).(*sliceBinding); ok {
+			return true
+		}
+	case *ast.ParenExpr:
+		return l.sliceExprAliasesBuffer(e.X)
+	case *ast.SliceExpr:
+		return true
+	case *ast.CallExpr:
+		if fn, ok := e.Fun.(*ast.Ident); ok && fn.Name == "append" {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *Lowerer) currentScope() scope {
@@ -597,6 +664,12 @@ func (l *Lowerer) defineSlice(sc scope, name string, elemSize int,
 		elemSize: elemSize, elemType: elemType, elemSlice: elemSlice,
 		elemPtrType: elemPtrType, elemIntSize: elemIntSize,
 	}
+	// Zero the header cells so any subsequent freeIfHeapTop check sees
+	// 0/0 (no buffer) for a freshly-defined slice rather than stale
+	// values left over from a recycled cell allocation.
+	l.emit(&IRZero{Dst: si.ptr})
+	l.emit(&IRZero{Dst: si.len})
+	l.emit(&IRZero{Dst: si.cap})
 	sc[name] = &sliceBinding{info: si}
 	return si
 }
@@ -847,6 +920,18 @@ func (l *Lowerer) lowerSliceAssign(si sliceInfo, rhs ast.Expr) error {
 			}
 		}
 	}
+	// Optimize `s = s + x` (and the desugared `s += x`) when both sides
+	// are string-shaped: append x's bytes onto s's buffer in place when
+	// s is at heap top, avoiding a fresh allocation per concat. Falls
+	// through to the general concat path when the LHS isn't an operand
+	// or when the buffer isn't reclaimable.
+	if bin, ok := rhs.(*ast.BinaryExpr); ok && bin.Op == token.ADD {
+		if id, ok := bin.X.(*ast.Ident); ok && l.isStringExpr(bin.X) && l.isStringExpr(bin.Y) {
+			if src, ok := l.lookupSlice(id.Name); ok && src.ptr == si.ptr {
+				return l.lowerSliceSelfConcat(si, bin.Y)
+			}
+		}
+	}
 	tmp, err := l.lowerSliceExpr(rhs)
 	if err != nil {
 		return err
@@ -854,6 +939,118 @@ func (l *Lowerer) lowerSliceAssign(si sliceInfo, rhs ast.Expr) error {
 	l.moveSliceHeader(si, tmp.ptr, tmp.len, tmp.cap)
 	l.freeSliceInfo(tmp)
 	return nil
+}
+
+// freeIfHeapTop emits a runtime check: when si's backing buffer sits at
+// the top of the heap (si.ptr + si.cap == heapPtr), reset heapPtr to
+// si.ptr and pop si.cap slots off the stack so the cells become
+// reusable. No-op when si is below the top, has zero cap, or aliases a
+// buffer that lives elsewhere on the heap. Caller must guarantee that
+// the buffer is genuinely orphaned -- typically by checking that the
+// upcoming RHS doesn't read si.
+func (l *Lowerer) freeIfHeapTop(si sliceInfo) {
+	endPtr := l.allocCell()
+	l.emit(&IRAdd{Dst: endPtr, Src1: si.ptr, Src2: si.cap})
+	atEnd := l.allocCell()
+	l.emit(&IRCmp{Op: CmpEq, Dst: atEnd, Src1: endPtr, Src2: l.heapPtr})
+	l.freeCell(endPtr)
+
+	saved := l.nodes
+	l.nodes = nil
+	l.emit(&IRCopy{Dst: l.heapPtr, Src: si.ptr})
+	popSize := l.allocCell()
+	l.emit(&IRCopy{Dst: popSize, Src: si.cap})
+	l.emit(&IRFramePopDyn{Size: popSize})
+	l.freeCell(popSize)
+	thenNodes := l.nodes
+	l.nodes = saved
+
+	l.emit(&IRIf{Cond: atEnd, Then: &IRBlock{Nodes: thenNodes}})
+	l.freeCell(atEnd)
+}
+
+// lowerSliceSelfConcat handles `s = s + x` for string-shaped s by
+// growing s's existing buffer in place. When s.ptr + s.cap == heapPtr
+// the new bytes simply extend the heap; otherwise we fall through to
+// the regular concat path (which allocates fresh).
+func (l *Lowerer) lowerSliceSelfConcat(si sliceInfo, other ast.Expr) error {
+	if lit, ok := l.stringLiteralValue(other); ok {
+		l.ensureSliceCapBy(si, len(lit))
+		l.appendLiteralBytes(si, lit)
+		return nil
+	}
+	src, srcTemp, err := l.resolveStringSlice(other)
+	if err != nil {
+		return err
+	}
+	l.ensureSliceCapByCell(si, src.len)
+	l.appendBytesFromSlice(si, src)
+	if srcTemp {
+		l.freeSliceInfo(src)
+	}
+	return nil
+}
+
+// ensureSliceCapBy guarantees si has room for `extra` more bytes by
+// bumping heapPtr and si.cap when si is at heap top. When si isn't at
+// the top, falls back to a realloc-and-copy.
+func (l *Lowerer) ensureSliceCapBy(si sliceInfo, extra int) {
+	extraCell := l.allocCell()
+	l.emit(&IRConst{Dst: extraCell, Value: byte(extra)}) // #nosec G115
+	l.ensureSliceCapByCell(si, extraCell)
+	l.freeCell(extraCell)
+}
+
+// ensureSliceCapByCell is the runtime-sized form: extra is the cell
+// holding the number of additional bytes to reserve.
+func (l *Lowerer) ensureSliceCapByCell(si sliceInfo, extra Cell) {
+	endPtr := l.allocCell()
+	l.emit(&IRAdd{Dst: endPtr, Src1: si.ptr, Src2: si.cap})
+	atEnd := l.allocCell()
+	l.emit(&IRCmp{Op: CmpEq, Dst: atEnd, Src1: endPtr, Src2: l.heapPtr})
+	l.freeCell(endPtr)
+
+	// In-place extend: heapPtr += extra; cap += extra.
+	saved := l.nodes
+	l.nodes = nil
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: extra})
+	pushExt := l.allocCell()
+	l.emit(&IRCopy{Dst: pushExt, Src: extra})
+	l.emit(&IRFramePushDyn{Size: pushExt})
+	l.freeCell(pushExt)
+	l.emit(&IRAdd{Dst: si.cap, Src1: si.cap, Src2: extra})
+	extendNodes := l.nodes
+
+	// Realloc path: alloc new buffer of len+extra, copy current contents,
+	// update ptr/cap. Old buffer leaks (caller already could not free it
+	// because it wasn't on top).
+	l.nodes = nil
+	newCap := l.allocCell()
+	l.emit(&IRAdd{Dst: newCap, Src1: si.len, Src2: extra})
+	newPtr := l.allocCell()
+	l.emit(&IRCopy{Dst: newPtr, Src: l.heapPtr})
+	pushSize := l.allocCell()
+	l.emit(&IRCopy{Dst: pushSize, Src: newCap})
+	l.emit(&IRAdd{Dst: l.heapPtr, Src1: l.heapPtr, Src2: newCap})
+	l.emit(&IRFramePushDyn{Size: pushSize})
+	l.freeCell(pushSize)
+	// copyHeapBytes frees its `n` argument, so use a temp copy of si.len.
+	lenCopy := l.allocCell()
+	l.emit(&IRCopy{Dst: lenCopy, Src: si.len})
+	l.copyHeapBytes(newPtr, si.ptr, lenCopy)
+	l.emit(&IRCopy{Dst: si.ptr, Src: newPtr})
+	l.emit(&IRCopy{Dst: si.cap, Src: newCap})
+	l.freeCell(newPtr)
+	l.freeCell(newCap)
+	reallocNodes := l.nodes
+
+	l.nodes = saved
+	l.emit(&IRIf{
+		Cond: atEnd,
+		Then: &IRBlock{Nodes: extendNodes},
+		Else: &IRBlock{Nodes: reallocNodes},
+	})
+	l.freeCell(atEnd)
 }
 
 func (l *Lowerer) evalSliceMake(typeExpr ast.Expr, args []ast.Expr) (sliceInfo, error) {
@@ -2103,6 +2300,10 @@ func (l *Lowerer) lowerStructLit(name string, comp *ast.CompositeLit, def *Struc
 // lowerStructValueTo lowers a struct value (literal or variable) into cells
 // starting at base.
 func (l *Lowerer) lowerStructValueTo(base Cell, def *StructDef, valExpr ast.Expr) error {
+	// A struct value (including a composite literal) may carry slice
+	// idents into struct fields; mark them escaped so the source
+	// scope doesn't reclaim the buffer the field still references.
+	l.markEscapedFromExpr(valExpr)
 	switch v := valExpr.(type) {
 	case *ast.CompositeLit:
 		for j, elt := range v.Elts {
@@ -3669,6 +3870,16 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 		// Slice assignment: s = make([]byte, n) or s = append(s, v) or s = expr
 		unmask := maskRHS()
 		defer unmask()
+		// Aliasing RHS (`t = s`, `t = s[i:j]`, `t = append(s, ...)`) shares
+		// the source's buffer with the destination. Both bindings must
+		// outlive each other's scope, so neither can be reclaimed by
+		// popScope. Mark both as escaped. Non-aliasing RHS (concat,
+		// make, composite lit) produces a fresh buffer -- dst owns it
+		// alone, popScope can reclaim normally.
+		if l.sliceExprAliasesBuffer(rhs) {
+			b.escaped = true
+			l.markEscapedFromExpr(rhs)
+		}
 		return l.lowerSliceAssign(b.info, rhs)
 	case *intBinding:
 		// Multi-byte integer assignment.
@@ -4090,6 +4301,9 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 }
 
 func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
+	// A slice RHS being stored as an array/slice element escapes:
+	// the element outlives the source's scope.
+	l.markEscapedFromExpr(rhs)
 	base, err := l.lowerExpr(idx.X)
 	if err != nil {
 		return err
@@ -4405,6 +4619,9 @@ func (l *Lowerer) assignSliceStructField(si sliceInfo, indexExpr ast.Expr, def *
 }
 
 func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
+	// A slice RHS being copied into a struct field escapes: the field
+	// outlives the source binding's scope.
+	l.markEscapedFromExpr(rhs)
 	// (expr).field is the same as expr.field; (*pp).field auto-derefs to
 	// pp.field. Rewrite so the pointer/struct path resolves the base.
 	if p, ok := sel.X.(*ast.ParenExpr); ok {
@@ -5763,6 +5980,21 @@ func (l *Lowerer) captureBlock(fn func() error) (*IRBlock, error) {
 }
 
 func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
+	// Mark any slice variables in the return expressions as escaped so
+	// popScope doesn't reclaim their buffers before the caller reads
+	// through the returned ptr.
+	for _, r := range s.Results {
+		l.markEscapedFromExpr(r)
+	}
+	// Named returns: the named return variables themselves carry the
+	// final value out to returnDst, so mark them too.
+	if l.curFunc != nil {
+		for _, name := range l.curFunc.ReturnNames {
+			if b, ok := l.lookupBinding(name).(*sliceBinding); ok {
+				b.escaped = true
+			}
+		}
+	}
 	if !l.inFunc {
 		return fmt.Errorf("return outside function")
 	}
@@ -6219,6 +6451,12 @@ func (l *Lowerer) spreadInnerCall(outer *FuncInfo, call *ast.CallExpr) ([]exprRe
 }
 
 func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error) {
+	// Slice arguments escape: the callee's local copy aliases the
+	// caller's buffer, so popScope on the callee scope must not
+	// reclaim. Mark any slice ident passed as an arg.
+	for _, a := range argExprs {
+		l.markEscapedFromExpr(a)
+	}
 	// Multi-return spread: f(g()) where g returns N values matching f's params.
 	// Pre-lower the inner call into per-return exprResults; the rest of inlineCall
 	// proceeds with those args as if they had been evaluated normally.
@@ -6376,6 +6614,9 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 						inner.elemSlice, inner.elemPtrType, inner.elemIntSize)
 					l.moveSliceHeader(paramSI, inner.ptr, inner.len, inner.cap)
 					l.freeSliceInfo(inner)
+					// The slice parameter aliases the caller's buffer;
+					// don't reclaim it on this scope's popScope.
+					sc[paramName].(*sliceBinding).escaped = true
 					continue
 				}
 			}

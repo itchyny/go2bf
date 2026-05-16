@@ -374,6 +374,51 @@ Variadic `append(s, a, b, c)` emits multiple single-element
 appends. `append(s, t...)` ensures capacity, then bulk
 copies `len(t) * elemSize` cells from source to destination.
 
+### Heap Reclamation
+
+The bump allocator never moves `heapPtr` backwards on its own, so
+slice-builder patterns (`s := ""; for ... { s += x }`) would otherwise
+leak every intermediate buffer and exhaust the byte-sized
+`heapPtr` quickly. Two complementary mechanisms reclaim space:
+
+1. **In-place extend on self-concat.** When the lowerer sees
+   `s = s + x` (the desugared form of `s += x`) and `s` is at the
+   heap top (`s.ptr + s.cap == heapPtr` at runtime), it appends
+   `x`'s bytes to `s`'s existing buffer and grows `s.cap` instead of
+   allocating a fresh buffer. Falls back to a copy-and-reallocate
+   when `s` isn't at the top. See `lowerSliceSelfConcat` and
+   `ensureSliceCapByCell`.
+
+2. **Scope-pop slice buffer reclaim with escape tracking.** Each
+   `sliceBinding` carries an `escaped` flag. `popScope` walks its
+   bindings and, for any slice whose flag is still false, emits a
+   runtime check: if the slice's backing array is at the heap top,
+   roll `heapPtr` back to `ptr` and `IRFramePopDyn` the freed
+   slots. The flag flips to true at every site where the slice's
+   header (`ptr/len/cap`) is copied somewhere that outlives its
+   declaring scope:
+
+   | Site                                            | Mark target |
+   | ----------------------------------------------- | ----------- |
+   | `return s` / named return slices                | source      |
+   | Function-call argument                          | source + callee's parameter binding |
+   | `dst = src` slice assignment where src is an alias (`Ident`, `s[i:j]`, `append(...)`) | source + destination |
+   | `s.field = src` (struct field)                  | source      |
+   | `arr[i] = src` / `s[i] = src` (composite element) | source    |
+   | `Pair{a: src1, b: src2}` (composite literal carrying slice idents) | each source |
+
+   The "aliasing RHS" detector (`sliceExprAliasesBuffer`)
+   distinguishes share-the-buffer assignments (`t = s`, slicing,
+   `append`) from fresh-allocation ones (concat, `make`, composite
+   literal). Only aliasing assignments mark both sides; fresh ones
+   leave the destination unmarked so its scope-pop can still
+   reclaim it.
+
+The runtime `heapPtr == ptr + cap` check is the safety net: even
+if an escape is missed, the reclaim only fires when the buffer is
+the topmost allocation. A misplaced alias farther down the heap
+naturally falls through.
+
 `copy(dst, src)` copies `min(len(dst), len(src)) * elemSize`
 cells via a counted loop and returns the number of elements
 copied. Both arguments can be any slice expression (variable,
