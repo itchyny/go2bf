@@ -2,230 +2,176 @@ package main
 
 // OptimizeIR performs peephole optimizations on the IR before code generation.
 func OptimizeIR(prog *Program) {
-	optimizeBlock(prog.Main)
-	eliminateDeadStores(prog.Main)
+	optimizeBlock(prog.Main, map[Cell]bool{})
 }
 
-func optimizeBlock(block *IRBlock) {
-	// Track known constant values for cells.
-	known := map[Cell]byte{}
+// optimizeBlock walks a block once, doing three cleanups in lockstep:
+//
+//  1. Constant folding -- tracks the last known constant value in
+//     `known[c] byte`, drops a redundant `IRConst{c, v}` when `c` is
+//     already at `v`.
+//  2. Delta conversion -- replaces `IRConst{c, v}` with `IRAddI`/
+//     `IRSubI` when the delta from the prior known value is smaller
+//     than the literal (common in string-literal printing).
+//  3. Fresh-zero elimination -- drops `IRZero{c}` when `c` has never
+//     been written anywhere prior in the program. The BF tape starts
+//     at 0 and the register cache has no entry for an untouched
+//     cell, so the zero is a no-op. `everWritten` is shared across
+//     recursive calls so writes in earlier branches or pre-marked
+//     loop bodies keep later `IRZero`s where the cell may carry a
+//     stale value or cache entry.
+//
+// `known` is reset at control-flow boundaries (`IRIf`/`IRLoop`/
+// `IRDispatch`/unknown nodes) since the optimizer cannot tell which
+// branch ran or what the loop did across iterations. `everWritten`
+// is preserved. For loop and dispatch bodies, `markBlockDsts`
+// pre-marks every write inside before the recursive walk, so a body-
+// local IRZero used to reset a cell between iterations isn't
+// mistaken for a fresh-cell zero on the first pass.
+func optimizeBlock(block *IRBlock, everWritten map[Cell]bool) {
+	known := map[Cell]byte{} // cell -> last known constant value
 	out := make([]IRNode, 0, len(block.Nodes))
+
 	for _, node := range block.Nodes {
 		switch n := node.(type) {
+		case *IRZero:
+			if !everWritten[n.Dst] {
+				// Fresh cell -- BF tape is 0 and the register cache has
+				// no entry, so the zero-store is a no-op. Mark
+				// `everWritten` so a later IRZero on this cell (after a
+				// real write) isn't dropped as fresh.
+				everWritten[n.Dst] = true
+				known[n.Dst] = 0
+				continue
+			}
+			out = append(out, n)
+			known[n.Dst] = 0
 		case *IRConst:
 			if prev, ok := known[n.Dst]; ok {
 				diff := int(n.Value) - int(prev)
-				// Skip if same nonzero value. Don't skip zero - the cell may
-				// have been freed and reused, with stale data in the register.
+				// Skip if same nonzero value. Don't skip zero -- the cell
+				// may have been freed and reused, with stale data in the
+				// register from a different cell.
 				if diff == 0 && n.Value != 0 {
 					continue
 				}
+				// Convert to IRAddI/IRSubI when the delta is smaller than
+				// the absolute value.
 				if prev != 0 && diff > 0 && diff < int(n.Value) {
 					out = append(out, &IRAddI{Dst: n.Dst, Value: byte(diff)}) // #nosec G115
+					everWritten[n.Dst] = true
 					known[n.Dst] = n.Value
 					continue
 				}
 				if prev != 0 && diff < 0 && -diff < int(prev) {
 					out = append(out, &IRSubI{Dst: n.Dst, Value: byte(-diff)}) // #nosec G115
+					everWritten[n.Dst] = true
 					known[n.Dst] = n.Value
 					continue
 				}
 			}
 			out = append(out, n)
+			everWritten[n.Dst] = true
 			known[n.Dst] = n.Value
-		case *IRZero:
-			// Don't skip: the cell may have been freed and reused,
-			// with stale data in the register from a different cell.
-			out = append(out, n)
-			known[n.Dst] = 0
-		case *IRAddI:
-			if prev, ok := known[n.Dst]; ok {
-				known[n.Dst] = prev + n.Value
-			} else {
-				delete(known, n.Dst)
-			}
-			out = append(out, n)
-		case *IRSubI:
-			if prev, ok := known[n.Dst]; ok {
-				known[n.Dst] = prev - n.Value
-			} else {
-				delete(known, n.Dst)
-			}
-			out = append(out, n)
 		case *IRMove:
-			// dst gets src's value, src becomes 0.
+			out = append(out, n)
+			everWritten[n.Dst] = true
+			everWritten[n.Src] = true // Move zeros Src
 			if v, ok := known[n.Src]; ok {
 				known[n.Dst] = v
 			} else {
 				delete(known, n.Dst)
 			}
 			known[n.Src] = 0
-			out = append(out, n)
 		case *IRCopy:
+			out = append(out, n)
+			everWritten[n.Dst] = true
 			if v, ok := known[n.Src]; ok {
 				known[n.Dst] = v
 			} else {
 				delete(known, n.Dst)
 			}
+		case *IRAddI:
 			out = append(out, n)
+			everWritten[n.Dst] = true
+			if prev, ok := known[n.Dst]; ok {
+				known[n.Dst] = prev + n.Value
+			} else {
+				delete(known, n.Dst)
+			}
+		case *IRSubI:
+			out = append(out, n)
+			everWritten[n.Dst] = true
+			if prev, ok := known[n.Dst]; ok {
+				known[n.Dst] = prev - n.Value
+			} else {
+				delete(known, n.Dst)
+			}
+		case irHasDst:
+			out = append(out, n)
+			everWritten[n.getDst()] = true
+			delete(known, n.getDst())
+		case *IRDivMod:
+			out = append(out, n)
+			everWritten[n.QuotDst] = true
+			everWritten[n.RemDst] = true
+			delete(known, n.QuotDst)
+			delete(known, n.RemDst)
 		case *IRIf:
-			// Recurse into branches, then invalidate all knowledge
-			// (we don't know which branch was taken).
-			optimizeBlock(n.Then)
+			optimizeBlock(n.Then, everWritten)
 			if n.Else != nil {
-				optimizeBlock(n.Else)
+				optimizeBlock(n.Else, everWritten)
 			}
 			known = map[Cell]byte{}
 			out = append(out, n)
 		case *IRLoop:
-			optimizeBlock(n.Body)
+			markBlockDsts(n.Body, everWritten)
+			optimizeBlock(n.Body, everWritten)
 			known = map[Cell]byte{}
 			out = append(out, n)
 		case *IRDispatch:
-			for _, phase := range n.Phases {
-				optimizeBlock(phase)
+			for _, p := range n.Phases {
+				markBlockDsts(p, everWritten)
+				optimizeBlock(p, everWritten)
 			}
 			known = map[Cell]byte{}
 			out = append(out, n)
 		case *IRFree:
+			out = append(out, n)
 			delete(known, n.Cell)
-			out = append(out, n)
 		default:
-			// Any other node invalidates knowledge about its destination.
-			invalidateNodeDst(known, node)
-			out = append(out, n)
+			out = append(out, node)
 		}
 	}
 	block.Nodes = out
 }
 
-// eliminateDeadStores removes writes to cells that are overwritten before
-// being read. A forward scan tracks the last write index for each cell;
-// when a second write occurs with no intervening read or control flow,
-// the first write is marked dead and removed.
-func eliminateDeadStores(block *IRBlock) {
-	// Recurse into sub-blocks (but not loop bodies -- all writes in a loop
-	// body are potentially live due to re-execution).
-	for _, node := range block.Nodes {
-		if n, ok := node.(*IRIf); ok {
-			eliminateDeadStores(n.Then)
-			if n.Else != nil {
-				eliminateDeadStores(n.Else)
-			}
-		}
-	}
-
-	written := map[Cell]int{} // cell -> index of last write
-	dead := map[int]bool{}
-	markDead := func(cell Cell) {
-		if prev, ok := written[cell]; ok {
-			dead[prev] = true
-		}
-	}
-	markRead := func(cell Cell) {
-		delete(written, cell)
-	}
-	clearAll := func() {
-		written = map[Cell]int{}
-	}
-
-	for i, node := range block.Nodes {
-		switch n := node.(type) {
-		case *IRConst:
-			markDead(n.Dst)
-			written[n.Dst] = i
-		case *IRZero:
-			markDead(n.Dst)
-			written[n.Dst] = i
-		case *IRCopy:
-			markRead(n.Src)
-			markDead(n.Dst)
-			written[n.Dst] = i
+// markBlockDsts recursively marks every cell written anywhere in
+// `block` as ever-written. Used to pre-populate `everWritten` with
+// writes from nested blocks the main scan hasn't visited yet, so a
+// later `IRZero` on those cells isn't mistaken for a fresh-cell zero.
+func markBlockDsts(block *IRBlock, everWritten map[Cell]bool) {
+	for _, n := range block.Nodes {
+		switch n := n.(type) {
+		case irHasDst:
+			everWritten[n.getDst()] = true
 		case *IRMove:
-			markRead(n.Src)
-			markDead(n.Dst)
-			written[n.Dst] = i
-		case irBinaryOp:
-			dst, src1, src2 := n.getDstSrc1Src2()
-			markRead(src1)
-			markRead(src2)
-			markDead(dst)
-			written[dst] = i
+			everWritten[n.Dst] = true
+			everWritten[n.Src] = true
 		case *IRDivMod:
-			markRead(n.Src1)
-			markRead(n.Src2)
-			markDead(n.QuotDst)
-			markDead(n.RemDst)
-			written[n.QuotDst] = i
-			written[n.RemDst] = i
-		case *IRNot:
-			markRead(n.Src)
-			markDead(n.Dst)
-			written[n.Dst] = i
-		case *IRGetc:
-			markDead(n.Dst)
-			written[n.Dst] = i
-		case *IRAddI:
-			markRead(n.Dst)
-		case *IRSubI:
-			markRead(n.Dst)
-		case *IRPutc:
-			markRead(n.Src)
-		case *IRDynLoad:
-			markRead(n.Index)
-			markDead(n.Dst)
-			written[n.Dst] = i
-		case *IRDynStore:
-			markRead(n.Index)
-			markRead(n.Src)
-		case *IRFree:
-			markDead(n.Cell)
-			delete(written, n.Cell)
-		default:
-			clearAll()
-		}
-	}
-
-	if len(dead) > 0 {
-		out := block.Nodes[:0]
-		for i, node := range block.Nodes {
-			if !dead[i] {
-				out = append(out, node)
+			everWritten[n.QuotDst] = true
+			everWritten[n.RemDst] = true
+		case *IRIf:
+			markBlockDsts(n.Then, everWritten)
+			if n.Else != nil {
+				markBlockDsts(n.Else, everWritten)
+			}
+		case *IRLoop:
+			markBlockDsts(n.Body, everWritten)
+		case *IRDispatch:
+			for _, p := range n.Phases {
+				markBlockDsts(p, everWritten)
 			}
 		}
-		block.Nodes = out
-	}
-}
-
-// invalidateNodeDst removes known values for cells written by the node.
-func invalidateNodeDst(known map[Cell]byte, node IRNode) {
-	switch n := node.(type) {
-	case *IRAdd:
-		delete(known, n.Dst)
-	case *IRSub:
-		delete(known, n.Dst)
-	case *IRMul:
-		delete(known, n.Dst)
-	case *IRDiv:
-		delete(known, n.Dst)
-	case *IRMod:
-		delete(known, n.Dst)
-	case *IRDivMod:
-		delete(known, n.QuotDst)
-		delete(known, n.RemDst)
-	case *IRCmp:
-		delete(known, n.Dst)
-	case *IRNot:
-		delete(known, n.Dst)
-	case *IRGetc:
-		delete(known, n.Dst)
-	case *IRDynLoad:
-		delete(known, n.Dst)
-	case *IRDynStore:
-		// Writes to dynamic slot - can't track.
-	case *IRLoadFrame:
-		delete(known, n.Dst)
-	case *IRFramePush, *IRFramePushDyn, *IRFramePop, *IRStoreFrame, *IRPutc:
-		// No register destination to invalidate.
 	}
 }

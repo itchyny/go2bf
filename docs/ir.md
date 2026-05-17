@@ -132,11 +132,13 @@ This limits the total number of live variables and temporaries.
 
 ## IR Optimization
 
-The IR optimizer (`ir_optimizer.go`) runs two passes on each block.
+The IR optimizer (`ir_optimizer.go`) is a single walk that does three
+cleanups in lockstep on each block.
 
 ### Constant Folding and Delta Conversion
 
-A forward pass tracks known constant values in a `map[Cell]byte`:
+`known[c] byte` tracks the last constant value the optimizer has put
+in cell `c`:
 
 | Optimization | Condition | Result |
 | ------------- | ----------- | -------- |
@@ -144,26 +146,44 @@ A forward pass tracks known constant values in a `map[Cell]byte`:
 | Delta add | cell holds V, target is V+D, D < target | emit `IRAddI{D}` |
 | Delta sub | cell holds V, target is V-D, D < V | emit `IRSubI{D}` |
 
-Note: `IRZero` is never skipped even when the cell is known to be 0,
-because the lowerer reuses freed cells whose register positions may
-hold stale data from the codegen's register cache.
+Note: `IRConst{c, 0}` is never skipped via this path even when the
+cell is known to be 0, because the lowerer reuses freed cells whose
+register positions may hold stale data from the codegen's register
+cache. The fresh-zero pass below handles untouched cells separately.
 
 Delta conversion is particularly effective for string literal printing,
 where consecutive characters often differ by small amounts
 (e.g., "fib(" -> 'f', 'i'=f+3, 'b'=i-7, '('=b-58).
 
-Knowledge is invalidated at control flow boundaries (`IRIf`, `IRLoop`,
-`IRBlock`, `IRDispatch`) since the optimizer cannot track which branch
-executed at runtime.
+`known` is cleared at control-flow boundaries (`IRIf`, `IRLoop`,
+`IRDispatch`, unknown nodes) since the optimizer cannot track which
+branch executed at runtime.
 
-### Dead Store Elimination
+### Fresh Zero Elimination
 
-A second forward pass eliminates writes to cells that are overwritten
-before being read. Tracks the last write index for each cell; when a
-second write occurs with no intervening read or control flow, the
-first write is removed.
+In the same walk, an `IRZero{c}` is dropped when `c` has never been
+written anywhere prior in the program. The BF tape starts at 0 and
+the register cache has no entry for an untouched cell, so the zero
+is a no-op.
 
-Tracking is cleared at control flow boundaries (`IRIf`, `IRLoop`,
-`IRBlock`, `IRDispatch`). The pass recurses into `IRIf` branches
-but not into loop or dispatch bodies, where all writes are
-potentially live due to re-execution.
+`everWritten[c]` -- whether `c` has ever been a `Dst` anywhere in
+the program. Shared across recursive calls so writes in earlier
+branches or pre-marked loop bodies keep later `IRZero`s where the
+cell may carry a stale value or cache entry.
+
+For each node `optimizeBlock` updates `everWritten[c] = true` on
+every `Dst` it sees (including a *dropped* `IRZero{c}`, so the next
+`IRZero{c}` against a now-touched cell stays). On `IRZero{c}`:
+
+```text
+IRZero{c}:
+  !everWritten[c]   ->   drop the IRZero entirely (don't emit);
+                          mark everWritten[c] = true, known[c] = 0
+  everWritten[c]    ->   emit, known[c] = 0
+```
+
+For `IRLoop` and `IRDispatch`, `markBlockDsts` pre-marks every cell
+written anywhere inside the body before the recursive walk visits
+it. Without this, a body-local `IRZero{c}` used to reset `c`
+between iterations would be the *first* `Dst` the walk sees and
+would drop -- breaking iterations after the first.

@@ -299,7 +299,7 @@ The compiler pipeline:
 3. **Lower** - Converts AST to a structured IR
    (intermediate representation)
 4. **Optimize IR** - Constant folding, delta conversion,
-   dead store elimination
+   fresh-zero elimination
 5. **Generate** - Converts IR to Brainfuck using
    a register-cache CPU model with optimized register
    allocation and stack traffic reduction

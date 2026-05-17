@@ -11,10 +11,10 @@ type IRNode interface {
 	irNode()
 }
 
-// irBinaryOp is an IR node with Dst, Src1, Src2 fields.
-type irBinaryOp interface {
+// irHasDst is an IR node that writes to a single cell.
+type irHasDst interface {
 	IRNode
-	getDstSrc1Src2() (Cell, Cell, Cell)
+	getDst() Cell
 }
 
 // IRBlock is a sequence of IR nodes.
@@ -31,6 +31,8 @@ type IRZero struct {
 
 func (*IRZero) irNode() {}
 
+func (n *IRZero) getDst() Cell { return n.Dst }
+
 // IRConst sets a cell to a constant byte value.
 type IRConst struct {
 	Dst   Cell
@@ -38,6 +40,8 @@ type IRConst struct {
 }
 
 func (*IRConst) irNode() {}
+
+func (n *IRConst) getDst() Cell { return n.Dst }
 
 // IRMove moves src to dst (destructive, src becomes 0).
 type IRMove struct {
@@ -55,6 +59,8 @@ type IRCopy struct {
 
 func (*IRCopy) irNode() {}
 
+func (n *IRCopy) getDst() Cell { return n.Dst }
+
 // IRAddI adds a constant to a cell in place.
 type IRAddI struct {
 	Dst   Cell
@@ -62,6 +68,8 @@ type IRAddI struct {
 }
 
 func (*IRAddI) irNode() {}
+
+func (n *IRAddI) getDst() Cell { return n.Dst }
 
 // IRSubI subtracts a constant from a cell in place.
 type IRSubI struct {
@@ -71,6 +79,8 @@ type IRSubI struct {
 
 func (*IRSubI) irNode() {}
 
+func (n *IRSubI) getDst() Cell { return n.Dst }
+
 // IRAdd sets dst = src1 + src2.
 type IRAdd struct {
 	Dst, Src1, Src2 Cell
@@ -78,9 +88,7 @@ type IRAdd struct {
 
 func (*IRAdd) irNode() {}
 
-func (n *IRAdd) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRAdd) getDst() Cell { return n.Dst }
 
 // IRSub sets dst = src1 - src2.
 type IRSub struct {
@@ -89,9 +97,7 @@ type IRSub struct {
 
 func (*IRSub) irNode() {}
 
-func (n *IRSub) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRSub) getDst() Cell { return n.Dst }
 
 // IRMul sets dst = src1 * src2.
 type IRMul struct {
@@ -100,9 +106,7 @@ type IRMul struct {
 
 func (*IRMul) irNode() {}
 
-func (n *IRMul) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRMul) getDst() Cell { return n.Dst }
 
 // IRDiv sets dst = src1 / src2.
 type IRDiv struct {
@@ -111,9 +115,7 @@ type IRDiv struct {
 
 func (*IRDiv) irNode() {}
 
-func (n *IRDiv) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRDiv) getDst() Cell { return n.Dst }
 
 // IRMod sets dst = src1 % src2.
 type IRMod struct {
@@ -122,9 +124,7 @@ type IRMod struct {
 
 func (*IRMod) irNode() {}
 
-func (n *IRMod) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRMod) getDst() Cell { return n.Dst }
 
 // IRDivMod computes both quotient and remainder in one operation.
 type IRDivMod struct {
@@ -140,9 +140,7 @@ type IRAnd struct {
 
 func (*IRAnd) irNode() {}
 
-func (n *IRAnd) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRAnd) getDst() Cell { return n.Dst }
 
 // IROr sets dst = src1 | src2 (bitwise OR).
 type IROr struct {
@@ -151,9 +149,7 @@ type IROr struct {
 
 func (*IROr) irNode() {}
 
-func (n *IROr) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IROr) getDst() Cell { return n.Dst }
 
 // IRXor sets dst = src1 ^ src2 (bitwise XOR).
 type IRXor struct {
@@ -162,9 +158,7 @@ type IRXor struct {
 
 func (*IRXor) irNode() {}
 
-func (n *IRXor) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRXor) getDst() Cell { return n.Dst }
 
 // CmpOp is a comparison operation.
 type CmpOp int
@@ -194,9 +188,7 @@ type IRCmp struct {
 
 func (*IRCmp) irNode() {}
 
-func (n *IRCmp) getDstSrc1Src2() (Cell, Cell, Cell) {
-	return n.Dst, n.Src1, n.Src2
-}
+func (n *IRCmp) getDst() Cell { return n.Dst }
 
 // IRNot computes logical not: dst = (src == 0) ? 1 : 0.
 type IRNot struct {
@@ -205,6 +197,8 @@ type IRNot struct {
 }
 
 func (*IRNot) irNode() {}
+
+func (n *IRNot) getDst() Cell { return n.Dst }
 
 // IRIf is a structured if/else.
 // Executes Then if Cond != 0, Else otherwise.
@@ -239,6 +233,8 @@ type IRGetc struct {
 
 func (*IRGetc) irNode() {}
 
+func (n *IRGetc) getDst() Cell { return n.Dst }
+
 // IRDynLoad loads a value from a dynamically indexed array slot.
 type IRDynLoad struct {
 	Dst      Cell
@@ -247,6 +243,8 @@ type IRDynLoad struct {
 }
 
 func (*IRDynLoad) irNode() {}
+
+func (n *IRDynLoad) getDst() Cell { return n.Dst }
 
 // IRDynStore stores a value to a dynamically indexed array slot.
 type IRDynStore struct {
@@ -295,6 +293,8 @@ type IRLoadFrame struct {
 }
 
 func (*IRLoadFrame) irNode() {}
+
+func (n *IRLoadFrame) getDst() Cell { return n.Dst }
 
 // IRStoreFrame stores a register cell's value into the current frame's slot.
 type IRStoreFrame struct {

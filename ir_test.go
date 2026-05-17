@@ -46,26 +46,30 @@ func TestIRNode(t *testing.T) {
 	}
 }
 
-func TestIRBinaryOp(t *testing.T) {
-	ops := []irBinaryOp{
-		&IRAdd{Dst: 10, Src1: 20, Src2: 30},
-		&IRSub{Dst: 11, Src1: 21, Src2: 31},
-		&IRMul{Dst: 12, Src1: 22, Src2: 32},
-		&IRDiv{Dst: 13, Src1: 23, Src2: 33},
-		&IRMod{Dst: 14, Src1: 24, Src2: 34},
-		&IRAnd{Dst: 15, Src1: 25, Src2: 35},
-		&IROr{Dst: 16, Src1: 26, Src2: 36},
-		&IRXor{Dst: 17, Src1: 27, Src2: 37},
-		&IRCmp{Op: CmpLt, Dst: 18, Src1: 28, Src2: 38},
+func TestIRHasDst(t *testing.T) {
+	ops := []irHasDst{
+		&IRZero{Dst: 10},
+		&IRConst{Dst: 11},
+		&IRCopy{Dst: 12},
+		&IRAddI{Dst: 13},
+		&IRSubI{Dst: 14},
+		&IRAdd{Dst: 15},
+		&IRSub{Dst: 16},
+		&IRMul{Dst: 17},
+		&IRDiv{Dst: 18},
+		&IRMod{Dst: 19},
+		&IRAnd{Dst: 20},
+		&IROr{Dst: 21},
+		&IRXor{Dst: 22},
+		&IRCmp{Dst: 23},
+		&IRNot{Dst: 24},
+		&IRGetc{Dst: 25},
+		&IRDynLoad{Dst: 26},
+		&IRLoadFrame{Dst: 27},
 	}
-	for _, op := range ops {
-		dst, src1, src2 := op.getDstSrc1Src2()
-		if dst == 0 || src1 == 0 || src2 == 0 {
-			t.Errorf("unexpected zero field in %T", op)
-		}
-		if src1 != dst+10 || src2 != dst+20 {
-			t.Errorf("unexpected fields in %T: %d %d %d",
-				op, dst, src1, src2)
+	for i, op := range ops {
+		if got, want := op.getDst(), Cell(10+i); got != want {
+			t.Errorf("%T.getDst() = %d, want %d", op, got, want)
 		}
 	}
 }

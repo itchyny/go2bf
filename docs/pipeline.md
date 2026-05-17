@@ -81,14 +81,23 @@ Converts the AST into a structured IR (see [`ir.md`](ir.md)).
 
 ## 4. Optimize IR (`ir_optimizer.go`)
 
-Two passes on the IR before code generation:
+A single walk on the IR before code generation, doing three cleanups
+in lockstep:
 
-- **Constant folding and delta conversion**: tracks known cell values;
-  converts `IRConst` to `IRAddI`/`IRSubI` when the delta is smaller
-  (common in string literal printing)
-- **Dead store elimination**: removes writes to cells that are
-  overwritten before being read, with tracking cleared at control flow
-  boundaries
+- **Constant folding**: tracks known cell values; drops `IRConst{c,v}`
+  when `c` already holds `v`
+- **Delta conversion**: converts `IRConst` to `IRAddI`/`IRSubI` when
+  the delta from the prior known value is smaller (common in string
+  literal printing)
+- **Fresh-zero elimination**: removes `IRZero` on cells that have
+  never been written anywhere prior (BF tape starts at 0, so the
+  zero is a no-op)
+
+Constant tracking is cleared at control-flow boundaries (`IRIf`,
+`IRLoop`, `IRDispatch`, unknown nodes); loop and dispatch bodies
+pre-mark all their writes before being walked, so a body-local
+`IRZero` used to reset a cell between iterations isn't mistaken
+for a fresh-cell zero
 
 ## 5. Generate BF (`codegen.go`)
 
