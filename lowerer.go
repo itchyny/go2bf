@@ -290,6 +290,28 @@ func Lower(result *AnalysisResult) (*Program, error) {
 		}
 	}
 
+	// Inline init() before main, if defined. init() takes no params,
+	// returns nothing, and is called once at program start. A bare
+	// `return` inside init terminates init early but not main, so a
+	// dedicated returnFlag is set up if needed.
+	if initInfo, ok := result.Funcs["init"]; ok {
+		l.inFunc = true
+		l.pushScope()
+		if hasReturn(initInfo.Body) {
+			l.returnFlag = l.allocCell()
+			l.emit(&IRZero{Dst: l.returnFlag})
+		}
+		if err := l.lowerStmts(initInfo.Body.List); err != nil {
+			return nil, err
+		}
+		if l.returnFlag != 0 {
+			l.freeCell(l.returnFlag)
+			l.returnFlag = 0
+		}
+		l.popScope()
+		l.inFunc = false
+	}
+
 	// Set up return flag if the body contains return statements, or any
 	// goto -- the goto dispatch loop uses returnFlag to skip the rest of
 	// a segment after a jump.

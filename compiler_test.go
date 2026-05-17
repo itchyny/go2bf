@@ -2206,6 +2206,20 @@ func get() uint16 { return n }
 func main() { add(250); add(325); print(get()) }`,
 			"", "675",
 		},
+		{
+			"init function runs before main",
+			`package main
+var b byte
+var msg string
+func init() {
+	b = 32
+	msg = "hi"
+}
+func main() {
+	println(b, msg)
+}`,
+			"", "32 hi\n",
+		},
 		// --- Type conversion ---
 		{
 			"string conversion in print",

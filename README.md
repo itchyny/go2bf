@@ -381,6 +381,8 @@ The generated Brainfuck uses a CPU-like execution model:
   patterns
 - `defer` for function calls
   (LIFO order; not supported inside loops)
+- `init()` function, inlined before `main`
+  (one per package; multiple `init`s not yet supported)
 
 ### Arrays
 
