@@ -5,9 +5,7 @@ package main
 func main() {
 	a, b := uint32(0), uint32(1)
 	for i := 1; i <= 47; i++ {
-		c := a + b
-		a = b
-		b = c
+		a, b = b, a+b
 		print("fib(")
 		print(i)
 		print(") = ")
