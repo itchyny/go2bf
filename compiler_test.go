@@ -6496,6 +6496,36 @@ func main() {
 			"", "200\n",
 		},
 		{
+			"string concat with byte-cast operand",
+			`package main
+func line(c byte, n byte) string {
+	s := ""
+	for i := byte(0); i < n; i++ {
+		s += string(c)
+	}
+	return s
+}
+func main() {
+	for i := byte(0); i < 12; i++ {
+		s := line('A'+i, 8)
+		println(i, s)
+	}
+}`,
+			"", `0 AAAAAAAA
+1 BBBBBBBB
+2 CCCCCCCC
+3 DDDDDDDD
+4 EEEEEEEE
+5 FFFFFFFF
+6 GGGGGGGG
+7 HHHHHHHH
+8 IIIIIIII
+9 JJJJJJJJ
+10 KKKKKKKK
+11 LLLLLLLL
+`,
+		},
+		{
 			"slice literal as function argument",
 			`package main
 func sum(s []byte) byte {

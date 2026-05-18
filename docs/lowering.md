@@ -389,6 +389,16 @@ leak every intermediate buffer and exhaust the byte-sized
    when `s` isn't at the top. See `lowerSliceSelfConcat` and
    `ensureSliceCapByCell`.
 
+   String literals (`s += "..."`) and byte-cast operands
+   (`s += string(c)` for a byte expression `c`) skip the source-
+   materialization step and write directly into `s`'s buffer.
+   Materializing them first would bump `heapPtr` past `s`'s
+   buffer, defeating the at-top check and falling through to the
+   realloc path -- which would then leak both the old `s` buffer
+   and the materialized source each iteration, exhausting the
+   byte-sized `heapPtr` after ~50 iterations of a tight builder
+   loop.
+
 2. **Scope-pop slice buffer reclaim with escape tracking.** Each
    `sliceBinding` carries an `escaped` flag. `popScope` walks its
    bindings and, for any slice whose flag is still false, emits a

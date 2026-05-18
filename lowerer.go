@@ -1001,6 +1001,33 @@ func (l *Lowerer) lowerSliceSelfConcat(si sliceInfo, other ast.Expr) error {
 		l.appendLiteralBytes(si, lit)
 		return nil
 	}
+	// Special-case `s += string(byteExpr)` -- otherwise materializing
+	// `string(byteExpr)` via `evalByteToString` allocates a 1-byte heap
+	// slot every iteration, which then leaks because `ensureSliceCapByCell`
+	// sees `heapPtr` has moved and falls through to the realloc path.
+	if call, ok := other.(*ast.CallExpr); ok && len(call.Args) == 1 {
+		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "string" && !l.isStringExpr(call.Args[0]) {
+			r, err := l.lowerExpr(call.Args[0])
+			if err != nil {
+				return err
+			}
+			l.ensureSliceCapBy(si, 1)
+			addr := l.allocCell()
+			l.emit(&IRAdd{Dst: addr, Src1: si.ptr, Src2: si.len})
+			if r.temp {
+				l.ptrStore(addr, r.cell)
+				l.freeCell(r.cell)
+			} else {
+				valCell := l.allocCell()
+				l.emit(&IRCopy{Dst: valCell, Src: r.cell})
+				l.ptrStore(addr, valCell)
+				l.freeCell(valCell)
+			}
+			l.freeCell(addr)
+			l.emit(&IRAddI{Dst: si.len, Value: 1})
+			return nil
+		}
+	}
 	src, srcTemp, err := l.resolveStringSlice(other)
 	if err != nil {
 		return err
