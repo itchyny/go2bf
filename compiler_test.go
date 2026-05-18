@@ -6081,6 +6081,25 @@ func main() {
 			"", "1 2 5 6\n",
 		},
 		{
+			"2d array of structs with variable index",
+			`package main
+type P struct { x, y byte }
+func main() {
+	var grid [3][3]P
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 3; j++ {
+			grid[i][j] = P{x: i, y: j}
+		}
+	}
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 3; j++ {
+			println(grid[i][j].x, grid[i][j].y)
+		}
+	}
+}`,
+			"", "0 0\n0 1\n0 2\n1 0\n1 1\n1 2\n2 0\n2 1\n2 2\n",
+		},
+		{
 			"struct with 2d array field",
 			`package main
 type Matrix struct { data [2][3]byte; rows byte }

@@ -4470,8 +4470,12 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 		subArr := arrayInfo{base: dst, elemCount: base.elemSize, elemSize: 1}
 		return l.lowerCompositeLitInto(subArr, comp)
 	}
-	// Constant index: write directly into the element.
-	if constIdx, ok := l.constValue(indexExpr); ok {
+	// Constant index: write directly into the element. When `base` is a
+	// flat-offset view from a variable outer index (`grid[i][CONST]` on a
+	// 2D array), the outer offset is a runtime value in `base.cell` and
+	// the original array origin is `base.flatBase`; fall through to the
+	// dynamic-store path below.
+	if constIdx, ok := l.constValue(indexExpr); ok && base.flatBase == 0 {
 		if base.elemCount > 0 && constIdx >= base.elemCount {
 			return fmt.Errorf("array index %d out of bounds [0:%d]", constIdx, base.elemCount)
 		}
@@ -4520,12 +4524,23 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 		l.freeCellRange(valBase, base.elemSize)
 		return nil
 	}
+	// When base is a flat-offset view (`grid[i]` on a 2D array), the array
+	// origin is `base.flatBase` and `base.cell` holds the outer offset
+	// (`i * outerElemSize`); combine it with `indexExpr * base.elemSize`
+	// to form the flat index relative to `base.flatBase`.
+	arrayBase := base.cell
+	if base.flatBase != 0 {
+		arrayBase = base.flatBase
+	}
 	ai := arrayInfo{
-		base: base.cell, elemCount: base.elemCount, elemSize: base.elemSize,
+		base: arrayBase, elemCount: base.elemCount, elemSize: base.elemSize,
 	}
 	baseOffset, err := l.lowerCompositeVarIndex(ai, indexExpr)
 	if err != nil {
 		return err
+	}
+	if base.flatBase != 0 {
+		l.emit(&IRAdd{Dst: baseOffset.cell, Src1: baseOffset.cell, Src2: base.cell})
 	}
 	flatArr := flatArrayOf(ai)
 	srcs := make([]Cell, base.elemSize)
