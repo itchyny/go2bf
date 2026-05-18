@@ -3956,7 +3956,7 @@ func main() {
 			"", "99\n2\n6\n6\n6\n",
 		},
 		{
-			"switch with tag in recursive function",
+			"switch with print cases in recursive function",
 			`package main
 func f(n byte) byte {
 	if n == 0 { return 0 }

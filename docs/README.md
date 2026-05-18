@@ -20,8 +20,8 @@ from Go to Brainfuck.
 ## Compilation
 
 - [Lowering](lowering.md) - how Go constructs are translated to IR:
-  function inlining, structs, arrays, slices, strings, multi-byte
-  integers, defer, control flow, and `divmod` fusion
+  function inlining, structs, arrays, slices, strings, pointers,
+  multi-byte integers, control flow, defer, and `divmod` fusion
 - [IR](ir.md) - the intermediate representation: node types, cell
   allocation, and peephole optimization
 - [Code Generation](codegen.md) - BF generation for arithmetic,
@@ -30,5 +30,5 @@ from Go to Brainfuck.
 ## Recursion
 
 - [Recursion](recursion.md) - tail-call optimization, phase dispatch
-  for general recursion, `noRetFlag`, conditional calls for if-branches,
-  and execution traces
+  for general recursion, `noRetFlag`, recursive calls in branches,
+  and multi-byte integers.

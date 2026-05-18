@@ -165,28 +165,6 @@ Each iteration toggles r between 0 and 1, incrementing q every other
 step. This avoids the 6-cell temp area and counter-based algorithm
 that the general `divmod` requires.
 
-## String Literals
-
-String constants in `print`/`println` are emitted as sequences of
-`IRConst` + `IRPutc`. The IR optimizer's delta conversion often reduces
-these to `IRAddI`/`IRSubI` chains:
-
-```text
-// print("Hi!")
-IRConst{t, 72}   // 'H'
-IRPutc{t}
-IRAddI{t, 33}    // 72+33=105='i' (delta, not full const)
-IRPutc{t}
-IRSubI{t, 72}    // 105-72=33='!'
-IRPutc{t}
-```
-
-## String Conversion
-
-`string(byte)` in `print`/`println` arguments outputs the byte as a
-raw character via `IRPutc`, bypassing `emitPrintByte`.
-For example, `print(string(65))` outputs `A`.
-
 ## Decimal Number Printing
 
 `emitPrintByte` prints a byte (0-255) as a decimal number with
@@ -314,9 +292,6 @@ Without `IRFree`, the register holding `t` stays dirty in the cache.
 At the next `IRIf` or `IRLoop`, `flush` writes it to stack even
 though nothing will read it. With `IRFree`, the register is freed
 immediately, saving one `storeToStack` call.
-
-The IR optimizer also benefits: `IRFree` after a write marks the
-write as a dead store, which `eliminateDeadStores` can remove.
 
 This gives 5-20% output size reduction depending on how many
 temporaries the program uses.

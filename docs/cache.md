@@ -84,15 +84,29 @@ without writing `x` back to the stack.
 
 ## Cache Coherence
 
-The cache is invalidated after any operation that makes register contents
-potentially stale:
+The cache is invalidated wherever register contents could become stale:
 
-- After `IRIf`/`IRLoop`/`IRBlock`: the branch may have modified stack
-  slots that are cached in registers
-- After `IRDispatch`: recursive calls modify the stack extensively
-- After `IRDynStore`: dynamic writes could hit any slot, so all cached
-  values are suspect
+- **Inside an `IRIf` body**: each branch ends with `flushAndInvalidate`
+  so a subsequent `IRDynStore` (or any other write within the body)
+  doesn't leave a register holding a now-stale copy of a slot the
+  body wrote.
+- **Before and inside `IRLoop` / `IRDispatch`**: `flushAndInvalidate`
+  fires before the loop and after every iteration. The condition is
+  re-checked by the trailing `]`, so any cache state that survived
+  the body would be unsound on the next pass.
+- **At `IRDynStore` / `IRDynLoad`**: the runtime-determined slot can
+  alias any cached cell, so all cached values are suspect.
+- **At `IRFramePush` / `IRFramePop` / `IRFramePushDyn` /
+  `IRFramePopDyn`**: stack frame layout changes; cached slot IDs may
+  no longer point to live values.
 
-Individual cells can be flushed with `flushCell(cell)` when a specific
-stack slot must be up-to-date (e.g., before a dynamic load that might
-read the same slot).
+The pre-if `flush()`-only variant (see "Flush-Only Before If" in
+[`codegen.md`](codegen.md)) keeps the cache valid for code that
+follows the if when the body has no `IRDynStore`. The body's own
+end-of-branch `flushAndInvalidate` handles the case where it runs.
+
+Individual cells are flushed with `flushCell(cell)` when one operand
+of an IR op will be consumed by the BF algorithm itself
+(`IRCmp`'s consumed-operand path). Without the flush, the cache
+would hold a register copy of a slot whose stack value just got
+clobbered by the comparison loop.

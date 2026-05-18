@@ -19,7 +19,7 @@ type AnalysisResult struct {
 	IntConsts    map[string]uint64 // compile-time multi-byte integer constants (uint16/uint32/uint64)
 	IntConstSize map[string]int    // constant name -> integer size (2, 4, or 8)
 	StringConsts map[string]string // compile-time string constants
-	GlobalVars   []*ast.GenDecl    // top-level scalar var declarations, in source order
+	GlobalVars   []*ast.GenDecl    // top-level var declarations (scalar or composite), in source order
 	fset         *token.FileSet
 }
 

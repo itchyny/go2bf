@@ -28,8 +28,10 @@ full stage overview.
 
 The BF tape uses a CPU-like model: 5 registers at positions
 1,2,4,5,7 (interleaved with algo temps at 3,6 for neighbor
-optimization), remaining algo temps at 9-23, phase temps at
-25-39, sentinels at 0 and 40, stride-3 stack starting at 41.
+optimization), remaining algo temps at 9-23, then a dynamic
+phase-temp range (empty by default; populated when the compile
+driver bumps `sentinelFwd` past 24 to fit a recursive function),
+then the forward sentinel, two pad cells, and the stride-3 stack.
 See `docs/tape.md` for the layout.
 
 The register cache uses LRU eviction with round-robin allocation.
@@ -176,9 +178,9 @@ inside loops inside recursive functions).
 
 uint16/uint32/uint64 are decomposed into byte-level IR at
 lowering time. `exprResult.intSize` tracks width (2, 4, 8).
-`scope.intCells`/`scope.intSizes` store variables.
-All multi-byte operations use unified `*Int` functions
-(e.g., `emitAddInt`, `lowerBinaryInt`). See
+Multi-byte locals live as `*intBinding{base, size}` in the
+scope map. All multi-byte operations use unified `*Int`
+functions (e.g., `emitAddInt`, `lowerBinaryInt`). See
 `docs/lowering.md` for the full design.
 
 Key rules when modifying multi-byte code:

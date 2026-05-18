@@ -122,8 +122,13 @@ since struct types are package-level after analysis.
 ### Top-level Var Declarations
 
 The analyzer collects top-level (global) `var` declarations into
-`AnalysisResult.GlobalVars`, rejecting any non-scalar type upfront.
-`Lower` processes them right after the constant-binding phase by
+`AnalysisResult.GlobalVars`. Both scalar and composite
+(array/struct/slice) globals are accepted, and the type may be
+omitted when an initializer is present -- the shape is inferred
+from the RHS, same as `:=`. Zero-length arrays (`[0]T`, `[...]T{}`)
+are rejected upfront.
+
+`Lower` processes globals right after the constant-binding phase by
 wrapping each `*ast.GenDecl` in a synthetic `ast.DeclStmt` and
 dispatching through the same `lowerDecl` path used for locals.
 Allocation, binding, and initializer code all reuse the existing
@@ -498,6 +503,29 @@ bytes pre-stored.
   slice argument (or a string-shaped exprResult) and runs
   `emitPrintBytes`, which loops over `len` writing each byte
   with `IRPutc`. Multiple args are joined with spaces.
+  - **String-literal args.** When the argument resolves to a
+    compile-time string (literal, string const, or const-folded
+    `+` chain), the lowerer skips the slice path entirely and
+    iterates the bytes, emitting `IRConst{t, b}; IRPutc{t}` per
+    character. The IR optimizer's delta conversion then folds the
+    consecutive `IRConst`s into `IRAddI`/`IRSubI` chains:
+
+    ```text
+    // print("Hi!")
+    IRConst{t, 72}   // 'H'
+    IRPutc{t}
+    IRAddI{t, 33}    // 72+33=105='i'
+    IRPutc{t}
+    IRSubI{t, 72}    // 105-72=33='!'
+    IRPutc{t}
+    ```
+
+  - **`string(byteExpr)` args.** Routed to a bare `IRPutc` (raw
+    character output) rather than `emitPrintByte` (which prints
+    decimal). `print(string(65))` outputs `A`, not `65`. When the
+    inner argument is already string-shaped, the `string(...)`
+    cast is an identity and the slice path runs over the full
+    contents.
 - `s == t` / `s != t` -- `lowerSliceCompare` initializes
   `result = (len(a) == len(b))`, then loops byte-by-byte ANDing
   per-byte equality into `result`. The loop is wrapped in

@@ -1,7 +1,14 @@
 # Stack
 
 All Go variables, temporaries, and function parameters live on a stack
-that grows rightward from position 43 on the Brainfuck tape.
+that grows rightward starting at position `sentinelFwd + 3` on the
+Brainfuck tape (just past the forward sentinel and two pad cells).
+
+The position diagrams below use **`sentinelFwd = 40`** (the layout
+after two bumps) for concreteness. The default layout has
+`sentinelFwd = 24`, which shifts every absolute position in this page
+down by 16 (sentinel at 24, pad at 25/26, stack starts at 27). See
+[`tape.md`](tape.md) for how the forward sentinel grows.
 
 ## Slot Layout
 
@@ -29,18 +36,19 @@ Pos:  40  41  42  43  44  45  46  47  48  49  50  51  52 ...
 
 ### Guard Column Scanning
 
-The sentinel at position 40 is always 0. Guard cells form a
-column at positions 43, 46, 49, 52, ... (stride 3). To scan
-to the stack end: `>>>[>>>]` -- first `>>>` moves past the
-sentinel to the first guard (position 43), then `[>>>]` scans
-the guard column and stops at the first 0 (the unallocated
-slot past the last allocated one).
+The forward sentinel (position 40 in these diagrams) is always 0.
+Guard cells form a column at stride 3 starting two cells past the
+sentinel. To scan to the stack end: `>>>[>>>]` -- first `>>>` moves
+past the two pad cells to the first guard, then `[>>>]` scans the
+guard column and stops at the first 0 (the unallocated slot past the
+last allocated one).
 
 ## Cell Allocation
 
 The lowerer assigns each variable an abstract **cell** ID starting at
-`numFixed` (41). Cell N maps to stack slot `N - numFixed` and tape
-position `sentinelFwd + 4 + 3 * slot`.
+`sentinelFwd + 1`. `slotOf(cell) = cell - (sentinelFwd + 1)` maps a
+cell back to its stack slot, and `stackValuePos(slot) = sentinelFwd
++ 4 + 3 * slot` gives the slot's value-cell tape position.
 
 Cells are allocated sequentially and freed when temporaries go out of
 scope. The allocator reuses freed cells (free list). For contiguous
@@ -59,7 +67,7 @@ slots, a counter loop avoids unrolling:
 [>+<-[>>>+<<<-]>>>]     loop: set guard, shift counter forward
 <<                      back to last guard column
 [<<<]                   scan guard column back to sentinel
-<<<<<<<<                move to highway marker at position 32
+<<<<<<<<                move to highway marker (sentinelFwd - 8 = 32)
 [<<<<<<<<]              scan highway back to position 0
 ```
 
