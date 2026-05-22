@@ -223,6 +223,10 @@ type sliceInfo struct {
 type exprResult struct {
 	cell     Cell
 	temp     bool // true if the caller owns this cell and must free it
+	ownsHeap bool // true if the caller is the sole holder of a freshly
+	//                 allocated heap region (ptr..ptr+cap); when discarding
+	//                 the result without binding it, the consumer should
+	//                 `freeIfHeapTop` to reclaim the buffer.
 	flatBase Cell // for flat-offset results: base of the original array
 	lenCell  Cell // runtime length cell (0 if compile-time elemCount)
 	capCell  Cell // runtime capacity cell (0 if not applicable)
@@ -1001,10 +1005,14 @@ func (l *Lowerer) lowerSliceSelfConcat(si sliceInfo, other ast.Expr) error {
 		l.appendLiteralBytes(si, lit)
 		return nil
 	}
-	// Special-case `s += string(byteExpr)` -- otherwise materializing
-	// `string(byteExpr)` via `evalByteToString` allocates a 1-byte heap
-	// slot every iteration, which then leaks because `ensureSliceCapByCell`
-	// sees `heapPtr` has moved and falls through to the realloc path.
+	// `s += string(byteExpr)` is structurally awkward in the general
+	// path: `evalByteToString` allocates 1 cell at heap top, then
+	// `ensureSliceCapByCell` allocates new s above it (the at-top check
+	// fails because heapPtr has moved), leaving the byte orphaned in
+	// the middle of the heap. Special-case the byte-cast to compute the
+	// byte in a register and store it directly via the cap-extended
+	// path, avoiding the materialization. (The literal special-case
+	// above is the same shape: known statically-sized source.)
 	if call, ok := other.(*ast.CallExpr); ok && len(call.Args) == 1 {
 		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "string" && !l.isStringExpr(call.Args[0]) {
 			r, err := l.lowerExpr(call.Args[0])
@@ -3286,7 +3294,11 @@ func (l *Lowerer) lowerPrint(name string, args []ast.Expr, lowerExpr func(ast.Ex
 		}
 		// String-like slice expression result.
 		if !rawChar && r.isPointer && r.elemSize == 1 && r.elemType == "" && r.lenCell != 0 {
-			l.emitPrintBytes(sliceInfo{ptr: r.cell, len: r.lenCell, cap: r.capCell, elemSize: 1})
+			si := sliceInfo{ptr: r.cell, len: r.lenCell, cap: r.capCell, elemSize: 1}
+			l.emitPrintBytes(si)
+			if r.ownsHeap {
+				l.freeIfHeapTop(si)
+			}
 			if r.temp {
 				l.freeCell(r.cell)
 				l.freeCell(r.lenCell)
@@ -3872,6 +3884,10 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 		r, err := l.lowerExpr(rhs)
 		if err != nil {
 			return err
+		}
+		if r.ownsHeap && r.lenCell != 0 {
+			si := sliceInfo{ptr: r.cell, len: r.lenCell, cap: r.capCell, elemSize: 1}
+			l.freeIfHeapTop(si)
 		}
 		if r.temp {
 			l.freeCellRange(r.cell, r.cellCount())
@@ -5586,9 +5602,12 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 			// Literal range source: lowerExpr can't handle composite
 			// literals, so route slice/string shapes through
 			// lowerSliceExpr and array shapes through lowerArrayExpr.
+			// Mark ownsHeap conservatively for the slice path so the
+			// loop-end reclaim runs; the runtime at-top check no-ops
+			// when the source was actually a view (e.g. `s[i:j]`).
 			if si, sliceErr := l.lowerSliceExpr(s.X); sliceErr == nil {
 				r = exprResult{
-					cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true,
+					cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true, ownsHeap: true,
 					exprShape: exprShape{elemSize: si.elemSize, elemSlice: si.elemSlice, isPointer: true},
 				}
 				err = nil
@@ -5634,10 +5653,12 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		}
 	} else if l.isStringExpr(s.X) {
 		// `for range "hello"` etc.: materialize the string into a temp
-		// slice header and use its length for iteration.
+		// slice header and use its length for iteration. Mark ownsHeap
+		// conservatively so the loop-end reclaim runs; the runtime
+		// at-top check no-ops when the source was actually a view.
 		if si, err := l.lowerSliceExpr(s.X); err == nil {
 			rangeBase = exprResult{
-				cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true,
+				cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true, ownsHeap: true,
 				exprShape: exprShape{elemSize: 1, isPointer: true},
 			}
 		}
@@ -5781,6 +5802,10 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		l.freeCellRange(limit.cell, limit.intSize)
 	}
 	if rangeBase.temp && rangeBase.lenCell != 0 {
+		if rangeBase.ownsHeap {
+			si := sliceInfo{ptr: rangeBase.cell, len: rangeBase.lenCell, cap: rangeBase.capCell, elemSize: 1}
+			l.freeIfHeapTop(si)
+		}
 		l.freeCell(rangeBase.cell)
 		l.freeCell(rangeBase.lenCell)
 		l.freeCell(rangeBase.capCell)
@@ -7005,15 +7030,18 @@ func (l *Lowerer) lowerIdent(e *ast.Ident, lookupVar func(string) (int, error)) 
 		}
 	case *stringConstBinding:
 		// Materialize as a fresh heap-backed slice so it can flow into
-		// len/index/slice/concat. The 3-cell header is temp; the caller
-		// is expected to free via the lenCell/capCell pattern.
+		// len/index/slice/concat. The 3-cell header is temp and the
+		// heap region is freshly allocated by this call; ownsHeap = true
+		// signals the consumer to reclaim via `freeIfHeapTop` when
+		// discarding without binding.
 		lit := &ast.BasicLit{Kind: token.STRING, Value: strconv.Quote(b.value)}
 		si, err := l.evalStringLiteral(lit)
 		if err != nil {
 			return exprResult{}, err
 		}
 		return exprResult{
-			cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+			cell: si.ptr, temp: true, ownsHeap: true,
+			lenCell: si.len, capCell: si.cap,
 			exprShape: exprShape{elemSize: 1, isPointer: true},
 		}, nil
 	case *constBinding:
@@ -8098,7 +8126,8 @@ func (l *Lowerer) lowerStringConcat(e *ast.BinaryExpr) (exprResult, bool, error)
 	}
 
 	return exprResult{
-		cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+		cell: si.ptr, temp: true, ownsHeap: true,
+		lenCell: si.len, capCell: si.cap,
 		exprShape: exprShape{elemSize: 1, isPointer: true},
 	}, true, nil
 }
@@ -9310,7 +9339,20 @@ func (l *Lowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 		}
 		return exprResult{}, fmt.Errorf("cannot index non-array expression")
 	}
-	return l.indexInto(base, e.Index)
+	r, err := l.indexInto(base, e.Index)
+	if err != nil {
+		return exprResult{}, err
+	}
+	// Reclaim base's heap region when base was a freshly-materialized
+	// owner (e.g. `strConst[i]` materializes the const via
+	// `evalStringLiteral`). The indexed byte has been copied into `r`,
+	// so the source buffer is dead.
+	if base.ownsHeap {
+		si := sliceInfo{ptr: base.cell, len: base.lenCell, cap: base.capCell, elemSize: 1}
+		l.freeIfHeapTop(si)
+		l.freeSliceInfo(si)
+	}
+	return r, nil
 }
 
 // indexInto indexes a composite result by the given expression.

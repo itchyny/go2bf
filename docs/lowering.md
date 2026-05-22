@@ -384,7 +384,7 @@ copies `len(t) * elemSize` cells from source to destination.
 The bump allocator never moves `heapPtr` backwards on its own, so
 slice-builder patterns (`s := ""; for ... { s += x }`) would otherwise
 leak every intermediate buffer and exhaust the byte-sized
-`heapPtr` quickly. Two complementary mechanisms reclaim space:
+`heapPtr` quickly. Three complementary mechanisms reclaim space:
 
 1. **In-place extend on self-concat.** When the lowerer sees
    `s = s + x` (the desugared form of `s += x`) and `s` is at the
@@ -433,6 +433,30 @@ The runtime `heapPtr == ptr + cap` check is the safety net: even
 if an escape is missed, the reclaim only fires when the buffer is
 the topmost allocation. A misplaced alias farther down the heap
 naturally falls through.
+
+3. **`exprResult.ownsHeap` for transient temps.** Scope-pop reclaim
+   covers slice *bindings*, but expressions whose result is consumed
+   and discarded without being bound (e.g. `strConst[i]` inside a
+   loop, `_ = "a" + "b"`, `print("a" + "b")`) would leak their
+   freshly-allocated buffer otherwise. `exprResult.ownsHeap` flags
+   such results at the materializer; the consumer calls
+   `freeIfHeapTop` when discarding. Producers and consumers:
+
+   | Producer site | Consumer site |
+   | ------------- | ------------- |
+   | `stringConstBinding` materialization in `lowerExpr` | `lowerIndexExpr` after `indexInto` (byte extracted, source dead) |
+   | `lowerStringConcat` result | `_ = expr` discard in `lowerVarInit` |
+   | `lowerRange` temp wrappers (conservative) | `lowerPrint` / `lowerPrintln` after `emitPrintBytes` |
+   |                                            | `lowerRange` at loop exit |
+
+   The invariant: a consumer may reclaim only if no path between the
+   producer and the reclaim point copies `ptr` to longer-lived
+   storage. Defer arg capture, function-arg passing, return value,
+   and slice assignment to a binding all use other mechanisms (defer
+   captures the address; binding transfer hands ownership to the
+   scope-pop reclaim) and do *not* check `ownsHeap`.
+
+### Other Slice Operations
 
 `copy(dst, src)` copies `min(len(dst), len(src)) * elemSize`
 cells via a counted loop and returns the number of elements

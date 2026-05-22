@@ -10707,6 +10707,58 @@ func main() {
 }`,
 			"", "hi\nhi!\n",
 		},
+		{
+			"string const indexed by variable in loop",
+			`package main
+const alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+func main() {
+	for i := byte(0); i < 26; i++ {
+		putchar(alpha[i])
+	}
+	println()
+}`,
+			"", "ABCDEFGHIJKLMNOPQRSTUVWXYZ\n",
+		},
+		{
+			"discarded concat in loop reclaims heap",
+			`package main
+func main() {
+	for i := byte(0); i < 30; i++ {
+		_ = "Hello, " + "World!"
+		print(i)
+		print(" ")
+	}
+	println()
+}`,
+			"", "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 \n",
+		},
+		{
+			"printed concat in loop reclaims heap",
+			`package main
+func main() {
+	for i := byte(0); i < 30; i++ {
+		print("XY" + "ZW")
+	}
+	println()
+}`,
+			"", "XYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZWXYZW\n",
+		},
+		{
+			"range over temp string in loop reclaims heap",
+			`package main
+func main() {
+	for i := byte(0); i < 30; i++ {
+		n := byte(0)
+		for range "HelloWorld" + "Goodbye" {
+			n++
+		}
+		print(n)
+		print(" ")
+	}
+	println()
+}`,
+			"", "17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 \n",
+		},
 		// --- Pointers ---
 		{
 			"pointer read",
