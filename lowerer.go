@@ -2040,6 +2040,16 @@ func elementShapeOf(parent exprShape) exprShape {
 		return byteSliceShape()
 	case parent.elemIntSize > 1:
 		return exprShape{intSize: parent.elemIntSize}
+	case parent.elemType != "" && parent.innerElemSize > 0:
+		// [N][M]T where T is a struct: indexing the outer yields a
+		// [M]T sub-array, not the struct itself. innerElemSize is the
+		// inner element's cell count; preserve elemType so the next
+		// elementShapeOf collapses correctly to {structType: T}.
+		return exprShape{
+			elemCount: parent.elemSize / parent.innerElemSize,
+			elemSize:  parent.innerElemSize,
+			elemType:  parent.elemType,
+		}
 	case parent.elemType != "":
 		return exprShape{structType: parent.elemType}
 	case parent.elemPtrType != "":

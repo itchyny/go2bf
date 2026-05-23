@@ -6121,6 +6121,23 @@ func main() {
 			"", "0 1 2 \n3 4 5 \n6 7 8 \n",
 		},
 		{
+			"size-1 struct array element copy and range",
+			`package main
+type Cell struct { v byte }
+func main() {
+	var m [3][3]Cell
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 3; j++ {
+			m[i][j].v = i*3 + j
+		}
+	}
+	c := m[2][1]
+	print(c.v)
+	for _, c := range m[1] { print(c.v) }
+}`,
+			"", "7345",
+		},
+		{
 			"struct with 2d array field",
 			`package main
 type Matrix struct { data [2][3]byte; rows byte }
