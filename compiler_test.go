@@ -11561,6 +11561,27 @@ func main() { var a [N]byte; _ = a }`,
 			"input.go:3:21: zero-length arrays are not supported",
 		},
 		{
+			"zero-length array global var typed",
+			`package main
+var arr [0]byte
+func main() { _ = arr }`,
+			"input.go:2:9: zero-length arrays are not supported",
+		},
+		{
+			"zero-length array global var with literal",
+			`package main
+var arr = [0]byte{}
+func main() { _ = arr }`,
+			"input.go:2:11: zero-length arrays are not supported",
+		},
+		{
+			"zero-length array global var with ellipsis",
+			`package main
+var arr = [...]byte{}
+func main() { _ = arr }`,
+			"input.go:2:11: zero-length arrays are not supported",
+		},
+		{
 			"integer overflow",
 			`package main
 func main() { putchar(256) }`,

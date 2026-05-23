@@ -503,7 +503,32 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 			// composite (array/struct/slice) globals via the same path
 			// used for local `var` -- type may be omitted when a value is
 			// present (the shape is inferred from the RHS, same as `:=`).
+			// Reject zero-length arrays upfront so they don't reach the
+			// lowerer where they'd silently emit no allocations.
 			if gd, ok := decl.(*ast.GenDecl); ok && gd.Tok == token.VAR {
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					if vs.Type != nil {
+						if pos, ok := findZeroLengthArray(vs.Type, result.ByteConsts); ok {
+							return nil, fmt.Errorf("%s: zero-length arrays are not supported", fset.Position(pos))
+						}
+					}
+					for _, v := range vs.Values {
+						if comp, ok := v.(*ast.CompositeLit); ok && comp.Type != nil {
+							// `[...]T{}` resolves to len(Elts) = 0 -- pass
+							// the CompositeLit so arrayTypeSizePart sees Elts.
+							if arrayTypeSizePart(comp, result.ByteConsts) == 0 {
+								return nil, fmt.Errorf("%s: zero-length arrays are not supported", fset.Position(comp.Pos()))
+							}
+							if pos, ok := findZeroLengthArray(comp.Type, result.ByteConsts); ok {
+								return nil, fmt.Errorf("%s: zero-length arrays are not supported", fset.Position(pos))
+							}
+						}
+					}
+				}
 				result.GlobalVars = append(result.GlobalVars, gd)
 				continue
 			}
