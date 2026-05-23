@@ -8951,6 +8951,17 @@ func main() {
 }`,
 			"", "ok",
 		},
+		{
+			"parallel swap on uint16 array",
+			`package main
+func main() {
+	a := [4]uint16{100, 200, 300, 400}
+	i, j := byte(0), byte(3)
+	a[i], a[j] = a[j], a[i]
+	println(a[0], a[1], a[2], a[3])
+}`,
+			"", "400 200 300 100\n",
+		},
 		// --- uint32 ---
 		{
 			"uint32 arithmetic",

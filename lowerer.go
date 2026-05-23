@@ -4189,10 +4189,11 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 	// into temporaries, then assign to LHS. This ensures correct swap semantics.
 	if len(s.Lhs) > 1 && len(s.Lhs) == len(s.Rhs) {
 		type rhsValue struct {
-			cell  Cell
-			size  int // 1 for byte, >1 for composite
-			isStr bool
-			str   sliceInfo
+			cell    Cell
+			size    int // 1 for byte, >1 for composite
+			intSize int // 2/4/8 for uintN; 0 for non-integer (struct/array)
+			isStr   bool
+			str     sliceInfo
 		}
 		rhsVals := make([]rhsValue, len(s.Rhs))
 		for i, rhs := range s.Rhs {
@@ -4230,7 +4231,7 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				continue
 			}
 			r = l.ensureTemp(r)
-			rhsVals[i] = rhsValue{cell: r.cell, size: r.cellCount()}
+			rhsVals[i] = rhsValue{cell: r.cell, size: r.cellCount(), intSize: r.intSize}
 		}
 		// Assign to all LHS.
 		for i, lhs := range s.Lhs {
@@ -4244,7 +4245,7 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				l.freeCell(rv.str.cap)
 				continue
 			}
-			val := exprResult{cell: rv.cell, temp: true, exprShape: exprShape{size: rv.size}}
+			val := exprResult{cell: rv.cell, temp: true, exprShape: exprShape{size: rv.size, intSize: rv.intSize}}
 			switch t := lhs.(type) {
 			case *ast.IndexExpr:
 				base, err := l.lowerExpr(t.X)
