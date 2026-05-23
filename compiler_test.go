@@ -6100,6 +6100,27 @@ func main() {
 			"", "0 0\n0 1\n0 2\n1 0\n1 1\n1 2\n2 0\n2 1\n2 2\n",
 		},
 		{
+			"size-1 struct array field write with var index",
+			`package main
+type Cell struct { v byte }
+func main() {
+	var matrix [3][3]Cell
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 3; j++ {
+			matrix[i][j].v = i*3 + j
+		}
+	}
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 3; j++ {
+			print(matrix[i][j].v)
+			print(" ")
+		}
+		println()
+	}
+}`,
+			"", "0 1 2 \n3 4 5 \n6 7 8 \n",
+		},
+		{
 			"struct with 2d array field",
 			`package main
 type Matrix struct { data [2][3]byte; rows byte }

@@ -4720,6 +4720,36 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 				}
 			}
 		}
+		// arr[i].field = v (or nested matrix[i][j].field = v) where the
+		// struct has size 1 (single-field byte struct). lowerExpr(idx)
+		// would load the byte into a temp; the field write would then go
+		// to the temp + offset (offset is 0 for a size-1 struct), losing
+		// the array slot. Walk down through nested IndexExprs to find
+		// the array ident, then rewrite as a whole-element assign by
+		// wrapping the RHS in a struct literal so the existing variable-
+		// index composite-assign path handles it.
+		root := idx
+		for {
+			if inner, ok := root.X.(*ast.IndexExpr); ok {
+				root = inner
+				continue
+			}
+			break
+		}
+		if id, ok := root.X.(*ast.Ident); ok {
+			if ai, ok := l.lookupArray(id.Name); ok && ai.elemType != "" {
+				if def, ok := l.result.Structs[ai.elemType]; ok && def.Size == 1 {
+					comp := &ast.CompositeLit{
+						Type: &ast.Ident{Name: ai.elemType},
+						Elts: []ast.Expr{&ast.KeyValueExpr{
+							Key:   &ast.Ident{Name: sel.Sel.Name},
+							Value: rhs,
+						}},
+					}
+					return l.lowerArrayAssign(idx, comp)
+				}
+			}
+		}
 	}
 	// Resolve the base (struct, array element, or pointer).
 	base, err := l.lowerExpr(sel.X)
