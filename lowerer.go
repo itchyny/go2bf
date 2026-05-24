@@ -9838,7 +9838,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			l.emit(&IRAddI{Dst: inner.cell, Value: byte(offset)}) // #nosec G115
 			totalSize := inner.elemCount * inner.elemSize
 			flatArr := arrayInfo{base: inner.flatBase, elemCount: totalSize, elemSize: 1}
-			if n := def.Field[e.Sel.Name].IntSize; n > 1 {
+			if n := fi.IntSize; n > 1 {
 				base := l.allocCells(n)
 				dsts := make([]Cell, n)
 				for j := range n {
@@ -9848,13 +9848,23 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 				l.freeCell(inner.cell)
 				return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 			}
-			if def.Field[e.Sel.Name].IsString() {
+			if fi.IsString() {
 				si := l.allocSliceInfo()
 				l.loadConsecutiveViaIndex(flatArr, inner.cell, []Cell{si.ptr, si.len, si.cap})
 				l.freeCell(inner.cell)
 				return exprResult{
 					cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
 					exprShape: exprShape{elemSize: 1, isPointer: true},
+				}, nil
+			}
+			// Array field (`[N]T`): return a flat-offset sub-array so a
+			// chained index can compute the final flat address. inner.cell
+			// now holds the offset to the field's first byte relative to
+			// `inner.flatBase`.
+			if fi.ElemCount > 0 {
+				return exprResult{
+					cell: inner.cell, temp: true, flatBase: inner.flatBase,
+					exprShape: l.shapeOfField(fi),
 				}, nil
 			}
 			result := l.allocCell()

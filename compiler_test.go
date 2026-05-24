@@ -5604,6 +5604,42 @@ func main() {
 			"", "99\n",
 		},
 		{
+			"struct array with uint16 array field double var index",
+			`package main
+type S struct { counts [4]uint16; tag byte }
+func main() {
+	var arr [3]S
+	arr[1].counts[2] = 100
+	arr[1].counts[3] = 200
+	i := byte(1)
+	arr[i].counts[2] = 888
+	println(arr[1].counts[2], arr[1].counts[3])
+}`,
+			"", "888 200\n",
+		},
+		{
+			"struct array with uint16 array field nested loop read write",
+			`package main
+type S struct { counts [4]uint16; tag byte }
+func main() {
+	var arr [3]S
+	for i := byte(0); i < 3; i++ {
+		arr[i].tag = i
+		for j := byte(0); j < 4; j++ {
+			arr[i].counts[j] = uint16(i)*100 + uint16(j)
+		}
+	}
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 4; j++ {
+			print(arr[i].counts[j])
+			print(" ")
+		}
+		println(arr[i].tag)
+	}
+}`,
+			"", "0 1 2 3 0\n100 101 102 103 1\n200 201 202 203 2\n",
+		},
+		{
 			"2d array variable outer constant inner read",
 			`package main
 func main() {
