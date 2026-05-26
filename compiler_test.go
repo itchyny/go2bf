@@ -8711,6 +8711,21 @@ func main() {
 }`,
 			"", "1 3 4 6\n",
 		},
+		{
+			"parallel swap of byte fields on var-indexed size-1 struct array",
+			`package main
+type S struct { v byte }
+func main() {
+	var arr [3]S
+	arr[0].v = 10
+	arr[1].v = 20
+	arr[2].v = 30
+	i, j := byte(0), byte(2)
+	arr[i].v, arr[j].v = arr[j].v, arr[i].v
+	println(arr[0].v, arr[1].v, arr[2].v)
+}`,
+			"", "30 20 10\n",
+		},
 		// --- uint16 ---
 		{
 			"uint16 basics",
@@ -9071,6 +9086,66 @@ func main() {
 }`,
 			"", "100 200\n10 20\n",
 		},
+		{
+			"parallel swap through uint16 pointer params",
+			`package main
+func swap16(a, b *uint16) { *a, *b = *b, *a }
+func main() {
+	x, y := uint16(1000), uint16(2000)
+	swap16(&x, &y)
+	println(x, y)
+}`,
+			"", "2000 1000\n",
+		},
+		{
+			"parallel swap of uint16 fields on var-indexed struct array element",
+			`package main
+type S struct { a, b uint16 }
+func main() {
+	var arr [2]S
+	arr[1].a = 1000
+	arr[1].b = 2000
+	i := byte(1)
+	arr[i].a, arr[i].b = arr[i].b, arr[i].a
+	println(arr[1].a, arr[1].b)
+}`,
+			"", "2000 1000\n",
+		},
+		{
+			"parallel swap of uint16 fields with const index",
+			`package main
+type S struct { a, b uint16 }
+func main() {
+	arr := [2]S{{0, 0}, {1000, 2000}}
+	arr[1].a, arr[1].b = arr[1].b, arr[1].a
+	println(arr[1].a, arr[1].b)
+}`,
+			"", "2000 1000\n",
+		},
+		{
+			"parallel swap of uint16 fields on slice-of-struct element",
+			`package main
+type S struct { a, b uint16 }
+func main() {
+	s := []S{{0, 0}, {1000, 2000}}
+	i := 1
+	s[i].a, s[i].b = s[i].b, s[i].a
+	println(s[i].a, s[i].b)
+}`,
+			"", "2000 1000\n",
+		},
+		{
+			"parallel swap of uint16 fields through struct pointer",
+			`package main
+type S struct { a, b uint16 }
+func swap(p *S) { p.a, p.b = p.b, p.a }
+func main() {
+	s := S{1000, 2000}
+	swap(&s)
+	println(s.a, s.b)
+}`,
+			"", "2000 1000\n",
+		},
 		// --- uint32 ---
 		{
 			"uint32 arithmetic",
@@ -9232,6 +9307,17 @@ func main() {
 	println(*p)
 }`,
 			"", "1000\n",
+		},
+		{
+			"parallel swap through uint32 pointer params",
+			`package main
+func swap32(a, b *uint32) { *a, *b = *b, *a }
+func main() {
+	x, y := uint32(1000000), uint32(2000000)
+	swap32(&x, &y)
+	println(x, y)
+}`,
+			"", "2000000 1000000\n",
 		},
 		// --- uint64 ---
 		{

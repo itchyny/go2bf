@@ -4288,16 +4288,20 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				}
 				return fmt.Errorf("cannot index non-array expression")
 			case *ast.SelectorExpr:
-				if err := l.assignFieldFromCell(t, rv.cell); err != nil {
+				if err := l.assignFieldFromCell(t, rv.cell, rv.size); err != nil {
 					return err
 				}
-				l.freeCell(rv.cell)
+				l.freeCellRange(rv.cell, rv.size)
 				continue
 			case *ast.StarExpr:
-				if err := l.lowerDerefAssignFromCell(t.X, rv.cell); err != nil {
+				size := rv.size
+				if size == 0 {
+					size = 1
+				}
+				if err := l.lowerDerefAssignFromCell(t.X, rv.cell, size); err != nil {
 					return err
 				}
-				l.freeCell(rv.cell)
+				l.freeCellRange(rv.cell, size)
 				continue
 			}
 			dst, err := l.lowerExpr(lhs)
@@ -4942,9 +4946,43 @@ func (l *Lowerer) assignStringHeader(lhs ast.Expr, src sliceInfo) error {
 	return fmt.Errorf("unsupported parallel string-assign target: %T", lhs)
 }
 
-// assignFieldFromCell writes a single byte cell into a struct field's slot.
-// Used by parallel-assign for scalar RHS values targeting struct fields.
-func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell) error {
+// assignFieldFromCell writes `size` consecutive cells from src into a
+// struct field's slot. Used by parallel-assign for RHS values targeting
+// struct fields. The src cells are consumed (moved out) by this call.
+func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell, size int) error {
+	// (expr).field and (*pp).field rewrites match lowerFieldAssign.
+	if p, ok := sel.X.(*ast.ParenExpr); ok {
+		return l.assignFieldFromCell(&ast.SelectorExpr{X: p.X, Sel: sel.Sel}, src, size)
+	}
+	if star, ok := sel.X.(*ast.StarExpr); ok {
+		return l.assignFieldFromCell(&ast.SelectorExpr{X: star.X, Sel: sel.Sel}, src, size)
+	}
+	// arr[i].field where arr is [N]Struct with Size==1: lowerExpr(arr[i])
+	// would load the only byte into a temp, losing the slot reference, so
+	// rewrite as a whole-element write through the array.
+	if idx, ok := sel.X.(*ast.IndexExpr); ok {
+		root := idx
+		for {
+			if inner, ok := root.X.(*ast.IndexExpr); ok {
+				root = inner
+				continue
+			}
+			break
+		}
+		if id, ok := root.X.(*ast.Ident); ok {
+			if ai, ok := l.lookupArray(id.Name); ok && ai.elemType != "" {
+				if def, ok := l.result.Structs[ai.elemType]; ok && def.Size == 1 {
+					base, err := l.lowerExpr(idx.X)
+					if err != nil {
+						return err
+					}
+					return l.writeInto(base, idx.Index, exprResult{
+						cell: src, exprShape: exprShape{intSize: 1},
+					})
+				}
+			}
+		}
+	}
 	base, err := l.lowerExpr(sel.X)
 	if err != nil {
 		return err
@@ -4954,30 +4992,55 @@ func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell) error {
 	}
 	def := l.result.Structs[base.structType]
 	offset := def.Field[sel.Sel.Name].Offset
+	srcs := make([]Cell, size)
+	for j := range size {
+		srcs[j] = src + Cell(j) // #nosec G115
+	}
 	if base.isPointer {
-		slot := l.ptrOffset(base.cell, offset)
-		t := l.allocCell()
-		l.emit(&IRMove{Dst: t, Src: src})
-		l.ptrStore(slot, t)
-		l.freeCell(t)
-		l.freeCell(slot)
+		l.storeConsecutiveViaPtr(l.ptrOffset(base.cell, offset), srcs)
 		return nil
 	}
-	l.emit(&IRMove{Dst: base.cell + offset, Src: src})
+	// Variable-index struct array element: base.cell holds i*elemSize
+	// relative to base.flatBase. Convert to an absolute slot index and
+	// reuse the same ptr-based store helper as the pointer case.
+	if base.flatBase != 0 {
+		l.emit(&IRAddI{Dst: base.cell, Value: byte(slotOf(base.flatBase) + offset)}) // #nosec G115
+		l.storeConsecutiveViaPtr(base.cell, srcs)
+		return nil
+	}
+	for j := range size {
+		l.emit(&IRMove{Dst: base.cell + offset + Cell(j), Src: srcs[j]}) // #nosec G115
+	}
 	return nil
 }
 
-// lowerDerefAssignFromCell writes a single byte to *p, where p is the inner
+// lowerDerefAssignFromCell writes size bytes to *p, where p is the inner
 // pointer expression of a StarExpr LHS. Used by parallel-assign.
-func (l *Lowerer) lowerDerefAssignFromCell(ptrExpr ast.Expr, src Cell) error {
+func (l *Lowerer) lowerDerefAssignFromCell(ptrExpr ast.Expr, src Cell, size int) error {
 	p, err := l.lowerExpr(ptrExpr)
 	if err != nil {
 		return err
+	}
+	if size > 1 {
+		idx := l.allocCell()
+		l.emit(&IRCopy{Dst: idx, Src: p.cell})
+		srcs := make([]Cell, size)
+		for j := range size {
+			srcs[j] = src + Cell(j) // #nosec G115
+		}
+		l.storeConsecutiveViaPtr(idx, srcs)
+		if p.temp {
+			l.freeCell(p.cell)
+		}
+		return nil
 	}
 	t := l.allocCell()
 	l.emit(&IRMove{Dst: t, Src: src})
 	l.ptrStore(p.cell, t)
 	l.freeCell(t)
+	if p.temp {
+		l.freeCell(p.cell)
+	}
 	return nil
 }
 
@@ -9638,7 +9701,10 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 	if indexResult.temp {
 		l.freeCell(indexResult.cell)
 	}
-	return exprResult{cell: result, temp: true, exprShape: exprShape{intSize: 1}}, nil
+	// Preserve struct identity for size-1 struct elements so a chained
+	// SelectorExpr (e.g. arr[i].v) can resolve the field on the loaded byte.
+	return exprResult{cell: result, temp: true,
+		exprShape: exprShape{intSize: 1, structType: base.elemType}}, nil
 }
 
 // writeInto writes val into a composite at the given index.
