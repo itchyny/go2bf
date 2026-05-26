@@ -47,8 +47,8 @@ Local cell allocation is lazy: when `lowerAssign` / `lowerDecl` /
 `declareFromDecl` / `declareFromRange` allocate the cells in the
 current scope. A `scope` is a `map[string]binding`, where `binding`
 is a tagged union (`*byteBinding`, `*intBinding`, `*arrayBinding`,
-`*structBinding`, `*sliceBinding`, `*constBinding`,
-`*intConstBinding`). `lowerFor` and `lowerRange` push their own scope
+`*structBinding`, `*sliceBinding`, `*constBinding`, `*intConstBinding`,
+`*stringConstBinding`). `lowerFor` and `lowerRange` push their own scope
 so loop variables and consecutive same-name loops don't collide.
 
 ### Variable Initialization
@@ -446,7 +446,7 @@ naturally falls through.
    | ------------- | ------------- |
    | `stringConstBinding` materialization in `lowerExpr` | `lowerIndexExpr` after `indexInto` (byte extracted, source dead) |
    | `lowerStringConcat` result | `_ = expr` discard in `lowerVarInit` |
-   | `lowerRange` temp wrappers (conservative) | `lowerPrint` / `lowerPrintln` after `emitPrintBytes` |
+   | `lowerRange` temp wrappers (conservative) | `lowerPrint` after `emitPrintBytes` |
    |                                            | `lowerRange` at loop exit |
 
    The invariant: a consumer may reclaim only if no path between the
@@ -476,8 +476,9 @@ Composite literals (`[]Point{P{1,2}, P{3,4}}`) use
 `ptr + i * elemSize` via `ptrStore`.
 
 `len(m[i])` and `cap(m[i])` for `[][]byte` inner slices
-are handled by loading the inner header via
-`loadSliceElement` in the `len`/`cap` handler.
+work without a special path: `indexInto` already returns an
+`exprResult` with `lenCell` / `capCell` pointing at the inner
+header's cells, and the `len`/`cap` handler reads them directly.
 
 Composite slices (`[]Point`, `[][N]byte`, `[][]byte`)
 use `elemSize > 1`. For `[][]byte`, each element is a
@@ -1024,8 +1025,9 @@ paths.
 ### Struct fields
 
 Struct fields of `uint16`/`uint32`/`uint64` occupy N cells
-at their offset within the struct. `FieldIntSizes` in
-`StructDef` tracks which fields are multi-byte.
+at their offset within the struct. The per-field integer
+width is on `FieldInfo.IntSize`, accessed via
+`StructDef.Field[name]`.
 Field read (`p.val`), write (`p.val = x`), increment
 (`p.val++`), and compound assignment (`p.val += x`)
 all handle multi-byte fields through both direct and
@@ -1425,6 +1427,5 @@ Return statements:
 return a / b, a % b     // fused into a single IRDivMod
 ```
 
-The fusion also applies in recursive function phases
-(`recLowerer.lowerStmts`), with proper `noRetFlag` guarding
-for non-first statements.
+The fusion does not apply inside recursive functions; adjacent
+div/mod assignments there lower as separate `IRDiv` and `IRMod`.
