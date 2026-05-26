@@ -5640,6 +5640,45 @@ func main() {
 			"", "0 1 2 3 0\n100 101 102 103 1\n200 201 202 203 2\n",
 		},
 		{
+			"range over uint16 array field of var-indexed struct array",
+			`package main
+type S struct { counts [4]uint16 }
+func main() {
+	var arr [3]S
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 4; j++ {
+			arr[i].counts[j] = uint16(i)*100 + uint16(j)
+		}
+	}
+	i := byte(1)
+	for j, v := range arr[i].counts {
+		if j > 0 { print(" ") }
+		print(j); print(":"); print(v)
+	}
+	println()
+}`,
+			"", "0:100 1:101 2:102 3:103\n",
+		},
+		{
+			"range over byte array field of var-indexed struct array",
+			`package main
+type S struct { counts [4]byte }
+func main() {
+	var arr [3]S
+	for i := byte(0); i < 3; i++ {
+		for j := byte(0); j < 4; j++ {
+			arr[i].counts[j] = i*10 + j
+		}
+	}
+	i := byte(1)
+	for _, v := range arr[i].counts {
+		print(v); print(" ")
+	}
+	println()
+}`,
+			"", "10 11 12 13 \n",
+		},
+		{
 			"2d array variable outer constant inner read",
 			`package main
 func main() {
@@ -9014,6 +9053,23 @@ func main() {
 	println(a[0], a[1], a[2], a[3])
 }`,
 			"", "400 200 300 100\n",
+		},
+		{
+			"parallel swap on struct array via var index",
+			`package main
+type S struct { vals [3]uint16 }
+func main() {
+	var arr [2]S
+	arr[0].vals[0] = 10
+	arr[0].vals[1] = 20
+	arr[1].vals[0] = 100
+	arr[1].vals[1] = 200
+	i, j := byte(0), byte(1)
+	arr[i], arr[j] = arr[j], arr[i]
+	println(arr[0].vals[0], arr[0].vals[1])
+	println(arr[1].vals[0], arr[1].vals[1])
+}`,
+			"", "100 200\n10 20\n",
 		},
 		// --- uint32 ---
 		{

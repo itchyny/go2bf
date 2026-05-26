@@ -2171,11 +2171,10 @@ func (l *Lowerer) shapeOf(expr ast.Expr, sc scope) exprShape {
 			}
 		}
 	case *ast.SelectorExpr:
-		if structID, ok := expr.X.(*ast.Ident); ok {
-			if si, ok := l.lookupStruct(structID.Name); ok {
-				if fi, ok := si.def.Field[expr.Sel.Name]; ok {
-					return l.shapeOfField(fi)
-				}
+		structType := l.resolveExprTypeName(expr.X)
+		if def, ok := l.result.Structs[structType]; ok {
+			if fi, ok := def.Field[expr.Sel.Name]; ok {
+				return l.shapeOfField(fi)
 			}
 		}
 	case *ast.CallExpr:
@@ -4240,6 +4239,25 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				rhsVals[i] = rhsValue{cell: dst, size: r.size}
 				continue
 			}
+			if r.flatBase != 0 && r.elemCount*r.elemSize > 1 {
+				// Flat-offset composite (e.g. arr[i] for [N]Struct, var idx):
+				// materialize the elemCount*elemSize bytes via dynamic loads
+				// into a contiguous temp so later writes to the same array
+				// can't corrupt them.
+				totalSize := r.elemCount * r.elemSize
+				flatArr := arrayInfo{base: r.flatBase, elemCount: totalSize, elemSize: 1}
+				dst := l.allocCells(totalSize)
+				dsts := make([]Cell, totalSize)
+				for j := range totalSize {
+					dsts[j] = dst + Cell(j) // #nosec G115
+				}
+				l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
+				if r.temp {
+					l.freeCell(r.cell)
+				}
+				rhsVals[i] = rhsValue{cell: dst, size: totalSize}
+				continue
+			}
 			r = l.ensureTemp(r)
 			rhsVals[i] = rhsValue{cell: r.cell, size: r.cellCount(), intSize: r.intSize}
 		}
@@ -5774,6 +5792,20 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 				l.emit(&IRAdd{Dst: idx, Src1: rangeBase.cell, Src2: idx})
 			}
 			l.loadConsecutiveViaPtr(idx, dsts)
+		case rangeBase.flatBase != 0:
+			// Flat-offset shape (e.g. `arr[i].counts`): rangeBase.cell holds
+			// the byte offset into rangeBase.flatBase, so the per-iteration
+			// flat index is offset + cell*elemSize.
+			ai := arrayInfo{base: rangeBase.flatBase, elemCount: rangeBase.elemCount * es, elemSize: 1}
+			flatIdx := l.allocCell()
+			if es == 1 {
+				l.emit(&IRAdd{Dst: flatIdx, Src1: cell, Src2: rangeBase.cell})
+			} else {
+				l.mulByConst(flatIdx, cell, es)
+				l.emit(&IRAdd{Dst: flatIdx, Src1: flatIdx, Src2: rangeBase.cell})
+			}
+			l.loadConsecutiveViaIndex(ai, flatIdx, dsts)
+			l.freeCell(flatIdx)
 		case rangeBase.elemSize > 1:
 			// Multi-cell element (uint16/uint32/uint64, struct, or nested array).
 			// Read elemSize bytes per iteration via flat indexing into the array.
@@ -5850,6 +5882,8 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		l.freeCell(rangeBase.cell)
 		l.freeCell(rangeBase.lenCell)
 		l.freeCell(rangeBase.capCell)
+	} else if rangeBase.temp && rangeBase.flatBase != 0 {
+		l.freeCell(rangeBase.cell)
 	}
 	return nil
 }
@@ -9687,6 +9721,30 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 	// Multi-byte int element: write N bytes via dynamic stores at sequential offsets.
 	if base.elemIntSize > 1 {
 		return l.writeMultiByteIntToFlat(base.cell, 0, indexExpr, ai.size(), base.elemSize, val)
+	}
+	// Composite element (struct, nested array) with multi-cell val:
+	// scale index by elemSize and store each byte at base + idx*elemSize + j.
+	if base.elemSize > 1 && val.size > 1 {
+		indexR, err := l.lowerExpr(indexExpr)
+		if err != nil {
+			return err
+		}
+		flatIdx := l.allocCell()
+		l.mulByConst(flatIdx, indexR.cell, base.elemSize)
+		if indexR.temp {
+			l.freeCell(indexR.cell)
+		}
+		flatArr := arrayInfo{base: base.cell, elemCount: ai.size(), elemSize: 1}
+		srcs := make([]Cell, val.size)
+		for j := range val.size {
+			srcs[j] = val.cell + Cell(j) // #nosec G115
+		}
+		l.storeConsecutiveViaIndex(flatArr, flatIdx, srcs)
+		l.freeCell(flatIdx)
+		if val.temp {
+			l.freeCellRange(val.cell, val.size)
+		}
+		return nil
 	}
 	indexResult, err := l.lowerExpr(indexExpr)
 	if err != nil {
