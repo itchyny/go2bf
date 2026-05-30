@@ -2169,6 +2169,14 @@ func (l *Lowerer) shapeOf(expr ast.Expr, sc scope) exprShape {
 			if def, ok := l.lookupPtrType(expr.Name); ok {
 				return exprShape{isPointer: true, structType: def.Name}
 			}
+			if ai, ok := l.lookupPtrArray(expr.Name); ok {
+				sh := arrayShapeFrom(ai)
+				sh.isPointer = true
+				return sh
+			}
+			if n := l.lookupPtrIntSize(expr.Name); n > 1 {
+				return exprShape{isPointer: true, intSize: n}
+			}
 		}
 	case *ast.SelectorExpr:
 		structType := l.resolveExprTypeName(expr.X)
@@ -2473,6 +2481,35 @@ func (l *Lowerer) lowerStructValueTo(base Cell, def *StructDef, valExpr ast.Expr
 		r, err := l.lowerExpr(valExpr)
 		if err != nil {
 			return err
+		}
+		// Flat-base composite (e.g. `arr[i].x` for chained struct field):
+		// r.cell is the flat offset, not the value. Materialize into base.
+		if r.flatBase != 0 && def.Size > 1 {
+			flatArr := arrayInfo{base: r.flatBase, elemCount: r.elemCount * r.elemSize, elemSize: 1}
+			dsts := make([]Cell, def.Size)
+			for j := range def.Size {
+				dsts[j] = base + Cell(j) // #nosec G115
+			}
+			l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
+			if r.temp {
+				l.freeCell(r.cell)
+			}
+			return nil
+		}
+		// Pointer-base composite (e.g. `s[i]` for []Struct slice element):
+		// r.cell holds a slot index; load each cell of the struct into base.
+		if r.isPointer && r.elemCount > 1 && def.Size > 1 {
+			dsts := make([]Cell, def.Size)
+			for j := range def.Size {
+				dsts[j] = base + Cell(j) // #nosec G115
+			}
+			idx := l.allocCell()
+			l.emit(&IRCopy{Dst: idx, Src: r.cell})
+			l.loadConsecutiveViaPtr(idx, dsts)
+			if r.temp {
+				l.freeCell(r.cell)
+			}
+			return nil
 		}
 		l.emitCopyOrMove(base, r)
 	}
@@ -3149,6 +3186,17 @@ func (l *Lowerer) resolveExprTypeName(expr ast.Expr) string {
 				}
 				if si.elemPtrType != "" {
 					return si.elemPtrType
+				}
+			}
+		}
+		// `s.field[j]` where field is an array/slice of structs: resolve to
+		// the field's element type.
+		if sel, ok := x.X.(*ast.SelectorExpr); ok {
+			if parentType := l.resolveExprTypeName(sel.X); parentType != "" {
+				if def, ok := l.result.Structs[parentType]; ok {
+					if fi, ok := def.Field[sel.Sel.Name]; ok && fi.ElemType != "" {
+						return fi.ElemType
+					}
 				}
 			}
 		}
@@ -4380,12 +4428,8 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 				return err
 			}
 		case *ast.SelectorExpr:
-			r, err := l.lowerSelectorExpr(target)
-			if err != nil {
+			if err := l.assignFieldFromCell(target, retCells[off], n); err != nil {
 				return err
-			}
-			for j := range n {
-				l.emit(&IRMove{Dst: r.cell + j, Src: retCells[off+j]})
 			}
 		default:
 			return fmt.Errorf("unsupported assignment target")
@@ -4731,6 +4775,35 @@ func (l *Lowerer) assignSliceStructField(si sliceInfo, indexExpr ast.Expr, def *
 	return nil
 }
 
+// storeAtFlatField writes `srcs` cell-by-cell to a field of a variable-
+// indexed struct array element. `base.cell` holds `i*elemSize` relative
+// to `base.flatBase`; this converts it to an absolute slot index by
+// adding `slotOf(base.flatBase) + offset` and stores through that pointer.
+// `base.cell` is consumed (freed by storeConsecutiveViaPtr).
+func (l *Lowerer) storeAtFlatField(base exprResult, offset int, srcs []Cell) {
+	l.emit(&IRAddI{Dst: base.cell, Value: byte(slotOf(base.flatBase) + offset)}) // #nosec G115
+	l.storeConsecutiveViaPtr(base.cell, srcs)
+}
+
+// materializeFlatComposite reads all cells of a flat-base composite
+// result (`r.flatBase != 0`, `r.cell` is the flat offset) into a fresh
+// contiguous temp. Frees `r.cell` if `r.temp`. Returns the temp base
+// and its cell count.
+func (l *Lowerer) materializeFlatComposite(r exprResult) (Cell, int) {
+	total := r.elemCount * r.elemSize
+	dst := l.allocCells(total)
+	flatArr := arrayInfo{base: r.flatBase, elemCount: total, elemSize: 1}
+	dsts := make([]Cell, total)
+	for j := range total {
+		dsts[j] = dst + Cell(j) // #nosec G115
+	}
+	l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
+	if r.temp {
+		l.freeCell(r.cell)
+	}
+	return dst, total
+}
+
 func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	// A slice RHS being copied into a struct field escapes: the field
 	// outlives the source binding's scope.
@@ -4743,6 +4816,14 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	if star, ok := sel.X.(*ast.StarExpr); ok {
 		return l.lowerFieldAssign(&ast.SelectorExpr{X: star.X, Sel: sel.Sel}, rhs)
 	}
+	// arr[i].f1...fn = v where the chain bottoms out in a size-1 struct
+	// array: the chain occupies a single byte at arr[i], so write rhs
+	// directly through the array (writeInto stores 1 byte regardless of
+	// whether rhs is a byte expr, a size-1 struct ident, or a size-1
+	// composite literal).
+	if idx, ok := l.peelSize1FieldChain(sel); ok {
+		return l.lowerArrayAssign(idx, rhs)
+	}
 	// s[i].field = v where s is a slice of structs: write through the
 	// slice's pointer rather than to a loaded copy.
 	if idx, ok := sel.X.(*ast.IndexExpr); ok {
@@ -4750,36 +4831,6 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 			if si, ok := l.lookupSlice(id.Name); ok && si.elemType != "" {
 				if def, ok := l.result.Structs[si.elemType]; ok {
 					return l.assignSliceStructField(si, idx.Index, def, sel.Sel.Name, rhs)
-				}
-			}
-		}
-		// arr[i].field = v (or nested matrix[i][j].field = v) where the
-		// struct has size 1 (single-field byte struct). lowerExpr(idx)
-		// would load the byte into a temp; the field write would then go
-		// to the temp + offset (offset is 0 for a size-1 struct), losing
-		// the array slot. Walk down through nested IndexExprs to find
-		// the array ident, then rewrite as a whole-element assign by
-		// wrapping the RHS in a struct literal so the existing variable-
-		// index composite-assign path handles it.
-		root := idx
-		for {
-			if inner, ok := root.X.(*ast.IndexExpr); ok {
-				root = inner
-				continue
-			}
-			break
-		}
-		if id, ok := root.X.(*ast.Ident); ok {
-			if ai, ok := l.lookupArray(id.Name); ok && ai.elemType != "" {
-				if def, ok := l.result.Structs[ai.elemType]; ok && def.Size == 1 {
-					comp := &ast.CompositeLit{
-						Type: &ast.Ident{Name: ai.elemType},
-						Elts: []ast.Expr{&ast.KeyValueExpr{
-							Key:   &ast.Ident{Name: sel.Sel.Name},
-							Value: rhs,
-						}},
-					}
-					return l.lowerArrayAssign(idx, comp)
 				}
 			}
 		}
@@ -4830,13 +4881,88 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	// Check if the field is a nested struct type.
 	if fieldType := def.Field[sel.Sel.Name].StructType; fieldType != "" {
 		fieldDef := l.result.Structs[fieldType]
+		// Variable-index parent: materialize rhs into a temp, then store
+		// each byte through the runtime-computed slot.
+		if base.flatBase != 0 {
+			tmp := l.allocCells(fieldDef.Size)
+			for j := range fieldDef.Size {
+				l.emit(&IRZero{Dst: tmp + j})
+			}
+			if err := l.lowerStructValueTo(tmp, fieldDef, rhs); err != nil {
+				l.freeCellRange(tmp, fieldDef.Size)
+				return err
+			}
+			srcs := make([]Cell, fieldDef.Size)
+			for j := range fieldDef.Size {
+				srcs[j] = tmp + Cell(j) // #nosec G115
+			}
+			l.storeAtFlatField(base, offset, srcs)
+			l.freeCellRange(tmp, fieldDef.Size)
+			return nil
+		}
 		return l.lowerStructValueTo(base.cell+offset, fieldDef, rhs)
 	}
+	// Array field (`[N]T`): write the rhs into the field's cells (or, for
+	// var-indexed parent, into a temp and then store through the runtime
+	// slot). Composite literals lower directly; other array-shaped rhs
+	// (`s.vals = other.vals`) materialize first.
+	if fi := def.Field[sel.Sel.Name]; fi.ElemCount > 0 && !fi.IsSlice {
+		sh := l.shapeOfField(fi)
+		writeTo := func(dst Cell) error {
+			if comp, ok := rhs.(*ast.CompositeLit); ok {
+				return l.lowerCompositeLitInto(arrayInfo{
+					base: dst, elemCount: sh.elemCount, elemSize: sh.elemSize,
+					elemType: sh.elemType, elemIntSize: sh.elemIntSize,
+					innerElemSize: sh.innerElemSize, innerElemIntSize: sh.innerElemIntSize,
+				}, comp)
+			}
+			r, err := l.lowerExpr(rhs)
+			if err != nil {
+				return err
+			}
+			srcBase, srcTemp := r.cell, r.temp
+			if r.flatBase != 0 {
+				srcBase, _ = l.materializeFlatComposite(r)
+				srcTemp = true
+			} else if r.isPointer {
+				srcBase = l.materializePtrComposite(r.cell, r.temp, sh.size)
+				srcTemp = true
+			}
+			for j := range sh.size {
+				l.emit(&IRMove{Dst: dst + Cell(j), Src: srcBase + Cell(j)}) // #nosec G115
+			}
+			if srcTemp {
+				l.freeCellRange(srcBase, sh.size)
+			}
+			return nil
+		}
+		if base.flatBase != 0 {
+			tmp := l.allocCells(sh.size)
+			if err := writeTo(tmp); err != nil {
+				l.freeCellRange(tmp, sh.size)
+				return err
+			}
+			srcs := make([]Cell, sh.size)
+			for j := range sh.size {
+				srcs[j] = tmp + Cell(j) // #nosec G115
+			}
+			l.storeAtFlatField(base, offset, srcs)
+			l.freeCellRange(tmp, sh.size)
+			return nil
+		}
+		return writeTo(base.cell + offset)
+	}
 	// Slice field: write ptr/len/cap (3 cells).
-	if def.Field[sel.Sel.Name].ElemSize > 0 {
+	if def.Field[sel.Sel.Name].IsSlice {
 		si, err := l.lowerSliceExpr(rhs)
 		if err != nil {
 			return err
+		}
+		// Variable-index parent: store 3 cells through the runtime slot.
+		if base.flatBase != 0 {
+			l.storeAtFlatField(base, offset, []Cell{si.ptr, si.len, si.cap})
+			l.freeSliceInfo(si)
+			return nil
 		}
 		l.emit(&IRMove{Dst: base.cell + offset, Src: si.ptr})
 		l.emit(&IRMove{Dst: base.cell + offset + 1, Src: si.len})
@@ -4858,12 +4984,11 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 		// relative to base.flatBase. Convert to an absolute slot index
 		// and reuse the same ptr-based store helper as the pointer case.
 		if base.flatBase != 0 {
-			l.emit(&IRAddI{Dst: base.cell, Value: byte(slotOf(base.flatBase) + offset)}) // #nosec G115
 			srcs := make([]Cell, intSize)
 			for j := range intSize {
 				srcs[j] = val.cell + Cell(j) // #nosec G115
 			}
-			l.storeConsecutiveViaPtr(base.cell, srcs)
+			l.storeAtFlatField(base, offset, srcs)
 			if val.temp {
 				l.freeCellRange(val.cell, intSize)
 			}
@@ -4880,10 +5005,9 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	// Variable-index struct array element: same flat-offset store as the
 	// uintN case above, sized for a single byte field.
 	if base.flatBase != 0 {
-		l.emit(&IRAddI{Dst: base.cell, Value: byte(slotOf(base.flatBase) + offset)}) // #nosec G115
 		t := l.allocCell()
 		l.emitCopyOrMove(t, val)
-		l.ptrStore(base.cell, t)
+		l.storeAtFlatField(base, offset, []Cell{t})
 		l.freeCell(t)
 		return nil
 	}
@@ -4910,6 +5034,13 @@ func (l *Lowerer) assignStringHeader(lhs ast.Expr, src sliceInfo) error {
 		offset := def.Field[t.Sel.Name].Offset
 		if base.isPointer {
 			l.storeStringHeaderViaPtr(l.ptrOffset(base.cell, offset), src)
+			return nil
+		}
+		// Variable-index struct array element: base.cell is the flat offset,
+		// not a static base. Convert to an absolute slot and store the 3-cell
+		// header through it.
+		if base.flatBase != 0 {
+			l.storeAtFlatField(base, offset, []Cell{src.ptr, src.len, src.cap})
 			return nil
 		}
 		l.emit(&IRCopy{Dst: base.cell + offset, Src: src.ptr})
@@ -4946,6 +5077,62 @@ func (l *Lowerer) assignStringHeader(lhs ast.Expr, src sliceInfo) error {
 	return fmt.Errorf("unsupported parallel string-assign target: %T", lhs)
 }
 
+// peelSize1FieldChain matches an LHS like `arr[i].f1...fn` (or a nested
+// `matrix[i][j].f1...fn`) where every struct in the chain has size 1.
+// Such chains occupy a single byte at `arr[i]`, so the caller can write
+// the rhs directly through the array via `lowerArrayAssign`. Returns the
+// outermost IndexExpr on a match, nil otherwise.
+func (l *Lowerer) peelSize1FieldChain(sel *ast.SelectorExpr) (*ast.IndexExpr, bool) {
+	fields := []string{sel.Sel.Name}
+	cur := sel.X
+	for {
+		inner, ok := cur.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		fields = append([]string{inner.Sel.Name}, fields...)
+		cur = inner.X
+	}
+	idx, ok := cur.(*ast.IndexExpr)
+	if !ok {
+		return nil, false
+	}
+	root := idx
+	for {
+		inner, ok := root.X.(*ast.IndexExpr)
+		if !ok {
+			break
+		}
+		root = inner
+	}
+	id, ok := root.X.(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	ai, ok := l.lookupArray(id.Name)
+	if !ok || ai.elemType == "" {
+		return nil, false
+	}
+	def, ok := l.result.Structs[ai.elemType]
+	if !ok || def.Size != 1 {
+		return nil, false
+	}
+	curType := ai.elemType
+	for i := 0; i < len(fields)-1; i++ {
+		d := l.result.Structs[curType]
+		fi, ok := d.Field[fields[i]]
+		if !ok || fi.IsPointer || fi.StructType == "" {
+			return nil, false
+		}
+		innerDef, ok := l.result.Structs[fi.StructType]
+		if !ok || innerDef.Size != 1 {
+			return nil, false
+		}
+		curType = fi.StructType
+	}
+	return idx, true
+}
+
 // assignFieldFromCell writes `size` consecutive cells from src into a
 // struct field's slot. Used by parallel-assign for RHS values targeting
 // struct fields. The src cells are consumed (moved out) by this call.
@@ -4957,31 +5144,16 @@ func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell, size int)
 	if star, ok := sel.X.(*ast.StarExpr); ok {
 		return l.assignFieldFromCell(&ast.SelectorExpr{X: star.X, Sel: sel.Sel}, src, size)
 	}
-	// arr[i].field where arr is [N]Struct with Size==1: lowerExpr(arr[i])
-	// would load the only byte into a temp, losing the slot reference, so
-	// rewrite as a whole-element write through the array.
-	if idx, ok := sel.X.(*ast.IndexExpr); ok {
-		root := idx
-		for {
-			if inner, ok := root.X.(*ast.IndexExpr); ok {
-				root = inner
-				continue
-			}
-			break
+	// arr[i].f1...fn where the chain bottoms out in a size-1 struct
+	// array: write the source byte directly through the array.
+	if idx, ok := l.peelSize1FieldChain(sel); ok {
+		base, err := l.lowerExpr(idx.X)
+		if err != nil {
+			return err
 		}
-		if id, ok := root.X.(*ast.Ident); ok {
-			if ai, ok := l.lookupArray(id.Name); ok && ai.elemType != "" {
-				if def, ok := l.result.Structs[ai.elemType]; ok && def.Size == 1 {
-					base, err := l.lowerExpr(idx.X)
-					if err != nil {
-						return err
-					}
-					return l.writeInto(base, idx.Index, exprResult{
-						cell: src, exprShape: exprShape{intSize: 1},
-					})
-				}
-			}
-		}
+		return l.writeInto(base, idx.Index, exprResult{
+			cell: src, exprShape: exprShape{intSize: 1},
+		})
 	}
 	base, err := l.lowerExpr(sel.X)
 	if err != nil {
@@ -5004,8 +5176,7 @@ func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell, size int)
 	// relative to base.flatBase. Convert to an absolute slot index and
 	// reuse the same ptr-based store helper as the pointer case.
 	if base.flatBase != 0 {
-		l.emit(&IRAddI{Dst: base.cell, Value: byte(slotOf(base.flatBase) + offset)}) // #nosec G115
-		l.storeConsecutiveViaPtr(base.cell, srcs)
+		l.storeAtFlatField(base, offset, srcs)
 		return nil
 	}
 	for j := range size {
@@ -5760,32 +5931,36 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 				valCell, _ = l.lookupVar(valID.Name)
 			}
 		}
-	} else if id, ok := s.X.(*ast.Ident); ok {
-		// Plain `for range slice` / `for range array` uses len as the iteration
-		// elemCount. Pre-evaluate the source so the limit logic below picks up
-		// lenCell or elemCount.
-		switch l.lookupBinding(id.Name).(type) {
-		case *sliceBinding, *arrayBinding:
-			r, err := l.lowerExpr(s.X)
-			if err == nil {
+	} else {
+		// Reject explicit invalid sources first.
+		if u, ok := s.X.(*ast.UnaryExpr); ok && u.Op == token.AND {
+			return fmt.Errorf("cannot range over pointer expression")
+		}
+		if id, ok := s.X.(*ast.Ident); ok {
+			if _, isStruct := l.lookupBinding(id.Name).(*structBinding); isStruct {
+				return fmt.Errorf("cannot range over struct: %s", id.Name)
+			}
+		}
+		// Predict the shape via shapeOf (no IR emitted). Lower for real only
+		// when the source looks like a composite, so scalar sources (byte
+		// ident, `len(a)`, byte-returning calls, integer literals, etc.)
+		// aren't double-lowered between here and the limit path below.
+		sh := l.shapeOf(s.X, l.currentScope())
+		if sh.elemCount > 0 || sh.isPointer {
+			if r, err := l.lowerExpr(s.X); err == nil && (r.elemCount > 0 || r.lenCell != 0) {
 				rangeBase = r
 			}
-		case *structBinding:
-			return fmt.Errorf("cannot range over struct: %s", id.Name)
 		}
-	} else if l.isStringExpr(s.X) {
-		// `for range "hello"` etc.: materialize the string into a temp
-		// slice header and use its length for iteration. Mark ownsHeap
-		// conservatively so the loop-end reclaim runs; the runtime
-		// at-top check no-ops when the source was actually a view.
-		if si, err := l.lowerSliceExpr(s.X); err == nil {
-			rangeBase = exprResult{
-				cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true, ownsHeap: true,
-				exprShape: exprShape{elemSize: 1, isPointer: true},
+		if rangeBase.cell == 0 && l.isStringExpr(s.X) {
+			// `for range "hello"` and string concats: lowerExpr can't lower
+			// these as values; materialize through lowerSliceExpr instead.
+			if si, err := l.lowerSliceExpr(s.X); err == nil {
+				rangeBase = exprResult{
+					cell: si.ptr, lenCell: si.len, capCell: si.cap, temp: true, ownsHeap: true,
+					exprShape: exprShape{elemSize: 1, isPointer: true},
+				}
 			}
 		}
-	} else if u, ok := s.X.(*ast.UnaryExpr); ok && u.Op == token.AND {
-		return fmt.Errorf("cannot range over pointer expression")
 	}
 
 	// Evaluate the range limit.
@@ -6272,6 +6447,42 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 			l.emitCopyOrMove(l.returnDst[0], exprResult{cell: r.cell, temp: r.temp})
 			l.emitCopyOrMove(l.returnDst[1], exprResult{cell: r.lenCell, temp: r.temp})
 			l.emitCopyOrMove(l.returnDst[2], exprResult{cell: r.capCell, temp: r.temp})
+			return l.returnFinish()
+		}
+		// Flat-offset composite (e.g. `return arr[i]` for [N]Struct or
+		// [N][M]T, var or const idx): r.cell is the flat index; materialize
+		// all cells from the backing array directly into the return slots.
+		if total := r.elemCount * r.elemSize; r.flatBase != 0 && total > 1 {
+			n := min(total, len(l.returnDst))
+			flatArr := arrayInfo{base: r.flatBase, elemCount: total, elemSize: 1}
+			dsts := make([]Cell, n)
+			for j := range n {
+				dsts[j] = l.returnDst[j]
+			}
+			l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
+			if r.temp {
+				l.freeCell(r.cell)
+			}
+			return l.returnFinish()
+		}
+		// Pointer-based composite (e.g. `return s[i]` for []Struct): r.cell
+		// holds a slot index; load each cell of the struct into the return
+		// slots. Skip when the function itself returns a pointer (in which
+		// case the slot index is what the caller wants).
+		returnsPointer := l.curFunc != nil && len(l.curFunc.ReturnTypes) > 0 &&
+			l.curFunc.ReturnTypes[0].IsPointer
+		if !returnsPointer && r.isPointer && r.elemCount > 1 && !r.elemSlice && r.structType != "" {
+			n := min(r.elemCount, len(l.returnDst))
+			dsts := make([]Cell, n)
+			for j := range n {
+				dsts[j] = l.returnDst[j]
+			}
+			idx := l.allocCell()
+			l.emit(&IRCopy{Dst: idx, Src: r.cell})
+			l.loadConsecutiveViaPtr(idx, dsts)
+			if r.temp {
+				l.freeCell(r.cell)
+			}
 			return l.returnFinish()
 		}
 		if r.intSize > 1 && len(l.returnDst) < 2 {
@@ -7363,20 +7574,6 @@ func (l *Lowerer) loadConsecutiveViaPtr(idx Cell, dsts []Cell) {
 	l.freeCell(idx)
 }
 
-// loadStringHeaderViaPtr loads ptr/len/cap from three consecutive heap
-// slots starting at *idx into a fresh sliceInfo and frees idx. The idx
-// cell is mutated in place. Returns an exprResult shaped like a
-// string-producing expression so callers (string-field reads via a
-// pointer, struct-array variable index) can return it directly.
-func (l *Lowerer) loadStringHeaderViaPtr(idx Cell) exprResult {
-	si := l.allocSliceInfo()
-	l.loadConsecutiveViaPtr(idx, []Cell{si.ptr, si.len, si.cap})
-	return exprResult{
-		cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
-		exprShape: exprShape{elemSize: 1, isPointer: true},
-	}
-}
-
 // loadMultiByteIntViaPtr loads n bytes from heap[*idx]..heap[*idx+n-1]
 // into a fresh contiguous block. idx is bumped in place and freed.
 // Returns an int-shaped exprResult ready for a multi-byte arithmetic
@@ -7619,6 +7816,30 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 	case *ast.IndexExpr:
 		id, ok := e.X.(*ast.Ident)
 		if !ok {
+			// &base.field[i] for a slice-typed field: lower the slice expr to
+			// resolve its ptr/elemSize, then dynamic-index for the address.
+			r, lerr := l.lowerExpr(e.X)
+			if lerr == nil && r.isPointer && r.elemSize > 0 && r.lenCell != 0 {
+				idx, err := l.ptrDynIndex(r.cell, e.Index, r.elemSize)
+				if err != nil {
+					return exprResult{}, err
+				}
+				if r.temp {
+					l.freeCell(r.cell)
+					l.freeCell(r.lenCell)
+					l.freeCell(r.capCell)
+				}
+				res := exprResult{cell: idx, temp: true}
+				if r.elemType != "" {
+					res.isPointer = true
+					res.structType = r.elemType
+				}
+				if r.elemIntSize > 0 {
+					res.isPointer = true
+					res.intSize = r.elemIntSize
+				}
+				return res, nil
+			}
 			return exprResult{}, fmt.Errorf("cannot take address of chained index expression")
 		}
 		var idx Cell
@@ -7674,6 +7895,14 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		}
 		return r, nil
 	case *ast.SelectorExpr:
+		// &base[i].field on slice/struct-array bases: lowerSelectorExpr would
+		// load the field's value into a temp, so slotOf would point at the
+		// temp instead of the field's slot. Compute the slot at runtime.
+		if r, ok, err := l.lowerAddressOfIndexedField(e); err != nil {
+			return exprResult{}, err
+		} else if ok {
+			return r, nil
+		}
 		// &p.x -- base slot + field offset
 		r, err := l.lowerSelectorExpr(e)
 		if err != nil {
@@ -7714,6 +7943,84 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 	default:
 		return exprResult{}, fmt.Errorf("cannot take address of %T", expr)
 	}
+}
+
+// lowerAddressOfIndexedField returns the slot for &base[i].field when base
+// is a slice or array of structs. Returns ok=false when the pattern does
+// not apply; the caller should fall through to the static path.
+func (l *Lowerer) lowerAddressOfIndexedField(e *ast.SelectorExpr) (exprResult, bool, error) {
+	// Walk chained selectors to collect field names (`arr[i].a.b.c`).
+	fields := []string{e.Sel.Name}
+	cur := e.X
+	for {
+		inner, ok := cur.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		fields = append([]string{inner.Sel.Name}, fields...)
+		cur = inner.X
+	}
+	idx, ok := cur.(*ast.IndexExpr)
+	if !ok {
+		return exprResult{}, false, nil
+	}
+	id, ok := idx.X.(*ast.Ident)
+	if !ok {
+		return exprResult{}, false, nil
+	}
+	var addr Cell
+	var def *StructDef
+	if si, ok := l.lookupSlice(id.Name); ok && si.elemType != "" {
+		d, ok := l.result.Structs[si.elemType]
+		if !ok {
+			return exprResult{}, false, nil
+		}
+		a, err := l.ptrDynIndex(si.ptr, idx.Index, si.elemSize)
+		if err != nil {
+			return exprResult{}, false, err
+		}
+		addr, def = a, d
+	} else if ai, ok := l.lookupArray(id.Name); ok && ai.elemType != "" {
+		d, ok := l.result.Structs[ai.elemType]
+		if !ok {
+			return exprResult{}, false, nil
+		}
+		baseCell := l.allocCell()
+		l.emit(&IRConst{Dst: baseCell, Value: byte(slotOf(ai.base))}) // #nosec G115
+		a, err := l.ptrDynIndex(baseCell, idx.Index, ai.elemSize)
+		l.freeCell(baseCell)
+		if err != nil {
+			return exprResult{}, false, err
+		}
+		addr, def = a, d
+	} else {
+		return exprResult{}, false, nil
+	}
+	var fi FieldInfo
+	for i, name := range fields {
+		var ok bool
+		fi, ok = def.Field[name]
+		if !ok {
+			l.freeCell(addr)
+			return exprResult{}, false, fmt.Errorf("unknown field %s in struct %s", name, def.Name)
+		}
+		if fi.Offset > 0 {
+			l.emit(&IRAddI{Dst: addr, Value: byte(fi.Offset)}) // #nosec G115
+		}
+		if i < len(fields)-1 {
+			if fi.IsPointer || fi.StructType == "" {
+				l.freeCell(addr)
+				return exprResult{}, false, fmt.Errorf("cannot take address through non-struct field %s", name)
+			}
+			def = l.result.Structs[fi.StructType]
+		}
+	}
+	r := exprResult{cell: addr, temp: true}
+	if fi.IntSize > 0 {
+		r.isPointer = true
+		r.intSize = fi.IntSize
+	}
+	return r, true, nil
 }
 
 // lowerDeref handles *p -- reads from the stack slot whose index is in p.
@@ -8618,6 +8925,9 @@ func (l *Lowerer) emitStringEq(result Cell, lSI, rSI sliceInfo) {
 // non-nil only for struct-typed operands.
 // tempSize > 0 means tempSize cells starting at base were allocated and need freeing.
 func (l *Lowerer) resolveCompositeOperand(expr ast.Expr) (Cell, int, int, *StructDef) {
+	if p, ok := expr.(*ast.ParenExpr); ok {
+		return l.resolveCompositeOperand(p.X)
+	}
 	if id, ok := expr.(*ast.Ident); ok {
 		if ai, ok := l.lookupArray(id.Name); ok {
 			return ai.base, ai.size(), 0, nil
@@ -8640,7 +8950,70 @@ func (l *Lowerer) resolveCompositeOperand(expr ast.Expr) (Cell, int, int, *Struc
 			return base, def.Size, def.Size, def
 		}
 	}
-	return 0, -1, 0, nil
+	// `arr[i]` or `expr.field` (chained struct/array): materialize all cells
+	// into a temp. Shape-check first (no IR emitted) so scalar bases like
+	// `board[pos] == 5` for `[N]byte` don't double-lower the operand.
+	var total int
+	var def *StructDef
+	switch x := expr.(type) {
+	case *ast.IndexExpr:
+		id, ok := x.X.(*ast.Ident)
+		if !ok {
+			return 0, -1, 0, nil
+		}
+		if ai, ok := l.lookupArray(id.Name); ok && (ai.elemSize > 1 || ai.elemType != "") {
+			total = ai.elemSize
+			if ai.elemType != "" {
+				def = l.result.Structs[ai.elemType]
+			}
+		} else if si, ok := l.lookupSlice(id.Name); ok && (si.elemSize > 1 || si.elemType != "") {
+			total = si.elemSize
+			if si.elemType != "" {
+				def = l.result.Structs[si.elemType]
+			}
+		}
+	case *ast.SelectorExpr:
+		parentType := l.resolveExprTypeName(x.X)
+		parentDef, ok := l.result.Structs[parentType]
+		if !ok {
+			return 0, -1, 0, nil
+		}
+		fi, ok := parentDef.Field[x.Sel.Name]
+		if !ok || fi.IsPointer {
+			return 0, -1, 0, nil
+		}
+		switch {
+		case fi.StructType != "":
+			fieldDef := l.result.Structs[fi.StructType]
+			if fieldDef == nil {
+				return 0, -1, 0, nil
+			}
+			total = fieldDef.Size
+			def = fieldDef
+		case fi.ElemCount > 0 && !fi.IsSlice:
+			total = l.shapeOfField(fi).size
+		default:
+			return 0, -1, 0, nil
+		}
+	default:
+		return 0, -1, 0, nil
+	}
+	if total <= 1 {
+		return 0, -1, 0, nil
+	}
+	r, err := l.lowerExpr(expr)
+	if err != nil {
+		return 0, -1, 0, nil
+	}
+	if r.flatBase != 0 {
+		base, _ := l.materializeFlatComposite(r)
+		return base, total, total, def
+	}
+	if r.isPointer {
+		base := l.materializePtrComposite(r.cell, r.temp, total)
+		return base, total, total, def
+	}
+	return r.cell, total, 0, def
 }
 
 // lowerBinaryInt handles binary operations on multi-byte integer values.
@@ -9718,6 +10091,15 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 		}
 		return fmt.Errorf("mismatched integer sizes in element assignment, use explicit conversion")
 	}
+	// Flat-base val (e.g. `arr[j] = arr[i]` for a struct/sub-array): val.cell
+	// is the flat offset into val.flatBase, not the value itself. Materialize
+	// into contiguous temps so the size-aware branches below can copy by cell.
+	if total := val.elemCount * val.elemSize; val.flatBase != 0 && total > 1 {
+		buf, _ := l.materializeFlatComposite(val)
+		val = exprResult{cell: buf, temp: true, exprShape: exprShape{
+			size: total, elemSize: val.elemSize, elemCount: val.elemCount, structType: val.structType,
+		}}
+	}
 	if base.isPointer {
 		idx, err := l.ptrDynIndex(base.cell, indexExpr, base.elemSize)
 		if err != nil {
@@ -9873,8 +10255,20 @@ func (l *Lowerer) loadFieldViaPtr(idx Cell, fi FieldInfo) exprResult {
 	if fi.IntSize > 1 {
 		return l.loadMultiByteIntViaPtr(idx, fi.IntSize)
 	}
-	if fi.IsString() {
-		return l.loadStringHeaderViaPtr(idx)
+	if fi.IsSlice {
+		si := l.allocSliceInfo()
+		l.loadConsecutiveViaPtr(idx, []Cell{si.ptr, si.len, si.cap})
+		elemSize := 1
+		if fi.ElemSize > 0 {
+			elemSize = fi.ElemSize
+		}
+		return exprResult{
+			cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+			exprShape: exprShape{
+				elemSize: elemSize, elemType: fi.ElemType, elemIntSize: fi.ElemIntSize,
+				elemSlice: fi.ElemSlice, isPointer: true,
+			},
+		}
 	}
 	result := l.ptrLoad(idx)
 	l.freeCell(idx)
@@ -9920,11 +10314,16 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		if err != nil {
 			return exprResult{}, err
 		}
-		base = inner.cell
-		baseIsPointer = inner.isPointer
 		if inner.structType == "" {
 			return exprResult{}, fmt.Errorf("field %s is not a struct", x.Sel.Name)
 		}
+		// Chained selector on a flat sub-result (e.g., arr[i].inner.x where
+		// .inner is an inline struct field): same dispatch as IndexExpr below.
+		if inner.flatBase != 0 {
+			return l.lowerFlatField(inner, e.Sel.Name)
+		}
+		base = inner.cell
+		baseIsPointer = inner.isPointer
 		def = l.result.Structs[inner.structType]
 	case *ast.IndexExpr:
 		inner, err := l.lowerExpr(x)
@@ -9950,51 +10349,18 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 					exprShape: exprShape{isPointer: true, structType: fi.StructType},
 				}, nil
 			}
+			// Inline nested struct field on a size-1 struct: the byte IS the
+			// inner struct, so preserve structType for chained selectors.
+			if fi.StructType != "" {
+				return exprResult{
+					cell: inner.cell, temp: inner.temp,
+					exprShape: exprShape{intSize: 1, structType: fi.StructType},
+				}, nil
+			}
 			return exprResult{cell: inner.cell, temp: inner.temp, exprShape: exprShape{intSize: 1}}, nil
 		}
 		if inner.flatBase != 0 {
-			// Variable index: flat offset + fieldOffset, dynamic load.
-			fi, ok := def.Field[e.Sel.Name]
-			if !ok {
-				return exprResult{}, fmt.Errorf("unknown field %s in struct %s", e.Sel.Name, def.Name)
-			}
-			offset := fi.Offset
-			l.emit(&IRAddI{Dst: inner.cell, Value: byte(offset)}) // #nosec G115
-			totalSize := inner.elemCount * inner.elemSize
-			flatArr := arrayInfo{base: inner.flatBase, elemCount: totalSize, elemSize: 1}
-			if n := fi.IntSize; n > 1 {
-				base := l.allocCells(n)
-				dsts := make([]Cell, n)
-				for j := range n {
-					dsts[j] = base + Cell(j) // #nosec G115
-				}
-				l.loadConsecutiveViaIndex(flatArr, inner.cell, dsts)
-				l.freeCell(inner.cell)
-				return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
-			}
-			if fi.IsString() {
-				si := l.allocSliceInfo()
-				l.loadConsecutiveViaIndex(flatArr, inner.cell, []Cell{si.ptr, si.len, si.cap})
-				l.freeCell(inner.cell)
-				return exprResult{
-					cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
-					exprShape: exprShape{elemSize: 1, isPointer: true},
-				}, nil
-			}
-			// Array field (`[N]T`): return a flat-offset sub-array so a
-			// chained index can compute the final flat address. inner.cell
-			// now holds the offset to the field's first byte relative to
-			// `inner.flatBase`.
-			if fi.ElemCount > 0 {
-				return exprResult{
-					cell: inner.cell, temp: true, flatBase: inner.flatBase,
-					exprShape: l.shapeOfField(fi),
-				}, nil
-			}
-			result := l.allocCell()
-			l.emitVariableIndexRead(flatArr, inner.cell, result)
-			l.freeCell(inner.cell)
-			return exprResult{cell: result, temp: true, exprShape: exprShape{intSize: 1}}, nil
+			return l.lowerFlatField(inner, e.Sel.Name)
 		}
 		base = inner.cell
 		baseIsPointer = inner.isPointer
@@ -10034,6 +10400,69 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		r.capCell = cell + 2
 	}
 	return r, nil
+}
+
+// lowerFlatField applies a `.field` selector to a flat-offset composite
+// result (`inner.flatBase != 0`). `inner.cell` holds the offset from
+// `inner.flatBase` to the struct; this function adds the field offset
+// and either loads the field's bytes or returns another flat sub-result
+// for chained access (struct or array fields).
+func (l *Lowerer) lowerFlatField(inner exprResult, fieldName string) (exprResult, error) {
+	def := l.result.Structs[inner.structType]
+	fi, ok := def.Field[fieldName]
+	if !ok {
+		return exprResult{}, fmt.Errorf("unknown field %s in struct %s", fieldName, def.Name)
+	}
+	l.emit(&IRAddI{Dst: inner.cell, Value: byte(fi.Offset)}) // #nosec G115
+	totalSize := inner.elemCount * inner.elemSize
+	flatArr := arrayInfo{base: inner.flatBase, elemCount: totalSize, elemSize: 1}
+	if n := fi.IntSize; n > 1 {
+		base := l.allocCells(n)
+		dsts := make([]Cell, n)
+		for j := range n {
+			dsts[j] = base + Cell(j) // #nosec G115
+		}
+		l.loadConsecutiveViaIndex(flatArr, inner.cell, dsts)
+		l.freeCell(inner.cell)
+		return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
+	}
+	if fi.IsSlice {
+		si := l.allocSliceInfo()
+		l.loadConsecutiveViaIndex(flatArr, inner.cell, []Cell{si.ptr, si.len, si.cap})
+		l.freeCell(inner.cell)
+		elemSize := 1
+		if fi.ElemSize > 0 {
+			elemSize = fi.ElemSize
+		}
+		return exprResult{
+			cell: si.ptr, temp: true, lenCell: si.len, capCell: si.cap,
+			exprShape: exprShape{
+				elemSize: elemSize, elemType: fi.ElemType, elemIntSize: fi.ElemIntSize,
+				elemSlice: fi.ElemSlice, isPointer: true,
+			},
+		}, nil
+	}
+	// Array field (`[N]T`): return a flat sub-array so a chained index can
+	// compute the final flat address.
+	if fi.ElemCount > 0 {
+		return exprResult{
+			cell: inner.cell, temp: true, flatBase: inner.flatBase,
+			exprShape: l.shapeOfField(fi),
+		}, nil
+	}
+	// Inline nested struct field: return a flat sub-struct so a chained
+	// selector can compute the final flat address.
+	if fi.StructType != "" && !fi.IsPointer {
+		sd := l.result.Structs[fi.StructType]
+		return exprResult{
+			cell: inner.cell, temp: true, flatBase: inner.flatBase,
+			exprShape: exprShape{elemSize: 1, elemCount: sd.Size, structType: fi.StructType},
+		}, nil
+	}
+	result := l.allocCell()
+	l.emitVariableIndexRead(flatArr, inner.cell, result)
+	l.freeCell(inner.cell)
+	return exprResult{cell: result, temp: true, exprShape: exprShape{intSize: 1}}, nil
 }
 
 // exprString renders an AST expression back to source text. Used in

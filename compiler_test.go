@@ -8726,6 +8726,34 @@ func main() {
 }`,
 			"", "30 20 10\n",
 		},
+		{
+			"chained selector read through struct field of var-indexed size-1 struct",
+			`package main
+type Inner struct { x byte }
+type Outer struct { inner Inner }
+func main() {
+	var arr [3]Outer
+	arr[0].inner.x = 10
+	arr[1].inner.x = 20
+	arr[2].inner.x = 30
+	i := byte(1)
+	println(arr[i].inner.x)
+}`,
+			"", "20\n",
+		},
+		{
+			"chained selector write through struct field of var-indexed size-1 struct",
+			`package main
+type Inner struct { x byte }
+type Outer struct { inner Inner }
+func main() {
+	var arr [3]Outer
+	i := byte(1)
+	arr[i].inner.x = 42
+	println(arr[0].inner.x, arr[1].inner.x, arr[2].inner.x)
+}`,
+			"", "0 42 0\n",
+		},
 		// --- uint16 ---
 		{
 			"uint16 basics",
@@ -9916,6 +9944,340 @@ func main() {
 			"", "100 40001 60000",
 		},
 		{
+			"address of var-indexed struct array field",
+			`package main
+type S struct { a uint16 }
+func bump(p *uint16) { *p += 5 }
+func main() {
+	var arr [3]S
+	arr[1].a = 1000
+	i := byte(1)
+	bump(&arr[i].a)
+	println(arr[1].a)
+}`,
+			"", "1005\n",
+		},
+		{
+			"address of slice-of-struct field",
+			`package main
+type S struct { a uint16 }
+func bump(p *uint16) { *p += 5 }
+func main() {
+	s := []S{{1000}}
+	bump(&s[0].a)
+	println(s[0].a)
+}`,
+			"", "1005\n",
+		},
+		{
+			"chained selector through struct field of var-indexed struct array",
+			`package main
+type Inner struct { x uint16 }
+type Outer struct { inner Inner }
+func main() {
+	var arr [2]Outer
+	arr[0].inner.x = 1000
+	arr[1].inner.x = 2000
+	i := byte(1)
+	println(arr[i].inner.x)
+}`,
+			"", "2000\n",
+		},
+		{
+			"multi-return into var-indexed struct fields",
+			`package main
+type S struct { a, b uint16 }
+func make16() (uint16, uint16) { return 1234, 5678 }
+func main() {
+	var arr [2]S
+	i := byte(1)
+	arr[i].a, arr[i].b = make16()
+	println(arr[1].a, arr[1].b)
+}`,
+			"", "1234 5678\n",
+		},
+		{
+			"composite-literal assign to chained var-indexed struct field",
+			`package main
+type Inner struct { a, b uint16 }
+type Outer struct { inner Inner }
+func main() {
+	var arr [3]Outer
+	i := byte(1)
+	arr[i].inner = Inner{a: 100, b: 200}
+	println(arr[1].inner.a, arr[1].inner.b)
+}`,
+			"", "100 200\n",
+		},
+		{
+			"return struct value at var-indexed array element",
+			`package main
+type S struct { a, b uint16 }
+func main() {
+	var arr [3]S
+	arr[1].a = 100
+	arr[1].b = 200
+	i := byte(1)
+	s := arr[i]
+	println(s.a, s.b)
+}`,
+			"", "100 200\n",
+		},
+		{
+			"return slice-of-struct element by value",
+			`package main
+type S struct { a, b uint16 }
+func get(s []S, i byte) S { return s[i] }
+func main() {
+	s := []S{{0, 0}, {100, 200}}
+	r := get(s, 1)
+	println(r.a, r.b)
+}`,
+			"", "100 200\n",
+		},
+		{
+			"return var-indexed struct array element from function",
+			`package main
+type S struct { a, b uint16 }
+var arr [3]S
+func get(i byte) S { return arr[i] }
+func main() {
+	arr[1].a = 100
+	arr[1].b = 200
+	s := get(1)
+	println(s.a, s.b)
+}`,
+			"", "100 200\n",
+		},
+		{
+			"struct equality at var-indexed array elements",
+			`package main
+type S struct { a, b uint16 }
+func main() {
+	var arr [3]S
+	arr[0] = S{100, 200}
+	arr[1] = S{100, 200}
+	arr[2] = S{100, 201}
+	i, j := byte(0), byte(1)
+	if arr[i] == arr[j] { println("eq01") }
+	j = 2
+	if arr[i] != arr[j] { println("neq02") }
+	if arr[i] == (S{100, 200}) { println("eqlit") }
+}`,
+			"", "eq01\nneq02\neqlit\n",
+		},
+		{
+			"whole-struct copy between var-indexed array elements",
+			`package main
+type S struct { a, b uint16 }
+func main() {
+	var arr [3]S
+	arr[0] = S{100, 200}
+	i, j := byte(0), byte(1)
+	arr[j] = arr[i]
+	println(arr[1].a, arr[1].b)
+}`,
+			"", "100 200\n",
+		},
+		{
+			"sub-array equality on var-indexed 2D array",
+			`package main
+func main() {
+	m := [3][3]byte{{1, 2, 3}, {4, 5, 6}, {1, 2, 3}}
+	i, j := byte(0), byte(2)
+	if m[i] == m[j] { println("eq") }
+	j = 1
+	if m[i] != m[j] { println("neq") }
+}`,
+			"", "eq\nneq\n",
+		},
+		{
+			"multi-byte slice field read and write at var-indexed struct array",
+			`package main
+type S struct { xs []uint16 }
+func main() {
+	var arr [2]S
+	arr[1].xs = []uint16{10, 20, 30}
+	i := byte(1)
+	arr[i].xs[1] = 999
+	for j, v := range arr[i].xs {
+		if j > 0 { print(" ") }
+		print(v)
+	}
+	println()
+}`,
+			"", "10 999 30\n",
+		},
+		{
+			"address-of through chained selector on var-indexed struct array",
+			`package main
+type Inner struct { val uint16 }
+type Outer struct { inner Inner }
+func bump(p *uint16) { *p += 2 }
+func main() {
+	var arr [3]Outer
+	arr[1].inner.val = 100
+	i := byte(1)
+	bump(&arr[i].inner.val)
+	println(arr[1].inner.val)
+}`,
+			"", "102\n",
+		},
+		{
+			"address-of slice element of slice field at var-indexed struct",
+			`package main
+type S struct { xs []uint16 }
+func bump(p *uint16) { *p += 10 }
+func main() {
+	var arr [2]S
+	arr[1].xs = []uint16{100, 200, 300}
+	i := byte(1)
+	bump(&arr[i].xs[1])
+	for j, v := range arr[i].xs {
+		if j > 0 { print(" ") }
+		print(v)
+	}
+	println()
+}`,
+			"", "100 210 300\n",
+		},
+		{
+			"multi-byte slice field via struct pointer",
+			`package main
+type S struct { xs []uint16 }
+func sum(s *S) uint16 {
+	var t uint16
+	for _, v := range s.xs { t += v }
+	return t
+}
+func main() {
+	x := S{xs: []uint16{100, 200, 300}}
+	println(sum(&x))
+}`,
+			"", "600\n",
+		},
+		{
+			"chained array-field index on var-indexed struct array",
+			`package main
+type Cell struct { val uint16 }
+type Row struct { cells [3]Cell }
+func main() {
+	var rows [2]Row
+	rows[0].cells[1].val = 100
+	rows[1].cells[2].val = 200
+	i, j, k, l := byte(0), byte(1), byte(1), byte(2)
+	println(rows[i].cells[j].val + rows[k].cells[l].val)
+}`,
+			"", "300\n",
+		},
+		{
+			"range index-only over slice field",
+			`package main
+type S struct { xs []uint16 }
+func main() {
+	x := S{xs: []uint16{100, 200, 300}}
+	for i := range x.xs { x.xs[i] += 10 }
+	for i, v := range x.xs {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+	println()
+}`,
+			"", "110 210 310\n",
+		},
+		{
+			"range over pointer-to-array",
+			`package main
+func bump(a *[5]uint16) {
+	for i := range a { a[i] += 1 }
+}
+func main() {
+	arr := [5]uint16{100, 200, 300, 400, 500}
+	bump(&arr)
+	for i, v := range arr {
+		if i > 0 { print(" ") }
+		print(v)
+	}
+	println()
+}`,
+			"", "101 201 301 401 501\n",
+		},
+		{
+			"equality of chained struct fields",
+			`package main
+type Inner struct { val uint16 }
+type Outer struct { a, b Inner }
+func main() {
+	var arr [3]Outer
+	arr[0].a = Inner{100}
+	arr[0].b = Inner{100}
+	arr[1].a = Inner{200}
+	arr[1].b = Inner{300}
+	i := byte(0)
+	if arr[i].a == arr[i].b { println("eq") }
+	i = 1
+	if arr[i].a != arr[i].b { println("neq") }
+}`,
+			"", "eq\nneq\n",
+		},
+		{
+			"chained struct field copy",
+			`package main
+type Inner struct { a, b uint16 }
+type Outer struct { x, y Inner }
+func main() {
+	var arr [3]Outer
+	arr[1].x = Inner{100, 200}
+	i := byte(1)
+	arr[i].y = arr[i].x
+	println(arr[1].x.a, arr[1].x.b)
+	println(arr[1].y.a, arr[1].y.b)
+}`,
+			"", "100 200\n100 200\n",
+		},
+		{
+			"parallel swap of string fields on chained var-indexed struct",
+			`package main
+type Inner struct { a, b string }
+type Outer struct { inner Inner }
+func main() {
+	var arr [3]Outer
+	arr[1].inner.a = "hello"
+	arr[1].inner.b = "world"
+	i := byte(1)
+	arr[i].inner.a, arr[i].inner.b = arr[i].inner.b, arr[i].inner.a
+	println(arr[1].inner.a)
+	println(arr[1].inner.b)
+}`,
+			"", "world\nhello\n",
+		},
+		{
+			"array-literal assignment to multi-byte array field",
+			`package main
+type S struct { vals [3]uint16 }
+func main() {
+	var s S
+	s.vals = [3]uint16{1000, 2000, 3000}
+	println(s.vals[0], s.vals[1], s.vals[2])
+}`,
+			"", "1000 2000 3000\n",
+		},
+		{
+			"multi-byte array field copy and equality",
+			`package main
+type S struct { vals [3]uint16 }
+func main() {
+	var arr [3]S
+	arr[0].vals = [3]uint16{100, 200, 300}
+	i, j := byte(0), byte(1)
+	arr[j].vals = arr[i].vals
+	if arr[i].vals == arr[j].vals { println("eq") }
+	arr[j].vals[2] = 9999
+	if arr[i].vals != arr[j].vals { println("neq") }
+}`,
+			"", "eq\nneq\n",
+		},
+		{
 			"multi-return with multi-byte slice param",
 			`package main
 func minmax(a []uint64) (uint64, uint64) {
@@ -10985,6 +11347,18 @@ func main() {
 	println()
 }`,
 			"", "17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 17 \n",
+		},
+		{
+			"string field write at var-indexed struct array",
+			`package main
+type S struct { name string }
+func main() {
+	var arr [3]S
+	i := byte(1)
+	arr[i].name = "hello"
+	println(arr[0].name, arr[1].name, arr[2].name)
+}`,
+			"", " hello \n",
 		},
 		// --- Pointers ---
 		{

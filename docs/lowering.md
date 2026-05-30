@@ -143,9 +143,38 @@ does not fall through (see [`recursion.md`](recursion.md)).
 dispatches by result type:
 
 - **Pointer** (`isPointer`): `ptrOffset` + `ptrStore`
-- **Nested struct**: `lowerStructValueTo` for composite field writes
-- **Direct/flat-offset**: `writeInto` with the field offset as a
-  constant index expression
+- **Variable-index parent** (`base.flatBase != 0`): for nested struct,
+  slice/string, multi-byte int, and byte fields, the helper
+  `storeAtFlatField(base, offset, srcs)` adds
+  `slotOf(base.flatBase) + offset` to `base.cell` and stores `srcs`
+  via `storeConsecutiveViaPtr`. Struct-typed fields materialize the
+  rhs into a temp first; the same store-through-slot path is shared
+  with `assignFieldFromCell` (the parallel-assign helper).
+- **Nested struct** (value base): `lowerStructValueTo` writes the
+  composite field directly into the field's cells.
+- **Direct**: cell-by-cell `IRMove`/`IRCopy` at `base.cell + offset`.
+
+Before any of the above, `peelSize1FieldChain(sel)` detects a chain
+`arr[i].f1...fn` where every containing struct has size 1 -- the
+whole chain occupies one byte at `arr[i]`, so the rhs is written
+through the array via `lowerArrayAssign(idx, rhs)`. This subsumes
+both the single-level `arr[i].field = v` rewrite and the deeper
+`arr[i].b.a.v = v` case. `writeInto` ignores the type mismatch when
+both sides are one byte, so no nested `CompositeLit` wrapping is
+needed.
+
+### Field Read Through Pointer
+
+`loadFieldViaPtr` mirrors the field-write dispatch for reads through
+a struct pointer (`s *T` parameter, `&Point{...}` value, etc.). It
+handles array fields, pointer-typed struct fields, inline nested
+struct fields, multi-byte int fields, and slice fields (`[]byte`,
+`string`, `[]uintN`, `[]Struct`) uniformly -- the slice branch loads
+the 3-cell header via `loadConsecutiveViaPtr` and threads
+`ElemSize`/`ElemType`/`ElemIntSize`/`ElemSlice` from `FieldInfo` into
+the returned `sliceInfo`, matching what `lowerFlatField` does for
+the var-indexed-array side. Byte fields fall through to a single
+`ptrLoad`.
 
 ## Structs
 
@@ -230,9 +259,12 @@ Method calls resolve the receiver's struct type via
 `resolveExprTypeName`, which walks the AST without evaluating.
 This supports method calls on any expression that produces a struct:
 variables (`p.sum()`), array elements (`a[i].sum()`), function
-returns (`makePoint(1, 2).sum()`), and chained methods
-(`p.scale(3).sum()`). The receiver expression is evaluated via
-`lowerExpr` and passed as the first argument to the inlined method.
+returns (`makePoint(1, 2).sum()`), chained methods
+(`p.scale(3).sum()`), and indexed struct fields
+(`s.field[j].sum()` -- the IndexExpr case looks up the parent
+struct's field and returns its `ElemType`). The receiver
+expression is evaluated via `lowerExpr` and passed as the first
+argument to the inlined method.
 
 **Auto-conversion across the value/pointer boundary.** Go's method
 calls implicitly take the address of a value receiver when the
@@ -300,6 +332,51 @@ index `a[i].x` computes a flat index `i * elemSize + fieldOffset`
 and uses a single dynamic load/store. Whole-struct assignment
 `a[i] = Point{...}` with variable index evaluates the struct into
 temp cells and dynamic-stores each field.
+
+`lowerExpr(a[i])` returns a flat-offset result (`flatBase = a.base`,
+`cell = i*elemSize`) for multi-byte struct elements. `lowerFlatField`
+applies a `.field` selector to such a result by adding the field
+offset and either loading the field's bytes (for `uintN`, byte,
+string/slice fields) or returning another flat sub-result (for inline
+struct fields and array fields), so chained access like
+`a[i].inner.x` or `a[i].vals[j]` keeps composing without intermediate
+loads. The same helper is dispatched from both the IndexExpr case and
+the chained SelectorExpr case of `lowerSelectorExpr` (whenever the
+inner result has `flatBase != 0`).
+
+Composite operations on `a[i]` use these flat results, sharing one
+helper `materializeFlatComposite(r)` that loads all cells from the
+backing array into a fresh temp:
+
+- **Equality** `a[i] == a[j]`, `a[i] == Point{...}`, `arr[i].a == arr[i].b`
+  (chained struct field) -- handled by `resolveCompositeOperand`. For
+  `IndexExpr`, the indexed ident is shape-checked first (so byte-array
+  bases like `arr[i] == 5` don't double-lower); for `SelectorExpr`,
+  `resolveExprTypeName` + `FieldInfo` predicts whether the field is an
+  inline struct. Both then `lowerExpr` and dispatch through the shared
+  materialization path: `materializeFlatComposite` for flat-base results,
+  `materializePtrComposite` for pointer-base, direct cells otherwise.
+  Falls through to the existing `emitStructCompare`. Also unwraps
+  `ParenExpr`.
+- **Whole-struct copy** `a[j] = a[i]` -- `writeInto` materializes a
+  flat-base `val` at the top (via `materializeFlatComposite`) when
+  `val.flatBase != 0 && total > 1`, then the existing size-aware
+  composite write branch handles the actual store. The chained variant
+  (`arr[i].y = arr[i].x` for inline struct fields) goes through
+  `lowerStructValueTo`'s default case, which now materializes a
+  flat-base or pointer-base composite RHS before the cell copy.
+- **Return** `return a[i]` -- `lowerReturn` reads the cells from the
+  flat array directly into the return slots via
+  `loadConsecutiveViaIndex`. The pointer-based variant (`return s[i]`
+  for `[]Struct`) uses `loadConsecutiveViaPtr` and is gated on the
+  function not returning a pointer so `func f() *P { return p }`
+  still returns the slot index.
+- **Address-of** `&a[i].field` (and `&a[i].f1.f2`) -- the
+  `lowerAddressOf` SelectorExpr case dispatches to
+  `lowerAddressOfIndexedField`, which walks chained selectors and
+  computes `slotOf(arrBase) + i*elemSize + sum(fieldOffsets)` at
+  runtime via `ptrDynIndex`. The IndexExpr case additionally accepts
+  any slice-shaped lowered base, so `&arr[i].xs[1]` works.
 
 ### Arrays of Arrays
 
@@ -634,12 +711,14 @@ bytes pre-stored.
   `lowerFieldAssign` mirrors the literal init path for
   `p.name = expr`. The same path covers pointer access
   (`pp.name`, `pp.name = expr`, `pp.name += expr`): the
-  pointer-read branch in `lowerSelectorExpr` calls
-  `loadStringHeaderViaPtr`, and the pointer-write branch in
-  `lowerFieldAssign` calls `storeStringHeaderViaPtr`. Both
-  are thin wrappers around the generic
-  `loadConsecutiveViaPtr` / `storeConsecutiveViaPtr` helpers
-  that walk three consecutive heap slots. Variable-index
+  pointer-read branch in `lowerSelectorExpr` dispatches
+  through `loadFieldViaPtr`, which calls
+  `loadConsecutiveViaPtr` for slice-shaped fields (strings
+  included) to load the three header cells, and the
+  pointer-write branch in `lowerFieldAssign` calls
+  `storeStringHeaderViaPtr` -- a thin wrapper around
+  `storeConsecutiveViaPtr` that walks three consecutive
+  heap slots. Variable-index
   struct-array access (`ps[i].name`) uses the index-based
   twin `loadConsecutiveViaIndex`, which copies a row index
   cell per byte and dispatches through `emitVariableIndexRead`.
@@ -738,7 +817,10 @@ Receiving side: `declareFromAssign` defines each LHS via
 so the binding kind matches. `lowerMultiReturnAssign` then dispatches
 on the actual binding kind (struct, array, slice, intVar, byte) and
 moves the right cell count from each return slot to the LHS storage,
-rather than guessing from `ReturnSizes` alone.
+rather than guessing from `ReturnSizes` alone. `SelectorExpr` LHS
+(e.g. `arr[i].a, arr[i].b = f()`) routes through
+`assignFieldFromCell` so var-indexed and multi-byte struct fields
+are stored through the runtime slot.
 
 Returning side: `lowerReturn`'s multi-result loop consults
 `l.curFunc.ReturnTypes[i]` per return value. For struct/array
@@ -759,9 +841,13 @@ single-cell snapshot is taken as before. The LHS dispatch
 then routes by node type:
 
 - `*ast.IndexExpr` byte/scalar: `writeInto` (existing path).
-- `*ast.SelectorExpr` byte/scalar: `assignFieldFromCell`,
-  which mirrors `lowerFieldAssign`'s pointer-base and
-  value-base writes for byte fields.
+- `*ast.SelectorExpr`: `assignFieldFromCell(sel, src, size)`,
+  which mirrors `lowerFieldAssign`'s full dispatch -- pointer
+  base, variable-indexed struct array element
+  (`base.flatBase != 0`), and value base. Handles multi-byte
+  fields by storing `size` consecutive cells. Also routes
+  size-1 struct chains through `peelSize1FieldChain` so
+  `arr[i].v = src` writes directly through the array.
 - `*ast.StarExpr` byte: `lowerDerefAssignFromCell`, a thin
   helper around `ptrStore`.
 - 3-cell snapshots: `assignStringHeader`, which writes the
@@ -1130,6 +1216,26 @@ iteration sources -- `for j := range s` where `s` is a
 struct, or `for j := range &p` (pointer expression) --
 with a clear compile error rather than silently using the
 underlying byte as a counter.
+
+The value-less form (`for i := range x`, `for range x`)
+uses one unified dispatch: it rejects the two invalid
+forms (struct ident, `&x`) explicitly, then asks
+`shapeOf(s.X)` (which emits no IR) whether the source
+looks composite. Only if so does it call `lowerExpr` for
+real. This way the same path covers slice/array idents,
+struct field selectors (`for i := range s.xs`), indexed
+bases (`for i := range arr[i].xs`), and pointer-to-array
+parameters (`for i := range a` where `a *[N]T`), while
+scalar sources like `for range len(a)` aren't double-
+lowered between here and the limit-as-counter path below.
+For the pointer-to-array case, `shapeOf`'s `byteBinding`
+branch consults `lookupPtrArray` / `lookupPtrIntSize`
+alongside `lookupPtrType` so the typed-pointer parameter
+forms surface their composite shape (the existing
+`lowerIdent` path was already doing this for the real
+lower; only the predicate was incomplete). String literals
+and concatenations (`for range "hi" + s`), which
+`lowerExpr` rejects, take the `lowerSliceExpr` fallback.
 
 ### Switch
 

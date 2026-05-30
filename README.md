@@ -400,10 +400,18 @@ The generated Brainfuck uses a CPU-like execution model:
 - Fields: `byte`, `uintN`, struct, `*Struct`, array, nested array,
   string, `[]byte`, `[]uintN`, `[]Struct`, `[][]byte` types
 - Nested struct array fields (`[N][M]Inner`)
-- Field access, nested field access (`p.a.x`)
+- Field access, nested field access (`p.a.x`, `arr[i].inner.x`)
 - Composite literals, copy assignment
 - `p.x++`, `p.x += v`, `a[i].x = v`, `s.vals[i] = v`,
   `s.ps[i].x = v` (struct slice field write through index)
+- Chained field operations on indexed elements: read/write
+  through `a[i].inner.x`, `arr[i].inner = Inner{...}`,
+  parallel swap `a[i].x, a[i].y = a[i].y, a[i].x`, and
+  multi-return `a[i].x, a[i].y = f()`
+- Composite equality and copy at indexed elements
+  (`a[i] == a[j]`, `a[i] == Point{...}`, `a[j] = a[i]`)
+- Return composite by value from indexed base (`return a[i]`,
+  `return s[i]` for struct slices)
 - Pass to and return from functions
 - Value and pointer receivers (`func (v T) m()`, `func (p *T) m()`)
 
@@ -452,7 +460,8 @@ The generated Brainfuck uses a CPU-like execution model:
 - `*byte`, `*uintN` pointers: `&x`, `*p`, `*p = v`, `*p++`, `*p--`
 - `&myStruct`, `&myArray`, `&Point{x: 1, y: 2}`
 - `&a[i]`, `&s[i]` -- address of array/slice elements
-- `&p.field` -- address of struct field
+- `&p.field` -- address of struct field, including through indexed
+  bases and chains (`&arr[i].x`, `&arr[i].inner.x`, `&arr[i].xs[1]`)
 - `ptr.x` read/write for struct pointers (`ptr := &myStruct`)
 - `(*ptr).x` read/write (equivalent via auto-deref)
 - `q := pp` pointer alias (both observe the same target)
