@@ -5206,6 +5206,24 @@ func main() {
 			"", "1 2 3\n",
 		},
 		{
+			"constant expression array sizes",
+			`package main
+const R = 2
+func main() {
+	var g [R + 1][2 * 2]byte
+	for i := range g {
+		for j := range g[i] {
+			g[i][j] = byte(i*10 + j)
+		}
+	}
+	println(len(g), len(g[0]), g[2][3])
+	a := [1 + 2]byte{10, 20, 30}
+	b := [1 << 2]byte{}
+	println(len(a), a[2], len(b))
+}`,
+			"", "3 4 23\n3 30 4\n",
+		},
+		{
 			"array len",
 			`package main
 func main() {

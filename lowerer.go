@@ -2793,8 +2793,9 @@ func arrayNestingDepth(expr ast.Expr) int {
 // wrapping one. Callers pass the parent node, never a bare length
 // expression, so `[...]T{...}` can be resolved from `len(comp.Elts)`
 // when the `Len` is an ellipsis. The `Len` of the unwrapped
-// `ArrayType` is inspected directly (`*ast.BasicLit` INT, or
-// `*ast.Ident` resolving through `consts`).
+// `ArrayType` is folded as a constant expression via `evalConstExpr`
+// (integer/char literals, named byte consts in `consts`, and
+// arithmetic over them).
 //
 // Returns -1 when the length can't be determined (unknown length
 // shape, bare `*ast.Ellipsis` outside a composite literal, or
@@ -2814,23 +2815,18 @@ func arrayTypeSizePart(expr ast.Expr, consts map[string]byte) int {
 	if !ok {
 		return -1
 	}
-	switch e := at.Len.(type) {
-	case *ast.BasicLit:
-		if e.Kind == token.INT {
-			n, err := strconv.Atoi(e.Value)
-			if err != nil {
-				return -1
-			}
-			return n
-		}
-	case *ast.Ident:
-		if consts != nil {
-			if val, ok := consts[e.Name]; ok {
-				return int(val)
-			}
-		}
+	if at.Len == nil {
+		return -1
 	}
-	return -1
+	// The length is any constant expression: an integer or char literal, a
+	// named byte const, or arithmetic over them (`[2*3]byte`, `[1<<4]byte`).
+	// evalConstExpr folds it at full precision; a non-constant length (e.g.
+	// a bare ellipsis outside a composite literal) yields an error -> -1.
+	v, err := evalConstExpr(at.Len, 0, consts)
+	if err != nil {
+		return -1
+	}
+	return int(v) // #nosec G115
 }
 
 // Statement lowering.
