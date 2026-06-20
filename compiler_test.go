@@ -1599,6 +1599,39 @@ func main() {
 			"", "16 1\n",
 		},
 		{
+			"constant shift exceeding byte width folds at full precision",
+			`package main
+func main() {
+	var a uint16 = 1 << 8
+	var b uint16 = 1 << 9
+	var c uint32 = 1 << 24
+	const K = 1 << 10
+	var e uint16 = K
+	println(a, b, e)
+	println(c)
+	var d uint64 = (1 << 40) - 1
+	println(byte(d>>32), byte(d>>24), byte(d))
+	println(16 * 16)
+}`,
+			"", "256 512 1024\n16777216\n255 255 255\n256\n",
+		},
+		{
+			"nested constant fold propagates width through byte-sized intermediates",
+			`package main
+const K = 200
+func main() {
+	var a uint16 = (2 + 3) * 100   // inner 5 fits a byte; product is 500
+	var b uint16 = (1 + 1) << 8    // 512
+	var c uint16 = (10 - 2) * 40   // 320
+	var d uint32 = K * K * 100     // 4000000
+	println(a, b, c)
+	println(d)
+	var p, q byte = 200, 100
+	println(p + q)                 // runtime byte arithmetic wraps to 44
+}`,
+			"", "500 512 320\n4000000\n44\n",
+		},
+		{
 			"xor swap",
 			`package main
 func main() {

@@ -8146,6 +8146,43 @@ func (l *Lowerer) lowerBinary(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprR
 	if err != nil {
 		return exprResult{}, err
 	}
+	// Both operands are untyped compile-time constants (`litValue` set; type
+	// conversions deliberately drop it, so typed byte arithmetic like
+	// `byte(200) + byte(100)` is left to wrap as Go specifies). Fold at full
+	// uint64 precision and materialize the result as a single constant sized
+	// by its magnitude, matching how an integer literal of that value is
+	// sized. This both fixes byte-width wrap on widening results (`1 << 8`
+	// would otherwise never enter the multi-byte path and wrap to 0) and
+	// propagates `litValue` up nested trees, so `(2 + 3) * 100` folds to a
+	// uint16 rather than computing the inner `5` byte-wide and wrapping the
+	// product. Folding every constant op also collapses `5 + 3` to one const.
+	if left.litValue != nil && right.litValue != nil {
+		if v, ok := evalBinaryOp(e.Op, *left.litValue, *right.litValue); ok {
+			if left.temp {
+				l.freeCellRange(left.cell, left.cellCount())
+			}
+			if right.temp {
+				l.freeCellRange(right.cell, right.cellCount())
+			}
+			n := 1
+			switch {
+			case v > math.MaxUint32:
+				n = 8
+			case v > math.MaxUint16:
+				n = 4
+			case v > math.MaxUint8:
+				n = 2
+			}
+			base := l.allocCells(n)
+			for j := range n {
+				l.emit(&IRConst{Dst: base + j, Value: byte(v >> (j * 8))}) // #nosec G115
+			}
+			if n == 1 {
+				return exprResult{cell: base, temp: true, exprShape: exprShape{intSize: 1, litValue: &v}}, nil
+			}
+			return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n, litValue: &v}}, nil
+		}
+	}
 	// Multi-byte integer binary operations.
 	if left.intSize > 1 || right.intSize > 1 {
 		if e.Op != token.SHL && e.Op != token.SHR && left.intSize != right.intSize {
@@ -8238,6 +8275,44 @@ func (l *Lowerer) lowerBinary(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprR
 		l.freeCell(right.cell)
 	}
 	return exprResult{cell: t, temp: true, exprShape: exprShape{intSize: 1}}, nil
+}
+
+// evalBinaryOp applies an arithmetic or bitwise binary operator to two integer
+// operands at full uint64 precision. It returns ok == false for operators that
+// do not yield an integer (comparisons, logical) and for division or modulo by
+// zero, leaving those to the per-operator codegen.
+func evalBinaryOp(op token.Token, left, right uint64) (uint64, bool) {
+	switch op {
+	case token.ADD:
+		return left + right, true
+	case token.SUB:
+		return left - right, true
+	case token.MUL:
+		return left * right, true
+	case token.QUO:
+		if right == 0 {
+			return 0, false
+		}
+		return left / right, true
+	case token.REM:
+		if right == 0 {
+			return 0, false
+		}
+		return left % right, true
+	case token.AND:
+		return left & right, true
+	case token.OR:
+		return left | right, true
+	case token.XOR:
+		return left ^ right, true
+	case token.AND_NOT:
+		return left &^ right, true
+	case token.SHL:
+		return left << right, true
+	case token.SHR:
+		return left >> right, true
+	}
+	return 0, false
 }
 
 func (l *Lowerer) lowerLogical(e *ast.BinaryExpr, lowerExpr func(ast.Expr) (exprResult, error)) (exprResult, error) {
@@ -9659,6 +9734,12 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 			}
 			return exprResult{cell: r.cell, temp: r.temp, exprShape: exprShape{intSize: 1}}, true, nil
 		}
+		// A conversion yields a typed byte value, not an untyped constant:
+		// drop litValue so typed arithmetic like `byte(200) + byte(100)`
+		// wraps in byte width (-> 44) rather than folding to the untyped
+		// sum 300. The wider uint16/uint32/uint64 cases below already
+		// return results without litValue.
+		r.litValue = nil
 		return r, true, err
 	case "uint16", "uint32", "uint64":
 		n := intIdentSize(fn.Name)

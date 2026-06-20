@@ -828,35 +828,14 @@ func evalConstExpr(expr ast.Expr, iota uint64, consts map[string]byte) (uint64, 
 		if err != nil {
 			return 0, err
 		}
+		if v, ok := evalBinaryOp(e.Op, left, right); ok {
+			return v, nil
+		}
 		switch e.Op {
-		case token.ADD:
-			return left + right, nil
-		case token.SUB:
-			return left - right, nil
-		case token.MUL:
-			return left * right, nil
 		case token.QUO:
-			if right == 0 {
-				return 0, fmt.Errorf("division by zero in constant expression")
-			}
-			return left / right, nil
+			return 0, fmt.Errorf("division by zero in constant expression")
 		case token.REM:
-			if right == 0 {
-				return 0, fmt.Errorf("modulo by zero in constant expression")
-			}
-			return left % right, nil
-		case token.AND:
-			return left & right, nil
-		case token.OR:
-			return left | right, nil
-		case token.XOR:
-			return left ^ right, nil
-		case token.AND_NOT:
-			return left &^ right, nil
-		case token.SHL:
-			return left << right, nil
-		case token.SHR:
-			return left >> right, nil
+			return 0, fmt.Errorf("modulo by zero in constant expression")
 		}
 	case *ast.CallExpr:
 		// Integer type conversions are pass-throughs at the uint64 level;

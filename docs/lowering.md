@@ -1063,6 +1063,30 @@ Integer literals > 255 produce `uint16` results;
 literals > 65535 produce `uint32`; literals > 2^32 - 1
 produce `uint64`. The same magnitude-based promotion
 applies to untyped constants via `classifyIntConst`.
+
+A binary expression whose operands are both untyped
+compile-time constants (e.g. `1 << 8`, `(1 << 40) - 1`,
+`16 * 16`, `K << 4` for a byte const `K`) is folded by
+`evalBinaryOp` at full `uint64` precision in `lowerBinary`
+-- after both sides are lowered, judged via the `litValue`
+each constant operand carries -- and materialized as a single
+constant promoted by the magnitude of the *result*. Without
+this, an expression whose operands each fit in a byte would
+never enter the multi-byte path and would be evaluated in
+byte width and wrap (`1 << 8` -> `0`). Folding every constant
+op (not just widening ones) keeps `litValue` flowing up
+nested trees, so `(2 + 3) * 100` promotes to `uint16` 500
+instead of computing the inner `5` byte-wide and wrapping the
+product; it also collapses `5 + 3` to one `IRConst`.
+
+`litValue` marks an *untyped* constant. An explicit
+conversion yields a typed value, so `byte()` / `uint8()`
+drop `litValue` (the wider conversions never set it); typed
+arithmetic like `byte(200) + byte(100)` then wraps in byte
+width as Go specifies rather than folding to the untyped sum
+300. `evalBinaryOp` is also the single source of truth for
+constant operator semantics shared with the analyzer's
+`evalConstExpr`.
 Assigning a wider integer to a narrower variable is a
 compile error. `byte()`, `uint16()`, and `uint32()` are
 the explicit truncation paths.
