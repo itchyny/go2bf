@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -707,7 +708,7 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 	}
 
 	if _, ok := result.Funcs["main"]; !ok {
-		return nil, fmt.Errorf("no main function found")
+		return nil, errors.New("no main function found")
 	}
 
 	// Build call graph (and reject zero-length arrays inside function bodies).
@@ -833,9 +834,9 @@ func evalConstExpr(expr ast.Expr, iota uint64, consts map[string]byte) (uint64, 
 		}
 		switch e.Op {
 		case token.QUO:
-			return 0, fmt.Errorf("division by zero in constant expression")
+			return 0, errors.New("division by zero in constant expression")
 		case token.REM:
-			return 0, fmt.Errorf("modulo by zero in constant expression")
+			return 0, errors.New("modulo by zero in constant expression")
 		}
 	case *ast.CallExpr:
 		// Integer type conversions are pass-throughs at the uint64 level;
@@ -860,7 +861,7 @@ func evalConstExpr(expr ast.Expr, iota uint64, consts map[string]byte) (uint64, 
 	case *ast.ParenExpr:
 		return evalConstExpr(e.X, iota, consts)
 	}
-	return 0, fmt.Errorf("unsupported constant expression")
+	return 0, errors.New("unsupported constant expression")
 }
 
 // detectRecursion marks functions that are part of call graph cycles.

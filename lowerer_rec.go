@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -328,12 +329,12 @@ func (l *Lowerer) rejectComposites(body *ast.BlockStmt) error {
 			err = fmt.Errorf("%s usage in recursive function is not supported", kind)
 		case *ast.StructType:
 			// Anonymous struct: `struct{...}` type literal.
-			err = fmt.Errorf("struct usage in recursive function is not supported")
+			err = errors.New("struct usage in recursive function is not supported")
 		case *ast.Ident:
 			// Named struct type used in a value context (var p Point,
 			// Point{...}, etc.). The non-struct idents pass through.
 			if l.structDef(n) != nil {
-				err = fmt.Errorf("struct usage in recursive function is not supported")
+				err = errors.New("struct usage in recursive function is not supported")
 			}
 		}
 		return true
@@ -1400,7 +1401,7 @@ func (rl *recLowerer) lowerStmt(stmt ast.Stmt) error {
 func (rl *recLowerer) lowerExprStmt(s *ast.ExprStmt) error {
 	call, ok := s.X.(*ast.CallExpr)
 	if !ok {
-		return fmt.Errorf("unsupported expression statement in recursive function")
+		return errors.New("unsupported expression statement in recursive function")
 	}
 	return rl.lowerCallStmt(call)
 }
@@ -1408,7 +1409,7 @@ func (rl *recLowerer) lowerExprStmt(s *ast.ExprStmt) error {
 func (rl *recLowerer) lowerCallStmt(call *ast.CallExpr) error {
 	funcName, _ := rl.resolveCall(call)
 	if funcName == "" {
-		return fmt.Errorf("unsupported call in recursive function")
+		return errors.New("unsupported call in recursive function")
 	}
 	if handled, err := rl.lowerBuiltinCall(funcName, call.Args, rl.lowerExpr); handled {
 		return err
@@ -1505,7 +1506,7 @@ func (rl *recLowerer) runInlinedFunc(info *FuncInfo, retCells []Cell, body func(
 func (rl *recLowerer) lowerDecl(s *ast.DeclStmt) error {
 	gd, ok := s.Decl.(*ast.GenDecl)
 	if !ok {
-		return fmt.Errorf("unsupported declaration in recursive function")
+		return errors.New("unsupported declaration in recursive function")
 	}
 	if gd.Tok == token.CONST {
 		return rl.lowerLocalConsts(gd)
@@ -1565,7 +1566,7 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 						size := info.ReturnSizes[i]
 						id, ok := lhs.(*ast.Ident)
 						if !ok {
-							return fmt.Errorf("unsupported multi-return target in recursive function")
+							return errors.New("unsupported multi-return target in recursive function")
 						}
 						if id.Name == "_" {
 							off += size
@@ -1600,7 +1601,7 @@ func (rl *recLowerer) lowerAssign(s *ast.AssignStmt) error {
 		for i, lhs := range s.Lhs {
 			id, ok := lhs.(*ast.Ident)
 			if !ok {
-				return fmt.Errorf("unsupported multi-assignment target in recursive function")
+				return errors.New("unsupported multi-assignment target in recursive function")
 			}
 			cell, err := rl.lookupVar(id.Name)
 			if err != nil {
@@ -1860,7 +1861,7 @@ func (rl *recLowerer) lowerRange(s *ast.RangeStmt) error {
 	// Range over a scalar limit: for i := range n. Range over arrays
 	// requires array locals, which are rejected upfront.
 	if s.Value != nil {
-		return fmt.Errorf("range with value in recursive function is not supported (no array locals)")
+		return errors.New("range with value in recursive function is not supported (no array locals)")
 	}
 	limit, err := rl.lowerExpr(s.X)
 	if err != nil {
@@ -2073,7 +2074,7 @@ func (rl *recLowerer) lowerReturn(s *ast.ReturnStmt) error {
 func (rl *recLowerer) lowerDefer(s *ast.DeferStmt) error {
 	fn, ok := s.Call.Fun.(*ast.Ident)
 	if !ok {
-		return fmt.Errorf("unsupported defer call in recursive function")
+		return errors.New("unsupported defer call in recursive function")
 	}
 	switch fn.Name {
 	case "putchar", "print", "println":

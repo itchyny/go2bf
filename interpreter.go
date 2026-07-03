@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"strings"
 )
@@ -233,7 +233,7 @@ func compileBF(code string) ([]instruction, error) {
 			stack = append(stack, i)
 		case opClose:
 			if len(stack) == 0 {
-				return nil, fmt.Errorf("unmatched ']'")
+				return nil, errors.New("unmatched ']'")
 			}
 			open := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
@@ -242,7 +242,7 @@ func compileBF(code string) ([]instruction, error) {
 		}
 	}
 	if len(stack) != 0 {
-		return nil, fmt.Errorf("unmatched '['")
+		return nil, errors.New("unmatched '['")
 	}
 
 	// Peephole: replace common patterns.

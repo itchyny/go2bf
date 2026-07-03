@@ -1112,7 +1112,7 @@ func (l *Lowerer) ensureSliceCapByCell(si sliceInfo, extra Cell) {
 
 func (l *Lowerer) evalSliceMake(typeExpr ast.Expr, args []ast.Expr) (sliceInfo, error) {
 	if sliceNestingDepth(typeExpr) > 2 {
-		return sliceInfo{}, fmt.Errorf("slice nesting deeper than 2 levels is not supported")
+		return sliceInfo{}, errors.New("slice nesting deeper than 2 levels is not supported")
 	}
 	si := l.allocSliceInfo()
 	es, et, esl, ept, eis := l.sliceElemInfo(typeExpr)
@@ -1516,14 +1516,14 @@ func (l *Lowerer) lowerSliceFromSliceExpr(si sliceInfo, se *ast.SliceExpr) error
 		if se.Low != nil {
 			v, ok := l.constValue(se.Low)
 			if !ok {
-				return fmt.Errorf("slice bounds must be constant for arrays")
+				return errors.New("slice bounds must be constant for arrays")
 			}
 			low = v
 		}
 		if se.High != nil {
 			v, ok := l.constValue(se.High)
 			if !ok {
-				return fmt.Errorf("slice bounds must be constant for arrays")
+				return errors.New("slice bounds must be constant for arrays")
 			}
 			high = v
 		} else {
@@ -1533,7 +1533,7 @@ func (l *Lowerer) lowerSliceFromSliceExpr(si sliceInfo, se *ast.SliceExpr) error
 		if se.Max != nil {
 			v, ok := l.constValue(se.Max)
 			if !ok {
-				return fmt.Errorf("slice bounds must be constant for arrays")
+				return errors.New("slice bounds must be constant for arrays")
 			}
 			capVal = v - low
 		}
@@ -1793,11 +1793,11 @@ func (l *Lowerer) lowerSliceAppend(si sliceInfo, valArg ast.Expr) error {
 func (l *Lowerer) lowerSliceAppendSpread(si sliceInfo, srcExpr ast.Expr) error {
 	srcID, ok := srcExpr.(*ast.Ident)
 	if !ok {
-		return fmt.Errorf("append spread requires a slice identifier")
+		return errors.New("append spread requires a slice identifier")
 	}
 	src, ok := l.lookupSlice(srcID.Name)
 	if !ok {
-		return fmt.Errorf("append spread requires a slice argument")
+		return errors.New("append spread requires a slice argument")
 	}
 	es := si.elemSize
 	// Compute needed = len(dst) + len(src). If needed > cap, reallocate.
@@ -2534,7 +2534,7 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 			// Keyed element: {0: 'a', 2: 'c'}
 			key, ok := l.constValue(kv.Key)
 			if !ok {
-				return fmt.Errorf("array index must be a constant")
+				return errors.New("array index must be a constant")
 			}
 			idx = key
 			valExpr = kv.Value
@@ -2615,7 +2615,7 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 		if arr.elemSize > 1 && arr.elemType == "" {
 			comp, ok := valExpr.(*ast.CompositeLit)
 			if !ok {
-				return fmt.Errorf("array-of-array element must be a literal")
+				return errors.New("array-of-array element must be a literal")
 			}
 			base := arr.base + idx*arr.elemSize
 			// Multi-byte int inner element: stride by innerElemSize.
@@ -2668,7 +2668,7 @@ func (l *Lowerer) lowerArrayExpr(expr ast.Expr) (arrayInfo, error) {
 	}
 	ec, es, et, eis, esl, ies, ieis := l.arrayElementInfo(comp)
 	if ec == 0 {
-		return arrayInfo{}, fmt.Errorf("not an array literal")
+		return arrayInfo{}, errors.New("not an array literal")
 	}
 	base := l.allocCells(ec * es)
 	arr := arrayInfo{base: base, elemCount: ec, elemSize: es, elemType: et,
@@ -3061,7 +3061,7 @@ func (l *Lowerer) lowerStmt(stmt ast.Stmt) error {
 func (l *Lowerer) lowerExprStmt(s *ast.ExprStmt) error {
 	call, ok := s.X.(*ast.CallExpr)
 	if !ok {
-		return fmt.Errorf("unsupported expression statement")
+		return errors.New("unsupported expression statement")
 	}
 	return l.lowerCallStmt(call)
 }
@@ -3069,7 +3069,7 @@ func (l *Lowerer) lowerExprStmt(s *ast.ExprStmt) error {
 func (l *Lowerer) lowerCallStmt(call *ast.CallExpr) error {
 	funcName, receiver := l.resolveCall(call)
 	if funcName == "" {
-		return fmt.Errorf("unsupported function call")
+		return errors.New("unsupported function call")
 	}
 
 	if handled, err := l.lowerBuiltinCall(funcName, call.Args, l.lowerExpr); handled {
@@ -3251,7 +3251,7 @@ func (l *Lowerer) lowerPutchar(args []ast.Expr, lowerExpr func(ast.Expr) (exprRe
 	}
 	if id, ok := args[0].(*ast.Ident); ok {
 		if _, ok := l.lookupSlice(id.Name); ok {
-			return fmt.Errorf("cannot use slice as argument to putchar")
+			return errors.New("cannot use slice as argument to putchar")
 		}
 		if l.lookupStringConst(id.Name) != "" {
 			return fmt.Errorf("string constant %s can only be used with print/println", id.Name)
@@ -3271,7 +3271,7 @@ func (l *Lowerer) lowerPutchar(args []ast.Expr, lowerExpr func(ast.Expr) (exprRe
 		return fmt.Errorf("cannot use struct %s as byte value", r.structType)
 	}
 	if r.elemCount > 0 {
-		return fmt.Errorf("cannot use array as byte value")
+		return errors.New("cannot use array as byte value")
 	}
 	l.emit(&IRPutc{Src: r.cell})
 	if r.temp {
@@ -3608,11 +3608,11 @@ func decimalDigits(k int) []int {
 
 func (l *Lowerer) lowerClear(args []ast.Expr) error {
 	if len(args) != 1 {
-		return fmt.Errorf("clear expects 1 argument")
+		return errors.New("clear expects 1 argument")
 	}
 	r, err := l.lowerExpr(args[0])
 	if err != nil || r.lenCell == 0 {
-		return fmt.Errorf("clear expects a slice argument")
+		return errors.New("clear expects a slice argument")
 	}
 	counter := l.allocCell()
 	l.emit(&IRZero{Dst: counter})
@@ -3725,15 +3725,15 @@ func (l *Lowerer) emitCopy(dst, src exprResult) Cell {
 
 func (l *Lowerer) lowerCopy(args []ast.Expr) error {
 	if len(args) != 2 {
-		return fmt.Errorf("copy expects 2 arguments")
+		return errors.New("copy expects 2 arguments")
 	}
 	dst, err := l.lowerExpr(args[0])
 	if err != nil || dst.lenCell == 0 {
-		return fmt.Errorf("copy expects slice arguments")
+		return errors.New("copy expects slice arguments")
 	}
 	src, err := l.lowerExpr(args[1])
 	if err != nil || src.lenCell == 0 {
-		return fmt.Errorf("copy expects slice arguments")
+		return errors.New("copy expects slice arguments")
 	}
 	n := l.emitCopy(dst, src)
 	l.freeCell(n)
@@ -3794,7 +3794,7 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 		}
 		st, ok := ts.Type.(*ast.StructType)
 		if !ok {
-			return fmt.Errorf("unsupported local type: only struct types are supported")
+			return errors.New("unsupported local type: only struct types are supported")
 		}
 		def := &StructDef{
 			Name:  ts.Name.Name,
@@ -3870,7 +3870,7 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 	l.declareFromDecl(s)
 	gd, ok := s.Decl.(*ast.GenDecl)
 	if !ok {
-		return fmt.Errorf("unsupported declaration")
+		return errors.New("unsupported declaration")
 	}
 	if gd.Tok == token.CONST {
 		return l.lowerLocalConsts(gd)
@@ -3884,10 +3884,10 @@ func (l *Lowerer) lowerDecl(s *ast.DeclStmt) error {
 			continue
 		}
 		if vs.Type != nil && arrayNestingDepth(vs.Type) > 3 {
-			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
+			return errors.New("array nesting deeper than 3 levels is not supported")
 		}
 		if vs.Type != nil && sliceNestingDepth(vs.Type) > 2 {
-			return fmt.Errorf("slice nesting deeper than 2 levels is not supported")
+			return errors.New("slice nesting deeper than 2 levels is not supported")
 		}
 		for i, name := range vs.Names {
 			if i >= len(vs.Values) {
@@ -4061,7 +4061,7 @@ func (l *Lowerer) lowerVarInit(name string, rhs ast.Expr, isDefine bool) error {
 	// Composite literal: a = [N]byte{...} or p = Point{...}
 	if comp, ok := rhs.(*ast.CompositeLit); ok {
 		if comp.Type != nil && arrayNestingDepth(comp.Type) > 3 {
-			return fmt.Errorf("array nesting deeper than 3 levels is not supported")
+			return errors.New("array nesting deeper than 3 levels is not supported")
 		}
 		size := l.arraySize(comp)
 		if size > 0 {
@@ -4148,7 +4148,7 @@ func (l *Lowerer) assignResult(dst, r exprResult) error {
 		if r.temp {
 			l.freeCellRange(r.cell, r.intSize)
 		}
-		return fmt.Errorf("cannot assign wider integer to byte variable, use explicit conversion")
+		return errors.New("cannot assign wider integer to byte variable, use explicit conversion")
 	}
 	if r.cell == dst.cell {
 		if r.temp {
@@ -4330,7 +4330,7 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 					}
 					continue
 				}
-				return fmt.Errorf("cannot index non-array expression")
+				return errors.New("cannot index non-array expression")
 			case *ast.SelectorExpr:
 				if err := l.assignFieldFromCell(t, rv.cell, rv.size); err != nil {
 					return err
@@ -4428,7 +4428,7 @@ func (l *Lowerer) lowerMultiReturnAssign(s *ast.AssignStmt, info *FuncInfo, args
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported assignment target")
+			return errors.New("unsupported assignment target")
 		}
 		off += n
 	}
@@ -4447,7 +4447,7 @@ func (l *Lowerer) lowerArrayAssign(idx *ast.IndexExpr, rhs ast.Expr) error {
 		return err
 	}
 	if base.elemCount == 0 && base.lenCell == 0 {
-		return fmt.Errorf("cannot index non-array expression")
+		return errors.New("cannot index non-array expression")
 	}
 	// Slice element write: s[i] = t, s[i] = make(...), s[i] = []byte{...}.
 	if base.elemSlice {
@@ -4663,7 +4663,7 @@ func (l *Lowerer) lowerCompositeReturnAssign(lhs ast.Expr, info *FuncInfo, args 
 	}
 	id, ok := lhs.(*ast.Ident)
 	if !ok {
-		return fmt.Errorf("unsupported assignment target for composite return")
+		return errors.New("unsupported assignment target for composite return")
 	}
 	retCells, err := l.inlineCall(info, args)
 	if err != nil {
@@ -4837,7 +4837,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 		return err
 	}
 	if base.structType == "" {
-		return fmt.Errorf("undefined struct in field assignment")
+		return errors.New("undefined struct in field assignment")
 	}
 	def := l.result.Structs[base.structType]
 	offset := def.Field[sel.Sel.Name].Offset
@@ -5021,7 +5021,7 @@ func (l *Lowerer) assignStringHeader(lhs ast.Expr, src sliceInfo) error {
 			return err
 		}
 		if base.structType == "" {
-			return fmt.Errorf("undefined struct in field assignment")
+			return errors.New("undefined struct in field assignment")
 		}
 		def := l.result.Structs[base.structType]
 		if !def.Field[t.Sel.Name].IsString() {
@@ -5058,7 +5058,7 @@ func (l *Lowerer) assignStringHeader(lhs ast.Expr, src sliceInfo) error {
 			return err
 		}
 		if !base.elemSlice {
-			return fmt.Errorf("expected slice-of-strings target")
+			return errors.New("expected slice-of-strings target")
 		}
 		if base.isPointer {
 			addr, err := l.ptrDynIndex(base.cell, t.Index, 3)
@@ -5156,7 +5156,7 @@ func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell, size int)
 		return err
 	}
 	if base.structType == "" {
-		return fmt.Errorf("undefined struct in field assignment")
+		return errors.New("undefined struct in field assignment")
 	}
 	def := l.result.Structs[base.structType]
 	offset := def.Field[sel.Sel.Name].Offset
@@ -5228,7 +5228,7 @@ func (l *Lowerer) lowerCompositeVarIndex(ai arrayInfo, indexExpr ast.Expr) (expr
 		if indexR.temp {
 			l.freeCellRange(indexR.cell, indexR.intSize)
 		}
-		return exprResult{}, fmt.Errorf("cannot use multi-byte integer as array index, use byte() to truncate")
+		return exprResult{}, errors.New("cannot use multi-byte integer as array index, use byte() to truncate")
 	}
 	flatIdx := l.allocCell()
 	l.mulByConst(flatIdx, indexR.cell, ai.elemSize)
@@ -5930,7 +5930,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	} else {
 		// Reject explicit invalid sources first.
 		if u, ok := s.X.(*ast.UnaryExpr); ok && u.Op == token.AND {
-			return fmt.Errorf("cannot range over pointer expression")
+			return errors.New("cannot range over pointer expression")
 		}
 		if id, ok := s.X.(*ast.Ident); ok {
 			if _, isStruct := l.lookupBinding(id.Name).(*structBinding); isStruct {
@@ -6129,7 +6129,7 @@ func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 			return l.emitLabeledBranch(s.Label.Name, true)
 		}
 		if l.loopSkipFlag == 0 {
-			return fmt.Errorf("break outside loop")
+			return errors.New("break outside loop")
 		}
 		l.emit(&IRConst{Dst: l.loopSkipFlag, Value: 1})
 		l.emit(&IRConst{Dst: l.loopBreakFlag, Value: 1})
@@ -6139,13 +6139,13 @@ func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 			return l.emitLabeledBranch(s.Label.Name, false)
 		}
 		if l.loopSkipFlag == 0 {
-			return fmt.Errorf("continue outside loop")
+			return errors.New("continue outside loop")
 		}
 		l.emit(&IRConst{Dst: l.loopSkipFlag, Value: 1})
 		return nil
 	case token.GOTO:
 		if l.gotoLabels == nil || s.Label == nil {
-			return fmt.Errorf("goto outside a goto-dispatch function")
+			return errors.New("goto outside a goto-dispatch function")
 		}
 		idx, ok := l.gotoLabels[s.Label.Name]
 		if !ok {
@@ -6394,7 +6394,7 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 		}
 	}
 	if !l.inFunc {
-		return fmt.Errorf("return outside function")
+		return errors.New("return outside function")
 	}
 
 	// Check for tail call: return f(args...) where f is the current tail-call target.
@@ -6482,7 +6482,7 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 			return l.returnFinish()
 		}
 		if r.intSize > 1 && len(l.returnDst) < 2 {
-			return fmt.Errorf("cannot return wider integer from byte-returning function, use byte() to truncate")
+			return errors.New("cannot return wider integer from byte-returning function, use byte() to truncate")
 		}
 		l.emitCopyOrMove(l.returnDst[0], r)
 		return l.returnFinish()
@@ -6695,7 +6695,7 @@ func (l *Lowerer) returnFinish() error {
 
 func (l *Lowerer) lowerDefer(s *ast.DeferStmt) error {
 	if l.loopDepth > 0 {
-		return fmt.Errorf("defer inside a loop is not supported")
+		return errors.New("defer inside a loop is not supported")
 	}
 
 	// Go semantics: defer args are evaluated immediately and captured.
@@ -6811,7 +6811,7 @@ func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
 			}
 			return arr.base, arr.size(), nil
 		}
-		return 0, 0, fmt.Errorf("unsupported composite literal argument")
+		return 0, 0, errors.New("unsupported composite literal argument")
 	}
 	r, err := l.lowerExpr(expr)
 	if err != nil {
@@ -7333,7 +7333,7 @@ func (l *Lowerer) lowerLiteral(e *ast.BasicLit) (exprResult, error) {
 		return exprResult{cell: t, temp: true, exprShape: exprShape{intSize: 1, litValue: &val}}, nil
 	case token.STRING:
 		// String literal in expression context: not directly supported as a value.
-		return exprResult{}, fmt.Errorf("string literals can only be used with print/println")
+		return exprResult{}, errors.New("string literals can only be used with print/println")
 	default:
 		return exprResult{}, fmt.Errorf("unsupported literal kind: %s", e.Kind)
 	}
@@ -7764,7 +7764,7 @@ func (l *Lowerer) ptrDynIndex(ptr Cell, indexExpr ast.Expr, elemSize int) (Cell,
 		if idxR.temp {
 			l.freeCellRange(idxR.cell, idxR.intSize)
 		}
-		return 0, fmt.Errorf("cannot use multi-byte integer as array index, use byte() to truncate")
+		return 0, errors.New("cannot use multi-byte integer as array index, use byte() to truncate")
 	}
 	l.mulByConst(idx, idxR.cell, elemSize)
 	if idxR.temp {
@@ -7836,7 +7836,7 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 				}
 				return res, nil
 			}
-			return exprResult{}, fmt.Errorf("cannot take address of chained index expression")
+			return exprResult{}, errors.New("cannot take address of chained index expression")
 		}
 		var idx Cell
 		var elemType string
@@ -9654,7 +9654,7 @@ func (l *Lowerer) lowerCallExpr(call *ast.CallExpr) (exprResult, error) {
 	}
 	funcName, receiver := l.resolveCall(call)
 	if funcName == "" {
-		return exprResult{}, fmt.Errorf("unsupported function call expression")
+		return exprResult{}, errors.New("unsupported function call expression")
 	}
 	info, ok := l.result.Funcs[funcName]
 	if !ok {
@@ -9816,15 +9816,15 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		return exprResult{cell: t, temp: true, exprShape: exprShape{intSize: 1}}, true, nil
 	case "copy":
 		if len(call.Args) != 2 {
-			return exprResult{}, true, fmt.Errorf("copy() expects 2 arguments")
+			return exprResult{}, true, errors.New("copy() expects 2 arguments")
 		}
 		dst, err := lowerExpr(call.Args[0])
 		if err != nil || dst.lenCell == 0 {
-			return exprResult{}, true, fmt.Errorf("copy expects slice arguments")
+			return exprResult{}, true, errors.New("copy expects slice arguments")
 		}
 		src, err := lowerExpr(call.Args[1])
 		if err != nil || src.lenCell == 0 {
-			return exprResult{}, true, fmt.Errorf("copy expects slice arguments")
+			return exprResult{}, true, errors.New("copy expects slice arguments")
 		}
 		n := l.emitCopy(dst, src)
 		return exprResult{cell: n, temp: true, exprShape: exprShape{intSize: 1}}, true, nil
@@ -9898,7 +9898,7 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		return exprResult{cell: t, temp: true, exprShape: exprShape{intSize: 1}}, true, nil
 	case "getchar":
 		if len(call.Args) != 0 {
-			return exprResult{}, true, fmt.Errorf("getchar expects 0 arguments")
+			return exprResult{}, true, errors.New("getchar expects 0 arguments")
 		}
 		t := l.allocCell()
 		l.emit(&IRGetc{Dst: t})
@@ -9923,9 +9923,9 @@ func (l *Lowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 			}
 		}
 		if depth > 3 {
-			return exprResult{}, fmt.Errorf("array nesting deeper than 3 levels is not supported")
+			return exprResult{}, errors.New("array nesting deeper than 3 levels is not supported")
 		}
-		return exprResult{}, fmt.Errorf("cannot index non-array expression")
+		return exprResult{}, errors.New("cannot index non-array expression")
 	}
 	r, err := l.indexInto(base, e.Index)
 	if err != nil {
@@ -10144,7 +10144,7 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 		if indexResult.temp {
 			l.freeCellRange(indexResult.cell, indexResult.intSize)
 		}
-		return exprResult{}, fmt.Errorf("cannot use multi-byte integer as array index, use byte() to truncate")
+		return exprResult{}, errors.New("cannot use multi-byte integer as array index, use byte() to truncate")
 	}
 	result := l.allocCell()
 	l.emitVariableIndexRead(ai, indexResult.cell, result)
@@ -10166,7 +10166,7 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 		if val.temp {
 			l.freeCellRange(val.cell, val.cellCount())
 		}
-		return fmt.Errorf("mismatched integer sizes in element assignment, use explicit conversion")
+		return errors.New("mismatched integer sizes in element assignment, use explicit conversion")
 	}
 	// Flat-base val (e.g. `arr[j] = arr[i]` for a struct/sub-array): val.cell
 	// is the flat offset into val.flatBase, not the value itself. Materialize
@@ -10408,7 +10408,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			return exprResult{}, err
 		}
 		if inner.structType == "" {
-			return exprResult{}, fmt.Errorf("indexed expression does not have struct elements")
+			return exprResult{}, errors.New("indexed expression does not have struct elements")
 		}
 		def = l.result.Structs[inner.structType]
 		// Size-1 struct from a slice/array index: inner.cell is a temp
@@ -10448,7 +10448,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 			return exprResult{}, err
 		}
 		if inner.structType == "" {
-			return exprResult{}, fmt.Errorf("unsupported selector expression")
+			return exprResult{}, errors.New("unsupported selector expression")
 		}
 		def = l.result.Structs[inner.structType]
 		base = inner.cell
