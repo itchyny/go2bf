@@ -1,4 +1,8 @@
 # Changelog
+## [v0.1.1](https://github.com/itchyny/go2bf/compare/v0.1.0..v0.1.1) (2026-07-05)
+* support array sizes with any constant expression
+* fix constant binary expressions wrapping to byte width
+
 ## [v0.1.0](https://github.com/itchyny/go2bf/compare/v0.0.1..v0.1.0) (2026-06-12)
 * support `uint16`, `uint32`, `uint64` integer types
 * support array nesting up to 3 levels of bytes, ellipsis-sized arrays
