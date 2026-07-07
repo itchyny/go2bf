@@ -1,7 +1,6 @@
 # go2bf
 
-[![CI Status](https://github.com/itchyny/go2bf/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/itchyny/go2bf/actions?query=branch:main)
-[![Go Report Card](https://goreportcard.com/badge/github.com/itchyny/go2bf)](https://goreportcard.com/report/github.com/itchyny/go2bf)
+[![CI Status](https://github.com/itchyny/go2bf/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/itchyny/go2bf/actions/workflows/ci.yaml?query=branch:main)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/itchyny/go2bf/blob/main/LICENSE)
 [![release](https://img.shields.io/github/release/itchyny/go2bf/all.svg)](https://github.com/itchyny/go2bf/releases)
 
