@@ -1267,7 +1267,7 @@ func (rl *recLowerer) lookupVar(name string) (Cell, error) {
 	}
 	info, ok := rl.rc.locals[name]
 	if !ok {
-		switch rl.Lowerer.lookupBinding(name).(type) {
+		switch rl.lookupBinding(name).(type) {
 		case *byteBinding, *intBinding:
 			return 0, fmt.Errorf(
 				"global variable %s is not accessible from recursive function", name)
