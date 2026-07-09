@@ -1954,6 +1954,13 @@ func (l *Lowerer) declareFromRange(s *ast.RangeStmt) {
 	if s.Value != nil {
 		if id, ok := s.Value.(*ast.Ident); ok {
 			l.defineFromShape(sc, id.Name, elementShapeOf(l.shapeOf(s.X, sc)))
+			// A range value bound to a slice header (`[][]byte`, `[]string`
+			// elements) aliases the source's element backing -- it never
+			// owns heap. Mark it escaped so popScope's reclaim does not free
+			// the source's last element, whose backing sits at the heap top.
+			if sb, ok := sc[id.Name].(*sliceBinding); ok {
+				sb.escaped = true
+			}
 		}
 	}
 }
@@ -2055,11 +2062,17 @@ func elementShapeOf(parent exprShape) exprShape {
 	case parent.elemPtrType != "":
 		return exprShape{isPointer: true, structType: parent.elemPtrType}
 	case parent.elemSize > 1:
-		// [N][M]T -> [M]T -- propagate the inner element info.
+		// [N][M]T -> [M]T -- propagate the inner element info. A slice of
+		// byte arrays (`[][M]byte`) carries no innerElemSize, so its
+		// elements default to single-byte inner elements.
+		inner, innerInt := parent.innerElemSize, parent.innerElemIntSize
+		if inner == 0 {
+			inner, innerInt = 1, 1
+		}
 		return exprShape{
-			elemCount:   parent.elemSize / parent.innerElemSize,
-			elemSize:    parent.innerElemSize,
-			elemIntSize: parent.innerElemIntSize,
+			elemCount:   parent.elemSize / inner,
+			elemSize:    inner,
+			elemIntSize: innerInt,
 		}
 	default:
 		return exprShape{} // byte
@@ -2545,8 +2558,28 @@ func (l *Lowerer) lowerCompositeLitInto(arr arrayInfo, comp *ast.CompositeLit) e
 			return fmt.Errorf("array index %d out of bounds [0:%d]", idx, arr.elemCount)
 		}
 		if arr.elemType != "" {
-			elemDef := l.result.Structs[arr.elemType]
 			base := arr.base + idx*arr.elemSize
+			// Nested array of structs ([N][M]T): each outer element is a
+			// sub-array of structs, not a single struct. Recurse into the
+			// inner [M]T literal.
+			if arr.innerElemSize > 0 {
+				inner, ok := valExpr.(*ast.CompositeLit)
+				if !ok {
+					return errors.New("array-of-array element must be a literal")
+				}
+				innerAi := arrayInfo{
+					base:      base,
+					elemCount: arr.elemSize / arr.innerElemSize,
+					elemSize:  arr.innerElemSize,
+					elemType:  arr.elemType,
+				}
+				if err := l.lowerCompositeLitInto(innerAi, inner); err != nil {
+					return err
+				}
+				idx++
+				continue
+			}
+			elemDef := l.result.Structs[arr.elemType]
 			if err := l.lowerStructValueTo(base, elemDef, valExpr); err != nil {
 				return err
 			}

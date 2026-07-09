@@ -5350,6 +5350,20 @@ func main() {
 			"", "3 7 10 20\n",
 		},
 		{
+			"2D array of structs composite literal",
+			`package main
+type Point struct{ x, y byte }
+func main() {
+	grid := [2][2]Point{
+		{{1, 2}, {3, 4}},
+		{{5, 6}, {7, 8}},
+	}
+	grid[1][0].x = 99
+	println(grid[0][0].x, grid[0][1].y, grid[1][0].x, grid[1][1].y)
+}`,
+			"", "1 4 99 8\n",
+		},
+		{
 			"struct with nested struct init",
 			`package main
 type Inner struct { x byte; y byte }
@@ -6951,6 +6965,19 @@ func main() {
 			"", "1 10\n2 20\n3 30\n",
 		},
 		{
+			"range slice of arrays by value",
+			`package main
+func main() {
+	m := [][2]byte{{1, 2}, {3, 4}, {5, 6}}
+	sum := byte(0)
+	for _, r := range m {
+		sum += r[0] + r[1]
+	}
+	println(sum, m[0][0], m[2][1])
+}`,
+			"", "21 1 6\n",
+		},
+		{
 			"slice of slices read write",
 			`package main
 func main() {
@@ -6991,6 +7018,24 @@ func main() {
 	println(sum, len(m[0]), len(m[1]))
 }`,
 			"", "36 3 2\n",
+		},
+		{
+			"range slice of slices by value keeps last row",
+			`package main
+func main() {
+	grid := make([][]byte, 3)
+	grid[0] = []byte{11, 12}
+	grid[1] = []byte{21, 22}
+	grid[2] = []byte{31, 32}
+	sum := byte(0)
+	for _, row := range grid {
+		for _, v := range row {
+			sum += v
+		}
+	}
+	println(sum, grid[0][0], grid[1][1], grid[2][0], grid[2][1])
+}`,
+			"", "129 11 22 31 32\n",
 		},
 		{
 			"slice reslice both bounds variable",
@@ -10954,6 +10999,21 @@ func main() {
 	}
 }`,
 			"", "foo small\nbar small\nbaz medium\n",
+		},
+		{
+			"range over string slice by value keeps last element",
+			`package main
+func main() {
+	words := []string{"apple", "banana", "cherry"}
+	n := byte(0)
+	for _, w := range words {
+		n += byte(len(w))
+	}
+	print(n)
+	print(" ")
+	println(words[2])
+}`,
+			"", "17 cherry\n",
 		},
 		{
 			"function multi-return with string and byte",
