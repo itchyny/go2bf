@@ -9949,11 +9949,11 @@ func (l *Lowerer) lowerIndexExpr(e *ast.IndexExpr) (exprResult, error) {
 	if base.elemCount == 0 && base.lenCell == 0 {
 		depth := 0
 		for x := ast.Expr(e); ; depth++ {
-			if idx, ok := x.(*ast.IndexExpr); ok {
-				x = idx.X
-			} else {
+			idx, ok := x.(*ast.IndexExpr)
+			if !ok {
 				break
 			}
+			x = idx.X
 		}
 		if depth > 3 {
 			return exprResult{}, errors.New("array nesting deeper than 3 levels is not supported")
@@ -10504,7 +10504,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		sd := l.result.Structs[fi.StructType]
 		r.elemSize = 1
 		r.elemCount = sd.Size
-	case fi.ElemSize > 0 && fi.ElemCount == 0 && !(fi.IsPointer && fi.StructType != ""):
+	case fi.ElemSize > 0 && fi.ElemCount == 0 && (!fi.IsPointer || fi.StructType == ""):
 		// Slice field: lenCell/capCell are at base+offset+1, +2.
 		r.lenCell = cell + 1
 		r.capCell = cell + 2
