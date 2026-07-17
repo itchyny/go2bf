@@ -39,9 +39,14 @@ type Lowerer struct {
 	// Loop break/continue context.
 	loopSkipFlag  Cell // 1 after break or continue (skip remaining body stmts)
 	loopBreakFlag Cell // 1 after break (skip post/condition, exit loop)
-	loopDepth     int  // nesting depth of for/range loops
-	loopFrames    []loopFrame
-	pendingLabel  string // label captured from *ast.LabeledStmt, consumed by next for/range
+	// Switch break context. Non-zero while lowering a switch whose cases
+	// contain a `break` that targets the switch; set to 1 to skip the rest
+	// of the current case. Loops mask this to 0 so an unlabeled `break`
+	// resolves to the innermost for/switch, matching Go.
+	switchSkipFlag Cell
+	loopDepth      int // nesting depth of for/range loops
+	loopFrames     []loopFrame
+	pendingLabel   string // label captured from *ast.LabeledStmt, consumed by next for/range
 
 	// Goto dispatch context.
 	gotoLabels map[string]int // label name -> segment index, non-nil while lowering a goto-using function
@@ -2866,7 +2871,7 @@ func arrayTypeSizePart(expr ast.Expr, consts map[string]byte) int {
 
 func (l *Lowerer) lowerStmts(stmts []ast.Stmt) error {
 	for i := 0; i < len(stmts); i++ {
-		guarded := i > 0 && (l.returnFlag != 0 || l.loopSkipFlag != 0)
+		guarded := i > 0 && (l.returnFlag != 0 || l.loopSkipFlag != 0 || l.switchSkipFlag != 0)
 		// Fuse adjacent div/mod assignments: q := x/y; r := x%y -> IRDivMod.
 		if i+1 < len(stmts) {
 			mark := len(l.nodes)
@@ -3024,15 +3029,25 @@ func (l *Lowerer) lookupOrDefineVar(id *ast.Ident, tok token.Token) (Cell, error
 // nor loopSkipFlag is set, and 0 otherwise. Caller must free the cell.
 func (l *Lowerer) emitSkipGuard() Cell {
 	guard := l.allocCell()
-	if l.loopSkipFlag != 0 && l.returnFlag != 0 {
+	var flags []Cell
+	for _, f := range []Cell{l.returnFlag, l.loopSkipFlag, l.switchSkipFlag} {
+		if f != 0 {
+			flags = append(flags, f)
+		}
+	}
+	switch len(flags) {
+	case 0:
+		l.emit(&IRConst{Dst: guard, Value: 1})
+	case 1:
+		l.emit(&IRNot{Dst: guard, Src: flags[0]})
+	default:
 		temp := l.allocCell()
-		l.emit(&IRAdd{Dst: temp, Src1: l.returnFlag, Src2: l.loopSkipFlag})
+		l.emit(&IRAdd{Dst: temp, Src1: flags[0], Src2: flags[1]})
+		for _, f := range flags[2:] {
+			l.emit(&IRAdd{Dst: temp, Src1: temp, Src2: f})
+		}
 		l.emit(&IRNot{Dst: guard, Src: temp})
 		l.freeCell(temp)
-	} else if l.loopSkipFlag != 0 {
-		l.emit(&IRNot{Dst: guard, Src: l.loopSkipFlag})
-	} else {
-		l.emit(&IRNot{Dst: guard, Src: l.returnFlag})
 	}
 	return guard
 }
@@ -5661,10 +5676,54 @@ func (l *Lowerer) lowerSwitch(s *ast.SwitchStmt) error {
 	}
 
 	ifStmt := l.buildSwitchIf(s.Body.List, tagName)
-	if ifStmt != nil {
+	if ifStmt == nil {
+		return nil
+	}
+	// A `break` inside a case targets the switch: skip the rest of that
+	// case. Only wire up the flag when a case actually breaks, so the
+	// common break-free switch lowers exactly as a plain if-else chain.
+	if !switchHasOwnBreak(s.Body.List) {
 		return l.lowerIf(ifStmt)
 	}
-	return nil
+	outerSwitchSkip := l.switchSkipFlag
+	l.switchSkipFlag = l.allocCell()
+	l.emit(&IRZero{Dst: l.switchSkipFlag})
+	err := l.lowerIf(ifStmt)
+	l.freeCell(l.switchSkipFlag)
+	l.switchSkipFlag = outerSwitchSkip
+	return err
+}
+
+// switchHasOwnBreak reports whether any case body contains an unlabeled
+// `break` that targets the switch itself -- i.e. one not nested inside
+// another loop, switch, or function literal (which would capture it).
+func switchHasOwnBreak(clauses []ast.Stmt) bool {
+	found := false
+	visit := func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		switch x := n.(type) {
+		case *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt, *ast.TypeSwitchStmt,
+			*ast.SelectStmt, *ast.FuncLit:
+			return false // nested breakable: its own break does not target us
+		case *ast.BranchStmt:
+			if x.Tok == token.BREAK && x.Label == nil {
+				found = true
+			}
+		}
+		return true
+	}
+	for _, clause := range clauses {
+		cc, ok := clause.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+		for _, stmt := range cc.Body {
+			ast.Inspect(stmt, visit)
+		}
+	}
+	return found
 }
 
 // buildSwitchIf converts case clauses into a nested *ast.IfStmt chain.
@@ -5790,6 +5849,11 @@ func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 	// Set up break/continue flags for this loop.
 	outerSkip := l.loopSkipFlag
 	outerBreak := l.loopBreakFlag
+	// Mask any enclosing switch's break flag: inside this loop an unlabeled
+	// `break` targets the loop, and its body must not be guarded by the
+	// switch flag.
+	outerSwitchSkip := l.switchSkipFlag
+	l.switchSkipFlag = 0
 	l.loopSkipFlag = l.allocCell()
 	l.loopBreakFlag = l.allocCell()
 	label := l.pendingLabel
@@ -5864,6 +5928,7 @@ func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 	l.freeCell(l.loopSkipFlag)
 	l.loopSkipFlag = outerSkip
 	l.loopBreakFlag = outerBreak
+	l.switchSkipFlag = outerSwitchSkip
 	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
 	l.freeCell(condCell)
 	return nil
@@ -6023,6 +6088,11 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 
 	outerSkip := l.loopSkipFlag
 	outerBreak := l.loopBreakFlag
+	// Mask any enclosing switch's break flag: inside this loop an unlabeled
+	// `break` targets the loop, and its body must not be guarded by the
+	// switch flag.
+	outerSwitchSkip := l.switchSkipFlag
+	l.switchSkipFlag = 0
 	l.loopSkipFlag = l.allocCell()
 	l.loopBreakFlag = l.allocCell()
 	label := l.pendingLabel
@@ -6136,6 +6206,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.freeCell(l.loopSkipFlag)
 	l.loopSkipFlag = outerSkip
 	l.loopBreakFlag = outerBreak
+	l.switchSkipFlag = outerSwitchSkip
 	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
 	l.freeCell(condCell)
 	if limit.temp {
@@ -6160,6 +6231,13 @@ func (l *Lowerer) lowerBranch(s *ast.BranchStmt) error {
 	case token.BREAK:
 		if s.Label != nil {
 			return l.emitLabeledBranch(s.Label.Name, true)
+		}
+		// An unlabeled break targets the innermost for/switch. Loops mask
+		// switchSkipFlag to 0, so a non-zero flag here means the switch is
+		// the innermost breakable: skip the rest of the current case.
+		if l.switchSkipFlag != 0 {
+			l.emit(&IRConst{Dst: l.switchSkipFlag, Value: 1})
+			return nil
 		}
 		if l.loopSkipFlag == 0 {
 			return errors.New("break outside loop")

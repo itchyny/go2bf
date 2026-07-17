@@ -354,7 +354,8 @@ The generated Brainfuck uses a CPU-like execution model:
 - `for` loops with `break` and `continue`, including labeled
   `break` and `continue` to escape or resume an outer loop
 - `switch` statement on `byte`, `uintN` values (including
-  multiple values per case, `default`, and `fallthrough`)
+  multiple values per case, `default`, `fallthrough`, and
+  `break` to exit a case early)
 
 ### Functions
 

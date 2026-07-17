@@ -953,6 +953,60 @@ func main() {
 }`,
 			"", "two\n3\n",
 		},
+		{
+			"break in switch inside loop breaks only the switch",
+			`package main
+func main() {
+	for i := byte(0); i < 6; i++ {
+		switch i {
+		case 2:
+			break
+		case 4:
+			print("four")
+		default:
+			print(i)
+		}
+		print(" ")
+	}
+	println()
+}`,
+			"", "0 1  3 four 5 \n",
+		},
+		{
+			"break in switch outside any loop",
+			`package main
+func main() {
+	i := byte(2)
+	switch i {
+	case 2:
+		print("hit")
+		break
+		print("no")
+	}
+	print("done")
+	println()
+}`,
+			"", "hitdone\n",
+		},
+		{
+			"break in loop nested inside switch case",
+			`package main
+func main() {
+	switch x := byte(1); x {
+	case 1:
+		print(0)
+		for j := byte(0); j < 5; j++ {
+			if j == 2 {
+				break
+			}
+			print(byte(1))
+		}
+		print(2)
+	}
+	println()
+}`,
+			"", "0112\n",
+		},
 		// --- Goto ---
 		{
 			"backward goto",
