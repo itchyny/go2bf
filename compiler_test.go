@@ -7725,6 +7725,22 @@ func main() {
 			"", "3\n5\n",
 		},
 		{
+			"copy from string",
+			`package main
+func main() {
+	d := make([]byte, 5)
+	n := copy(d, "hello")
+	println(n, string(d))
+	e := make([]byte, 3)
+	println(copy(e, "world"), string(e))
+	s := "ab"
+	f := make([]byte, 4)
+	copy(f, s+"cd")
+	println(string(f))
+}`,
+			"", "5 hello\n3 wor\nabcd\n",
+		},
+		{
 			"clear builtin",
 			`package main
 func main() {
@@ -7767,6 +7783,19 @@ func main() {
 	println(len(a))
 }`,
 			"", "1 2 3 4 5 6 6\n",
+		},
+		{
+			"append string spread",
+			`package main
+func main() {
+	var b []byte
+	b = append(b, "abc"...)
+	b = append(b, "de"...)
+	s := "fg"
+	b = append(b, (s + "h")...)
+	println(string(b), len(b))
+}`,
+			"", "abcdefgh 8\n",
 		},
 		{
 			"append to make result",

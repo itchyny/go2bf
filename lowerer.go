@@ -1801,13 +1801,23 @@ func (l *Lowerer) lowerSliceAppend(si sliceInfo, valArg ast.Expr) error {
 // lowerSliceAppendSpread handles s = append(s, t...) by ensuring
 // capacity and copying elements from t to s.
 func (l *Lowerer) lowerSliceAppendSpread(si sliceInfo, srcExpr ast.Expr) error {
-	srcID, ok := srcExpr.(*ast.Ident)
-	if !ok {
-		return errors.New("append spread requires a slice identifier")
+	var src sliceInfo
+	found := false
+	if srcID, ok := srcExpr.(*ast.Ident); ok {
+		src, found = l.lookupSlice(srcID.Name)
 	}
-	src, ok := l.lookupSlice(srcID.Name)
-	if !ok {
-		return errors.New("append spread requires a slice argument")
+	srcTemp := false
+	if !found {
+		// String source: append([]byte, "abc"...) or append(b, s+t...).
+		// Valid only when appending to a byte slice.
+		if si.elemSize != 1 {
+			return errors.New("append spread requires a slice argument")
+		}
+		var err error
+		src, srcTemp, err = l.resolveStringSlice(srcExpr)
+		if err != nil {
+			return errors.New("append spread requires a slice argument")
+		}
 	}
 	es := si.elemSize
 	// Compute needed = len(dst) + len(src). If needed > cap, reallocate.
@@ -1848,6 +1858,10 @@ func (l *Lowerer) lowerSliceAppendSpread(si sliceInfo, srcExpr ast.Expr) error {
 	l.freeCell(dstBase)
 	// Update len.
 	l.emit(&IRAdd{Dst: si.len, Src1: si.len, Src2: src.len})
+	if srcTemp {
+		l.freeIfHeapTop(src)
+		l.freeSliceInfo(src)
+	}
 	return nil
 }
 
@@ -3776,6 +3790,30 @@ func (l *Lowerer) emitCopy(dst, src exprResult) Cell {
 	return n
 }
 
+// copySrc resolves the source operand of copy(dst, src). A byte/struct/uintN
+// slice is used directly; a string is accepted when dst holds bytes
+// (copy([]byte, string)). If tmp is non-nil, it is a freshly materialized
+// buffer the caller must reclaim after emitCopy.
+func (l *Lowerer) copySrc(expr ast.Expr, dstElemSize int) (exprResult, *sliceInfo, error) {
+	if src, err := l.lowerExpr(expr); err == nil && src.lenCell != 0 {
+		return src, nil, nil
+	}
+	if dstElemSize != 1 {
+		return exprResult{}, nil, errors.New("copy expects slice arguments")
+	}
+	si, temp, err := l.resolveStringSlice(expr)
+	if err != nil {
+		return exprResult{}, nil, errors.New("copy expects slice arguments")
+	}
+	src := exprResult{cell: si.ptr, lenCell: si.len, capCell: si.cap,
+		exprShape: exprShape{elemSize: 1, isPointer: true}}
+	if temp {
+		s := si
+		return src, &s, nil
+	}
+	return src, nil, nil
+}
+
 func (l *Lowerer) lowerCopy(args []ast.Expr) error {
 	if len(args) != 2 {
 		return errors.New("copy expects 2 arguments")
@@ -3784,12 +3822,15 @@ func (l *Lowerer) lowerCopy(args []ast.Expr) error {
 	if err != nil || dst.lenCell == 0 {
 		return errors.New("copy expects slice arguments")
 	}
-	src, err := l.lowerExpr(args[1])
-	if err != nil || src.lenCell == 0 {
-		return errors.New("copy expects slice arguments")
+	src, tmp, err := l.copySrc(args[1], dst.elemSize)
+	if err != nil {
+		return err
 	}
-	n := l.emitCopy(dst, src)
-	l.freeCell(n)
+	l.freeCell(l.emitCopy(dst, src))
+	if tmp != nil {
+		l.freeIfHeapTop(*tmp)
+		l.freeSliceInfo(*tmp)
+	}
 	return nil
 }
 
@@ -9948,11 +9989,15 @@ func (l *Lowerer) lowerCallExprWith(call *ast.CallExpr, lowerExpr func(ast.Expr)
 		if err != nil || dst.lenCell == 0 {
 			return exprResult{}, true, errors.New("copy expects slice arguments")
 		}
-		src, err := lowerExpr(call.Args[1])
-		if err != nil || src.lenCell == 0 {
-			return exprResult{}, true, errors.New("copy expects slice arguments")
+		src, tmp, err := l.copySrc(call.Args[1], dst.elemSize)
+		if err != nil {
+			return exprResult{}, true, err
 		}
 		n := l.emitCopy(dst, src)
+		if tmp != nil {
+			l.freeIfHeapTop(*tmp)
+			l.freeSliceInfo(*tmp)
+		}
 		return exprResult{cell: n, temp: true, exprShape: exprShape{intSize: 1}}, true, nil
 	case "min", "max":
 		if len(call.Args) < 2 {

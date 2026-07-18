@@ -425,8 +425,10 @@ The generated Brainfuck uses a CPU-like execution model:
 - Indexing: `s[i]`, `s[i].x` for struct slices
 - `len(s)`, `cap(s)`, `for _, v := range s`
 - `append(s, v)`, `append(s, a, b, c)`,
-  `append(s, t...)` with automatic reallocation
-- `copy(dst, src)`, `clear(s)`
+  `append(s, t...)` with automatic reallocation,
+  including a string source (`append(b, str...)`)
+- `copy(dst, src)`, `clear(s)`, including copying a
+  string into a byte slice (`copy(b, str)`)
 - Array slicing: `a[i:j]`, `a[i:]`, `a[:j]`, `a[i:j:k]`, `a[:]`
 - Reslicing: `s[i:j]`, `s[i:]`, `s[:j]`, `s[i:j:k]`
 - `s == nil`, `s != nil` comparison
@@ -487,8 +489,10 @@ The generated Brainfuck uses a CPU-like execution model:
 - `make([]T, n)`, `make([]T, n, cap)` -- slices of byte,
   struct, or array types
 - `append(s, v)`, `append(s, a, b, c)`,
-  `append(s, t...)` -- with automatic reallocation
-- `copy(dst, src)` -- copy slice elements
+  `append(s, t...)` -- with automatic reallocation;
+  `t` may be a string when `s` is a byte slice
+- `copy(dst, src)` -- copy slice elements; `src` may be
+  a string when `dst` is a byte slice
 - `clear(s)` -- zero all slice elements
 - `min(a, b, ...)`, `max(a, b, ...)` -- variadic
 
