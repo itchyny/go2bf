@@ -6810,6 +6810,19 @@ func main() {
 			"", "1\n2\n3\n",
 		},
 		{
+			"slice literal of struct variables does not alias",
+			`package main
+type P struct{ x, y byte }
+func main() {
+	a := P{1, 2}
+	b := P{3, 4}
+	s := []P{a, b}
+	c := P{9, 9}
+	println(a.x, a.y, b.x, b.y, c.x, c.y, s[0].x, s[1].y)
+}`,
+			"", "1 2 3 4 9 9 1 4\n",
+		},
+		{
 			"array slice composite literal",
 			`package main
 func main() {

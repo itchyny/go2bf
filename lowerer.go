@@ -1384,7 +1384,7 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 		} else if es > 1 || si.elemType != "" {
 			// Struct or multi-cell element: resolve struct/array literal,
 			// then write its cells via pointer. storeConsecutiveViaPtr frees idx.
-			base, size, err := l.resolveStructArg(elt)
+			base, size, temp, err := l.resolveStructArg(elt)
 			if err != nil {
 				return sliceInfo{}, err
 			}
@@ -1393,7 +1393,12 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 				srcs[j] = base + Cell(j) // #nosec G115
 			}
 			l.storeConsecutiveViaPtr(idx, srcs)
-			l.freeCellRange(base, size)
+			// Only reclaim freshly-allocated temps. When elt is a struct
+			// variable, base is its permanent storage; freeing it would
+			// alias the variable with the next allocation.
+			if temp {
+				l.freeCellRange(base, size)
+			}
 			continue
 		}
 		r, err := l.lowerExpr(elt)
@@ -1646,7 +1651,7 @@ func (l *Lowerer) lowerSliceAppend(si sliceInfo, valArg ast.Expr) error {
 	} else if si.elemType != "" || es > 1 && si.elemIntSize == 0 {
 		// Composite element (struct, including size-1 struct): resolve via
 		// resolveStructArg to handle composite literals.
-		base, size, err := l.resolveStructArg(valArg)
+		base, size, _, err := l.resolveStructArg(valArg)
 		if err != nil {
 			return err
 		}
@@ -6544,7 +6549,7 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 				return l.returnFinish()
 			}
 			// Struct/array composite literal.
-			base, size, err := l.resolveStructArg(result)
+			base, size, _, err := l.resolveStructArg(result)
 			if err != nil {
 				return err
 			}
@@ -6612,7 +6617,7 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 		if l.curFunc != nil && i < len(l.curFunc.ReturnTypes) {
 			ri := l.curFunc.ReturnTypes[i]
 			if ri.StructType != "" && !ri.IsPointer {
-				base, size, err := l.resolveStructArg(expr)
+				base, size, _, err := l.resolveStructArg(expr)
 				if err != nil {
 					return err
 				}
@@ -6632,7 +6637,7 @@ func (l *Lowerer) lowerReturn(s *ast.ReturnStmt) error {
 						continue
 					}
 				}
-				base, size, err := l.resolveStructArg(expr)
+				base, size, _, err := l.resolveStructArg(expr)
 				if err != nil {
 					return err
 				}
@@ -6900,9 +6905,12 @@ func (l *Lowerer) emitDeferred() {
 }
 
 // resolveStructArg evaluates a struct argument expression, returning
-// the base cell and size. Handles variables, indexed elements,
+// the base cell, size, and whether base is a fresh temp owned by the
+// caller. When temp is false, base is a live variable's permanent
+// storage: the caller MUST NOT free it (doing so aliases the variable
+// with the next allocation). Handles variables, indexed elements,
 // composite literals, and function calls.
-func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
+func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, bool, error) {
 	// Composite literal: must be handled before lowerExpr.
 	if comp, ok := expr.(*ast.CompositeLit); ok {
 		if def := l.structDef(comp.Type); def != nil {
@@ -6911,31 +6919,31 @@ func (l *Lowerer) resolveStructArg(expr ast.Expr) (Cell, int, error) {
 				l.emit(&IRZero{Dst: base + j})
 			}
 			if err := l.lowerStructValueTo(base, def, comp); err != nil {
-				return 0, 0, err
+				return 0, 0, false, err
 			}
-			return base, def.Size, nil
+			return base, def.Size, true, nil
 		}
 		if l.arraySize(comp) > 0 {
 			arr, err := l.lowerArrayExpr(comp)
 			if err != nil {
-				return 0, 0, err
+				return 0, 0, false, err
 			}
-			return arr.base, arr.size(), nil
+			return arr.base, arr.size(), true, nil
 		}
-		return 0, 0, errors.New("unsupported composite literal argument")
+		return 0, 0, false, errors.New("unsupported composite literal argument")
 	}
 	r, err := l.lowerExpr(expr)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	// Pointer-based composite: materialize into contiguous temp cells so the
 	// caller can read fields by offset without re-deref'ing through a
 	// possibly-borrowed source variable.
 	if r.isPointer && r.elemCount > 1 && !r.elemSlice {
 		base := l.materializePtrComposite(r.cell, r.temp, r.elemCount)
-		return base, r.elemCount, nil
+		return base, r.elemCount, true, nil
 	}
-	return r.cell, r.cellCount(), nil
+	return r.cell, r.cellCount(), r.temp, nil
 }
 
 // returnCellCount derives the total cell elemCount needed to hold a function's
