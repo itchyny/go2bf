@@ -6227,6 +6227,10 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		l.freeCell(rangeBase.capCell)
 	} else if rangeBase.temp && rangeBase.flatBase != 0 {
 		l.freeCell(rangeBase.cell)
+	} else if rangeBase.temp && rangeBase.elemCount > 0 {
+		// Temp array value (e.g. `range returnsArray()`): reclaim the whole
+		// contiguous block.
+		l.freeCellRange(rangeBase.cell, rangeBase.elemCount*rangeBase.elemSize)
 	}
 	return nil
 }
@@ -8859,6 +8863,7 @@ func (l *Lowerer) lowerSliceLexCompare(e *ast.BinaryExpr) (exprResult, bool, err
 	l.freeCell(eq)
 	l.freeCell(av)
 	l.freeCell(bv)
+	l.freeCell(notEq)
 	innerBody := &IRBlock{Nodes: l.nodes}
 	l.nodes = innerSaved
 	l.emit(&IRIf{Cond: nd, Then: innerBody})
@@ -8893,6 +8898,8 @@ func (l *Lowerer) lowerSliceLexCompare(e *ast.BinaryExpr) (exprResult, bool, err
 	l.freeCell(cnt)
 	l.freeCell(minLen)
 	l.freeCell(done)
+	l.freeCell(nd)
+	l.freeCell(tailNd)
 
 	return exprResult{cell: result, temp: true, exprShape: exprShape{intSize: 1}}, true, nil
 }
@@ -10321,6 +10328,9 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 				srcs[j] = val.cell + Cell(j) // #nosec G115
 			}
 			l.storeConsecutiveViaPtr(idx, srcs)
+			if val.temp {
+				l.freeCellRange(val.cell, val.size)
+			}
 			return nil
 		}
 		t := l.allocCell()
@@ -10486,6 +10496,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	var base Cell
 	var def *StructDef
 	baseIsPointer := false
+	baseTemp := false // true when base is a temp we may reclaim
 	switch x := e.X.(type) {
 	case *ast.Ident:
 		si, ok := l.lookupStruct(x.Name)
@@ -10520,6 +10531,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		}
 		base = inner.cell
 		baseIsPointer = inner.isPointer
+		baseTemp = inner.temp
 		def = l.result.Structs[inner.structType]
 	case *ast.IndexExpr:
 		inner, err := l.lowerExpr(x)
@@ -10560,6 +10572,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		}
 		base = inner.cell
 		baseIsPointer = inner.isPointer
+		baseTemp = inner.temp
 	default:
 		// Generic: evaluate e.X and resolve struct type.
 		inner, err := l.lowerExpr(e.X)
@@ -10571,6 +10584,7 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 		}
 		def = l.result.Structs[inner.structType]
 		base = inner.cell
+		baseTemp = inner.temp
 	}
 	fi, ok := def.Field[e.Sel.Name]
 	if !ok {
@@ -10578,6 +10592,10 @@ func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	}
 	if baseIsPointer {
 		idx := l.ptrOffset(base, fi.Offset)
+		// ptrOffset copied base into idx, so a temp base is now orphaned.
+		if baseTemp {
+			l.freeCell(base)
+		}
 		return l.loadFieldViaPtr(idx, fi), nil
 	}
 	cell := base + Cell(fi.Offset) // #nosec G115
