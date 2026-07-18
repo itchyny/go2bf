@@ -453,6 +453,14 @@ func (l *Lowerer) freeCellRange(base Cell, n int) {
 	}
 }
 
+func consecutiveCells(base Cell, n int) []Cell {
+	cells := make([]Cell, n)
+	for j := range n {
+		cells[j] = base + Cell(j) // #nosec G115
+	}
+	return cells
+}
+
 func (l *Lowerer) emit(node IRNode) {
 	l.nodes = append(l.nodes, node)
 }
@@ -1388,10 +1396,7 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 			if err != nil {
 				return sliceInfo{}, err
 			}
-			srcs := make([]Cell, size)
-			for j := range size {
-				srcs[j] = base + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(base, size)
 			l.storeConsecutiveViaPtr(idx, srcs)
 			// Only reclaim freshly-allocated temps. When elt is a struct
 			// variable, base is its permanent storage; freeing it would
@@ -1685,10 +1690,7 @@ func (l *Lowerer) lowerSliceAppend(si sliceInfo, valArg ast.Expr) error {
 			l.mulByConst(addr, si.len, es)
 			l.emit(&IRAdd{Dst: addr, Src1: si.ptr, Src2: addr})
 		}
-		srcs := make([]Cell, es)
-		for j := range es {
-			srcs[j] = valBase + Cell(j) // #nosec G115
-		}
+		srcs := consecutiveCells(valBase, es)
 		l.storeConsecutiveViaPtr(addr, srcs)
 	}
 
@@ -2523,10 +2525,7 @@ func (l *Lowerer) lowerStructValueTo(base Cell, def *StructDef, valExpr ast.Expr
 		// r.cell is the flat offset, not the value. Materialize into base.
 		if r.flatBase != 0 && def.Size > 1 {
 			flatArr := arrayInfo{base: r.flatBase, elemCount: r.elemCount * r.elemSize, elemSize: 1}
-			dsts := make([]Cell, def.Size)
-			for j := range def.Size {
-				dsts[j] = base + Cell(j) // #nosec G115
-			}
+			dsts := consecutiveCells(base, def.Size)
 			l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
 			if r.temp {
 				l.freeCell(r.cell)
@@ -2536,10 +2535,7 @@ func (l *Lowerer) lowerStructValueTo(base Cell, def *StructDef, valExpr ast.Expr
 		// Pointer-base composite (e.g. `s[i]` for []Struct slice element):
 		// r.cell holds a slot index; load each cell of the struct into base.
 		if r.isPointer && r.elemCount > 1 && def.Size > 1 {
-			dsts := make([]Cell, def.Size)
-			for j := range def.Size {
-				dsts[j] = base + Cell(j) // #nosec G115
-			}
+			dsts := consecutiveCells(base, def.Size)
 			idx := l.allocCell()
 			l.emit(&IRCopy{Dst: idx, Src: r.cell})
 			l.loadConsecutiveViaPtr(idx, dsts)
@@ -4255,10 +4251,7 @@ func (l *Lowerer) assignResult(dst, r exprResult) error {
 		totalSize := r.elemCount * r.elemSize
 		flatArr := arrayInfo{base: r.flatBase, elemCount: totalSize, elemSize: 1}
 		n := min(r.elemCount, dst.size)
-		dsts := make([]Cell, n)
-		for j := range n {
-			dsts[j] = dst.cell + Cell(j) // #nosec G115
-		}
+		dsts := consecutiveCells(dst.cell, n)
 		l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
 		if r.temp {
 			l.freeCell(r.cell)
@@ -4270,10 +4263,7 @@ func (l *Lowerer) assignResult(dst, r exprResult) error {
 	// corrupting the source variable when r is a borrowed *T ident.
 	if r.isPointer && r.elemCount > 1 && dst.size > 1 {
 		n := min(r.elemCount, dst.size)
-		dsts := make([]Cell, n)
-		for j := range n {
-			dsts[j] = dst.cell + Cell(j) // #nosec G115
-		}
+		dsts := consecutiveCells(dst.cell, n)
 		idx := l.allocCell()
 		l.emit(&IRCopy{Dst: idx, Src: r.cell})
 		l.loadConsecutiveViaPtr(idx, dsts)
@@ -4385,10 +4375,7 @@ func (l *Lowerer) lowerAssign(s *ast.AssignStmt) error {
 				totalSize := r.elemCount * r.elemSize
 				flatArr := arrayInfo{base: r.flatBase, elemCount: totalSize, elemSize: 1}
 				dst := l.allocCells(totalSize)
-				dsts := make([]Cell, totalSize)
-				for j := range totalSize {
-					dsts[j] = dst + Cell(j) // #nosec G115
-				}
+				dsts := consecutiveCells(dst, totalSize)
 				l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
 				if r.temp {
 					l.freeCell(r.cell)
@@ -4675,10 +4662,7 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 			if err != nil {
 				return err
 			}
-			srcs := make([]Cell, base.elemSize)
-			for j := range base.elemSize {
-				srcs[j] = valBase + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(valBase, base.elemSize)
 			l.storeConsecutiveViaPtr(addr, srcs)
 			l.freeCellRange(valBase, base.elemSize)
 			return nil
@@ -4699,10 +4683,7 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 		if err != nil {
 			return err
 		}
-		srcs := make([]Cell, base.elemSize)
-		for j := range base.elemSize {
-			srcs[j] = valBase + Cell(j) // #nosec G115
-		}
+		srcs := consecutiveCells(valBase, base.elemSize)
 		l.storeConsecutiveViaPtr(addr, srcs)
 		l.freeCellRange(valBase, base.elemSize)
 		return nil
@@ -4726,10 +4707,7 @@ func (l *Lowerer) lowerCompositeElemAssign(base exprResult, indexExpr ast.Expr, 
 		l.emit(&IRAdd{Dst: baseOffset.cell, Src1: baseOffset.cell, Src2: base.cell})
 	}
 	flatArr := flatArrayOf(ai)
-	srcs := make([]Cell, base.elemSize)
-	for j := range base.elemSize {
-		srcs[j] = valBase + Cell(j) // #nosec G115
-	}
+	srcs := consecutiveCells(valBase, base.elemSize)
 	l.storeConsecutiveViaIndex(flatArr, baseOffset.cell, srcs)
 	for j := range base.elemSize {
 		l.freeCell(valBase + Cell(j)) // #nosec G115
@@ -4854,10 +4832,7 @@ func (l *Lowerer) assignSliceStructField(si sliceInfo, indexExpr ast.Expr, def *
 	if val.intSize < n {
 		val = l.widenIntegerLiteral(val, n)
 	}
-	srcs := make([]Cell, n)
-	for j := range n {
-		srcs[j] = val.cell + Cell(j) // #nosec G115
-	}
+	srcs := consecutiveCells(val.cell, n)
 	l.storeConsecutiveViaPtr(addr, srcs)
 	if val.temp {
 		l.freeCellRange(val.cell, n)
@@ -4883,10 +4858,7 @@ func (l *Lowerer) materializeFlatComposite(r exprResult) (Cell, int) {
 	total := r.elemCount * r.elemSize
 	dst := l.allocCells(total)
 	flatArr := arrayInfo{base: r.flatBase, elemCount: total, elemSize: 1}
-	dsts := make([]Cell, total)
-	for j := range total {
-		dsts[j] = dst + Cell(j) // #nosec G115
-	}
+	dsts := consecutiveCells(dst, total)
 	l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
 	if r.temp {
 		l.freeCell(r.cell)
@@ -4958,10 +4930,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 		if val.intSize < intSize {
 			val = l.widenIntegerLiteral(val, intSize)
 		}
-		srcs := make([]Cell, intSize)
-		for j := range intSize {
-			srcs[j] = val.cell + Cell(j) // #nosec G115
-		}
+		srcs := consecutiveCells(val.cell, intSize)
 		l.storeConsecutiveViaPtr(slot, srcs)
 		if val.temp {
 			l.freeCellRange(val.cell, intSize)
@@ -4982,10 +4951,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 				l.freeCellRange(tmp, fieldDef.Size)
 				return err
 			}
-			srcs := make([]Cell, fieldDef.Size)
-			for j := range fieldDef.Size {
-				srcs[j] = tmp + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(tmp, fieldDef.Size)
 			l.storeAtFlatField(base, offset, srcs)
 			l.freeCellRange(tmp, fieldDef.Size)
 			return nil
@@ -5032,10 +4998,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 				l.freeCellRange(tmp, sh.size)
 				return err
 			}
-			srcs := make([]Cell, sh.size)
-			for j := range sh.size {
-				srcs[j] = tmp + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(tmp, sh.size)
 			l.storeAtFlatField(base, offset, srcs)
 			l.freeCellRange(tmp, sh.size)
 			return nil
@@ -5074,10 +5037,7 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 		// relative to base.flatBase. Convert to an absolute slot index
 		// and reuse the same ptr-based store helper as the pointer case.
 		if base.flatBase != 0 {
-			srcs := make([]Cell, intSize)
-			for j := range intSize {
-				srcs[j] = val.cell + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(val.cell, intSize)
 			l.storeAtFlatField(base, offset, srcs)
 			if val.temp {
 				l.freeCellRange(val.cell, intSize)
@@ -5254,10 +5214,7 @@ func (l *Lowerer) assignFieldFromCell(sel *ast.SelectorExpr, src Cell, size int)
 	}
 	def := l.result.Structs[base.structType]
 	offset := def.Field[sel.Sel.Name].Offset
-	srcs := make([]Cell, size)
-	for j := range size {
-		srcs[j] = src + Cell(j) // #nosec G115
-	}
+	srcs := consecutiveCells(src, size)
 	if base.isPointer {
 		l.storeConsecutiveViaPtr(l.ptrOffset(base.cell, offset), srcs)
 		return nil
@@ -5285,10 +5242,7 @@ func (l *Lowerer) lowerDerefAssignFromCell(ptrExpr ast.Expr, src Cell, size int)
 	if size > 1 {
 		idx := l.allocCell()
 		l.emit(&IRCopy{Dst: idx, Src: p.cell})
-		srcs := make([]Cell, size)
-		for j := range size {
-			srcs[j] = src + Cell(j) // #nosec G115
-		}
+		srcs := consecutiveCells(src, size)
 		l.storeConsecutiveViaPtr(idx, srcs)
 		if p.temp {
 			l.freeCell(p.cell)
@@ -7170,10 +7124,7 @@ func (l *Lowerer) inlineCall(info *FuncInfo, argExprs []ast.Expr) ([]Cell, error
 				flatArr := arrayInfo{base: r.flatBase, elemCount: totalSize, elemSize: 1}
 				n := r.elemCount
 				base := l.allocCells(n)
-				dsts := make([]Cell, n)
-				for j := range n {
-					dsts[j] = base + Cell(j) // #nosec G115
-				}
+				dsts := consecutiveCells(base, n)
 				l.loadConsecutiveViaIndex(flatArr, r.cell, dsts)
 				l.freeCell(r.cell)
 				r = exprResult{cell: base, temp: true, exprShape: exprShape{size: n}}
@@ -7647,10 +7598,7 @@ func (l *Lowerer) lowerDerefAssign(ptr, rhs ast.Expr) error {
 func (l *Lowerer) lowerDerefAssignInt(pCell Cell, ptrIntSize int, r exprResult) {
 	idx := l.allocCell()
 	l.emit(&IRCopy{Dst: idx, Src: pCell})
-	srcs := make([]Cell, ptrIntSize)
-	for j := range ptrIntSize {
-		srcs[j] = r.cell + Cell(j) // #nosec G115
-	}
+	srcs := consecutiveCells(r.cell, ptrIntSize)
 	l.storeConsecutiveViaPtr(idx, srcs)
 	if r.temp {
 		l.freeCellRange(r.cell, ptrIntSize)
@@ -7740,10 +7688,7 @@ func (l *Lowerer) loadConsecutiveViaPtr(idx Cell, dsts []Cell) {
 // or comparison helper.
 func (l *Lowerer) loadMultiByteIntViaPtr(idx Cell, n int) exprResult {
 	base := l.allocCells(n)
-	dsts := make([]Cell, n)
-	for j := range n {
-		dsts[j] = base + Cell(j) // #nosec G115
-	}
+	dsts := consecutiveCells(base, n)
 	l.loadConsecutiveViaPtr(idx, dsts)
 	return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}
 }
@@ -7756,10 +7701,7 @@ func (l *Lowerer) loadMultiByteIntViaPtr(idx Cell, n int) exprResult {
 // is freed too -- callers must not reference it afterwards.
 func (l *Lowerer) materializePtrComposite(srcCell Cell, srcTemp bool, n int) Cell {
 	base := l.allocCells(n)
-	dsts := make([]Cell, n)
-	for j := range n {
-		dsts[j] = base + Cell(j) // #nosec G115
-	}
+	dsts := consecutiveCells(base, n)
 	idx := l.allocCell()
 	l.emit(&IRCopy{Dst: idx, Src: srcCell})
 	l.loadConsecutiveViaPtr(idx, dsts)
@@ -7820,10 +7762,7 @@ func (l *Lowerer) readMultiByteIntFromFlat(arrayBase, startOff Cell,
 		return exprResult{}, err
 	}
 	dst := l.allocCells(n)
-	dsts := make([]Cell, n)
-	for j := range n {
-		dsts[j] = dst + Cell(j) // #nosec G115
-	}
+	dsts := consecutiveCells(dst, n)
 	l.loadConsecutiveViaIndex(flatArr, flatIdx, dsts)
 	l.freeCell(flatIdx)
 	return exprResult{cell: dst, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
@@ -7843,10 +7782,7 @@ func (l *Lowerer) writeMultiByteIntToFlat(arrayBase, startOff Cell,
 	if n == 0 {
 		n = val.cellCount()
 	}
-	srcs := make([]Cell, n)
-	for j := range n {
-		srcs[j] = val.cell + Cell(j) // #nosec G115
-	}
+	srcs := consecutiveCells(val.cell, n)
 	l.storeConsecutiveViaIndex(flatArr, flatIdx, srcs)
 	l.freeCell(flatIdx)
 	if val.temp {
@@ -10359,19 +10295,13 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 			// handles the borrowed-source idx-copy and frees val.cell if
 			// temp; storeConsecutiveViaPtr frees idx.
 			buf := l.materializePtrComposite(val.cell, val.temp, val.elemCount)
-			srcs := make([]Cell, val.elemCount)
-			for j := range val.elemCount {
-				srcs[j] = buf + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(buf, val.elemCount)
 			l.storeConsecutiveViaPtr(idx, srcs)
 			l.freeCellRange(buf, val.elemCount)
 			return nil
 		}
 		if val.size > 1 {
-			srcs := make([]Cell, val.size)
-			for j := range val.size {
-				srcs[j] = val.cell + Cell(j) // #nosec G115
-			}
+			srcs := consecutiveCells(val.cell, val.size)
 			l.storeConsecutiveViaPtr(idx, srcs)
 			if val.temp {
 				l.freeCellRange(val.cell, val.size)
@@ -10472,10 +10402,7 @@ func (l *Lowerer) storeCompositeAtIndex(flatArr arrayInfo, outer Cell, indexExpr
 		l.emit(&IRAdd{Dst: flatIdx, Src1: flatIdx, Src2: outer})
 		l.freeCell(outer)
 	}
-	srcs := make([]Cell, val.size)
-	for j := range val.size {
-		srcs[j] = val.cell + Cell(j) // #nosec G115
-	}
+	srcs := consecutiveCells(val.cell, val.size)
 	l.storeConsecutiveViaIndex(flatArr, flatIdx, srcs)
 	l.freeCell(flatIdx)
 	if val.temp {
@@ -10702,10 +10629,7 @@ func (l *Lowerer) lowerFlatField(inner exprResult, fieldName string) (exprResult
 	flatArr := arrayInfo{base: inner.flatBase, elemCount: totalSize, elemSize: 1}
 	if n := fi.IntSize; n > 1 {
 		base := l.allocCells(n)
-		dsts := make([]Cell, n)
-		for j := range n {
-			dsts[j] = base + Cell(j) // #nosec G115
-		}
+		dsts := consecutiveCells(base, n)
 		l.loadConsecutiveViaIndex(flatArr, inner.cell, dsts)
 		l.freeCell(inner.cell)
 		return exprResult{cell: base, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
