@@ -5828,6 +5828,74 @@ func stripFallthrough(stmts []ast.Stmt) []ast.Stmt {
 	return stmts[:len(stmts)-1]
 }
 
+// loopFrameState holds the enclosing loop/switch break context and node
+// stream that pushLoopFrame saved, so popLoopFrame can restore them.
+type loopFrameState struct {
+	outerSkip, outerBreak, outerSwitchSkip Cell
+	savedNodes                             []IRNode
+}
+
+// pushLoopFrame allocates this loop's skip/break flags, pushes a loopFrame
+// (for labeled break/continue), masks any enclosing switch's break flag, and
+// begins capturing the loop body into a fresh node stream with the flags
+// reset at the start of each iteration. Shared by lowerFor and lowerRange.
+func (l *Lowerer) pushLoopFrame() loopFrameState {
+	st := loopFrameState{
+		outerSkip:       l.loopSkipFlag,
+		outerBreak:      l.loopBreakFlag,
+		outerSwitchSkip: l.switchSkipFlag,
+	}
+	// Mask any enclosing switch's break flag: inside this loop an unlabeled
+	// `break` targets the loop, and its body must not be guarded by the
+	// switch flag.
+	l.switchSkipFlag = 0
+	l.loopSkipFlag = l.allocCell()
+	l.loopBreakFlag = l.allocCell()
+	label := l.pendingLabel
+	l.pendingLabel = ""
+	l.loopFrames = append(l.loopFrames, loopFrame{
+		label: label, skipFlag: l.loopSkipFlag, breakFlag: l.loopBreakFlag,
+	})
+	st.savedNodes = l.nodes
+	l.nodes = nil
+	// Reset flags at the start of each iteration.
+	l.emit(&IRZero{Dst: l.loopSkipFlag})
+	l.emit(&IRZero{Dst: l.loopBreakFlag})
+	l.loopDepth++
+	return st
+}
+
+// emitLoopExitGuards zeroes condCell (ending the loop) when the break or
+// return flag is set, so a break or return stops further iterations.
+func (l *Lowerer) emitLoopExitGuards(condCell Cell) {
+	l.emit(&IRIf{
+		Cond: l.loopBreakFlag,
+		Then: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
+	})
+	if l.inFunc && l.returnFlag != 0 {
+		l.emit(&IRIf{
+			Cond: l.returnFlag,
+			Then: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
+		})
+	}
+}
+
+// popLoopFrame closes the captured body into an IRLoop over condCell, then
+// frees the loop flags and condCell and restores the context pushLoopFrame
+// saved.
+func (l *Lowerer) popLoopFrame(st loopFrameState, condCell Cell) {
+	body := &IRBlock{Nodes: l.nodes}
+	l.nodes = st.savedNodes
+	l.emit(&IRLoop{Cond: condCell, Body: body})
+	l.freeCell(l.loopBreakFlag)
+	l.freeCell(l.loopSkipFlag)
+	l.loopSkipFlag = st.outerSkip
+	l.loopBreakFlag = st.outerBreak
+	l.switchSkipFlag = st.outerSwitchSkip
+	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
+	l.freeCell(condCell)
+}
+
 func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 	l.pushScope()
 	defer l.popScope()
@@ -5846,29 +5914,7 @@ func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 		l.emit(&IRConst{Dst: condCell, Value: 1})
 	}
 
-	// Set up break/continue flags for this loop.
-	outerSkip := l.loopSkipFlag
-	outerBreak := l.loopBreakFlag
-	// Mask any enclosing switch's break flag: inside this loop an unlabeled
-	// `break` targets the loop, and its body must not be guarded by the
-	// switch flag.
-	outerSwitchSkip := l.switchSkipFlag
-	l.switchSkipFlag = 0
-	l.loopSkipFlag = l.allocCell()
-	l.loopBreakFlag = l.allocCell()
-	label := l.pendingLabel
-	l.pendingLabel = ""
-	l.loopFrames = append(l.loopFrames, loopFrame{
-		label: label, skipFlag: l.loopSkipFlag, breakFlag: l.loopBreakFlag,
-	})
-
-	saved := l.nodes
-	l.nodes = nil
-
-	// Reset flags at start of each iteration.
-	l.emit(&IRZero{Dst: l.loopSkipFlag})
-	l.emit(&IRZero{Dst: l.loopBreakFlag})
-	l.loopDepth++
+	st := l.pushLoopFrame()
 
 	// Body statements (guarded by skipFlag).
 	l.pushScope()
@@ -5905,32 +5951,8 @@ func (l *Lowerer) lowerFor(s *ast.ForStmt) error {
 	l.emit(&IRIf{Cond: breakGuard, Then: postCondBlock})
 	l.freeCell(breakGuard)
 
-	// If break or return, exit loop.
-	if l.loopBreakFlag != 0 {
-		l.emit(&IRIf{
-			Cond: l.loopBreakFlag,
-			Then: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
-		})
-	}
-	if l.inFunc && l.returnFlag != 0 {
-		l.emit(&IRIf{
-			Cond: l.returnFlag,
-			Then: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
-		})
-	}
-
-	body := &IRBlock{Nodes: l.nodes}
-	l.nodes = saved
-
-	l.emit(&IRLoop{Cond: condCell, Body: body})
-
-	l.freeCell(l.loopBreakFlag)
-	l.freeCell(l.loopSkipFlag)
-	l.loopSkipFlag = outerSkip
-	l.loopBreakFlag = outerBreak
-	l.switchSkipFlag = outerSwitchSkip
-	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
-	l.freeCell(condCell)
+	l.emitLoopExitGuards(condCell)
+	l.popLoopFrame(st, condCell)
 	return nil
 }
 
@@ -6086,27 +6108,7 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 		l.emit(&IRCmp{Op: CmpLt, Dst: condCell, Src1: cell, Src2: limit.cell})
 	}
 
-	outerSkip := l.loopSkipFlag
-	outerBreak := l.loopBreakFlag
-	// Mask any enclosing switch's break flag: inside this loop an unlabeled
-	// `break` targets the loop, and its body must not be guarded by the
-	// switch flag.
-	outerSwitchSkip := l.switchSkipFlag
-	l.switchSkipFlag = 0
-	l.loopSkipFlag = l.allocCell()
-	l.loopBreakFlag = l.allocCell()
-	label := l.pendingLabel
-	l.pendingLabel = ""
-	l.loopFrames = append(l.loopFrames, loopFrame{
-		label: label, skipFlag: l.loopSkipFlag, breakFlag: l.loopBreakFlag,
-	})
-
-	saved := l.nodes
-	l.nodes = nil
-
-	l.emit(&IRZero{Dst: l.loopSkipFlag})
-	l.emit(&IRZero{Dst: l.loopBreakFlag})
-	l.loopDepth++
+	st := l.pushLoopFrame()
 
 	// For range over array/slice: load v = x[i] at the start of each iteration.
 	if hasVal {
@@ -6185,30 +6187,8 @@ func (l *Lowerer) lowerRange(s *ast.RangeStmt) error {
 	l.emit(&IRIf{Cond: breakGuard, Then: postBlock})
 	l.freeCell(breakGuard)
 
-	// Exit on break or return.
-	l.emit(&IRIf{
-		Cond: l.loopBreakFlag,
-		Then: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
-	})
-	if l.inFunc && l.returnFlag != 0 {
-		l.emit(&IRIf{
-			Cond: l.returnFlag,
-			Then: &IRBlock{Nodes: []IRNode{&IRZero{Dst: condCell}}},
-		})
-	}
-
-	body := &IRBlock{Nodes: l.nodes}
-	l.nodes = saved
-
-	l.emit(&IRLoop{Cond: condCell, Body: body})
-
-	l.freeCell(l.loopBreakFlag)
-	l.freeCell(l.loopSkipFlag)
-	l.loopSkipFlag = outerSkip
-	l.loopBreakFlag = outerBreak
-	l.switchSkipFlag = outerSwitchSkip
-	l.loopFrames = l.loopFrames[:len(l.loopFrames)-1]
-	l.freeCell(condCell)
+	l.emitLoopExitGuards(condCell)
+	l.popLoopFrame(st, condCell)
 	if limit.temp {
 		l.freeCellRange(limit.cell, limit.intSize)
 	}
