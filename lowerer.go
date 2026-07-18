@@ -10394,6 +10394,12 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 		}
 		totalSize := base.elemCount * base.elemSize
 		flatArr := arrayInfo{base: base.flatBase, elemCount: totalSize, elemSize: 1}
+		// Composite element (struct / nested array) written by a multi-cell
+		// value (`grid[i][j] = structVar`): store all cells at the inner
+		// index, offset by the outer flat offset base.cell.
+		if base.elemSize > 1 && val.size > 1 {
+			return l.storeCompositeAtIndex(flatArr, base.cell, indexExpr, base.elemSize, val)
+		}
 		flatIdx, err := l.addFlatOffset(base.cell, indexExpr)
 		if err != nil {
 			return err
@@ -10421,29 +10427,11 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 	if base.elemIntSize > 1 {
 		return l.writeMultiByteIntToFlat(base.cell, 0, indexExpr, ai.size(), base.elemSize, val)
 	}
-	// Composite element (struct, nested array) with multi-cell val:
-	// scale index by elemSize and store each byte at base + idx*elemSize + j.
+	// Composite element (struct, nested array) with multi-cell val: store
+	// all cells at base + idx*elemSize (variable idx; const is handled above).
 	if base.elemSize > 1 && val.size > 1 {
-		indexR, err := l.lowerExpr(indexExpr)
-		if err != nil {
-			return err
-		}
-		flatIdx := l.allocCell()
-		l.mulByConst(flatIdx, indexR.cell, base.elemSize)
-		if indexR.temp {
-			l.freeCell(indexR.cell)
-		}
 		flatArr := arrayInfo{base: base.cell, elemCount: ai.size(), elemSize: 1}
-		srcs := make([]Cell, val.size)
-		for j := range val.size {
-			srcs[j] = val.cell + Cell(j) // #nosec G115
-		}
-		l.storeConsecutiveViaIndex(flatArr, flatIdx, srcs)
-		l.freeCell(flatIdx)
-		if val.temp {
-			l.freeCellRange(val.cell, val.size)
-		}
-		return nil
+		return l.storeCompositeAtIndex(flatArr, 0, indexExpr, base.elemSize, val)
 	}
 	indexResult, err := l.lowerExpr(indexExpr)
 	if err != nil {
@@ -10455,6 +10443,43 @@ func (l *Lowerer) writeInto(base exprResult, indexExpr ast.Expr, val exprResult)
 	}
 	if indexResult.temp {
 		l.freeCell(indexResult.cell)
+	}
+	return nil
+}
+
+// storeCompositeAtIndex writes the multi-cell value val into the flat byte
+// array flatArr at element indexExpr: the element offset (indexExpr*elemSize)
+// is added to outer (an existing flat offset temp, or 0 for none). Both outer
+// and a temp val are consumed. Shared by the flat-offset (`grid[i][j] = v`)
+// and plain (`arr[i] = v`) composite-element writes.
+func (l *Lowerer) storeCompositeAtIndex(flatArr arrayInfo, outer Cell, indexExpr ast.Expr, elemSize int, val exprResult) error {
+	var flatIdx Cell
+	if c, ok := l.constValue(indexExpr); ok {
+		flatIdx = l.allocCell()
+		l.emit(&IRConst{Dst: flatIdx, Value: byte(c * elemSize)}) // #nosec G115
+	} else {
+		idxR, err := l.lowerExpr(indexExpr)
+		if err != nil {
+			return err
+		}
+		flatIdx = l.allocCell()
+		l.mulByConst(flatIdx, idxR.cell, elemSize)
+		if idxR.temp {
+			l.freeCell(idxR.cell)
+		}
+	}
+	if outer != 0 {
+		l.emit(&IRAdd{Dst: flatIdx, Src1: flatIdx, Src2: outer})
+		l.freeCell(outer)
+	}
+	srcs := make([]Cell, val.size)
+	for j := range val.size {
+		srcs[j] = val.cell + Cell(j) // #nosec G115
+	}
+	l.storeConsecutiveViaIndex(flatArr, flatIdx, srcs)
+	l.freeCell(flatIdx)
+	if val.temp {
+		l.freeCellRange(val.cell, val.size)
 	}
 	return nil
 }

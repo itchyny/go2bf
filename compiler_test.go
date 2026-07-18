@@ -6044,6 +6044,25 @@ func main() {
 			"", "1 10\n2 11\n3 12\n",
 		},
 		{
+			"2D struct array variable index assign from struct value",
+			`package main
+type P struct{ x, y byte }
+type Q struct{ a, b uint16 }
+func main() {
+	var g [3][3]P
+	s := P{5, 9}
+	var i, j byte = 2, 1
+	g[i][j] = s
+	g[i][0] = g[2][1]
+	println(g[2][1].x, g[2][1].y, g[2][0].x, g[2][0].y, g[0][0].x)
+	var h [2][2]Q
+	q := Q{500, 900}
+	h[i%2][0] = q
+	println(h[0][0].a, h[0][0].b)
+}`,
+			"", "5 9 5 9 0\n500 900\n",
+		},
+		{
 			"2d array of size-1 struct field write and read",
 			`package main
 type Cell struct { v byte }
