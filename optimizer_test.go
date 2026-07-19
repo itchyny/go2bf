@@ -20,10 +20,17 @@ func TestOptimize(t *testing.T) {
 		{"cancel long add", "+++---", ""},
 		{"cancel long move", ">><<", ""},
 
-		// Dead loop elimination: [-][ ... ] -> [-]
+		// Dead loop elimination: any `]` leaves the current cell 0, so a loop
+		// immediately after it is dead -- unless a pointer move or value
+		// change in between makes the cell nonzero.
 		{"clear dead loop", "[-][+++]", "[-]"},
 		{"clear dead nested loop", "[-][[+>]<-]", "[-]"},
 		{"clear no dead loop", "[-]+[+]", "[-]+[+]"},
+		{"any loop-end marks dead loop", "[+][>+<]", "[+]"},
+		{"dead loop after plain loop-end", "[>][-]", "[>]"},
+		{"loop-end then move keeps clear", "[>]<[-]", "[>]<[-]"},
+		{"chained dead loops", "[-][+][>]", "[-]"},
+		{"dead loop comment gap", "[-]# note\n[+++]", "[-]"},
 
 		// Comments preserved (block merging across comments).
 		{"preserve comment", "++# comment\n++", "++# comment\n++"},
@@ -43,17 +50,6 @@ func TestOptimize(t *testing.T) {
 
 		// Complex: different kinds don't merge.
 		{"different kinds", ">>>+++<<<---", ">>>+++<<<---"},
-
-		// [+] wraps to clear but dead-loop detection only matches [-].
-		{"clear plus no dead loop", "[+][>+<]", "[+][>+<]"},
-
-		// Multiple dead loops chained: [-][ eliminates second loop,
-		// then the result [-] triggers another elimination.
-		{"chained dead loops", "[-][+][>]", "[-]"},
-
-		// Dead loop with comment between clear and open bracket.
-		// The comment is consumed as part of the dead loop body.
-		{"dead loop comment gap", "[-]# note\n[+++]", "[-]"},
 
 		// Highway round-trip elimination:
 		// [<<<]<<<<<<<<[<<<<<<<<]>>>>>>>>[>>>>>>>>] -> [<<<]

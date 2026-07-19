@@ -64,19 +64,16 @@ func mergeTokens(tokens []tok) []tok {
 	return merged
 }
 
-// eliminateDeadLoops removes loops after [-] (cell is known to be 0).
+// eliminateDeadLoops removes loops whose current cell is known to be 0, so
+// the loop body never runs. A cell is known 0 immediately after `]`.
 // Handles chained dead loops: [-][+][>] -> [-] in a single pass.
 func eliminateDeadLoops(tokens []tok) []tok {
 	result := tokens[:0]
 	for i := 0; i < len(tokens); i++ {
 		result = append(result, tokens[i])
-		// Detect [-][ pattern: clear followed by loop -> dead loop.
-		// Use a loop to handle chains: after removing one dead loop,
-		// [-] is still at the end of result so check again.
-		for len(result) >= 3 &&
-			result[len(result)-3].kind == '[' &&
-			result[len(result)-2].kind == 'v' && result[len(result)-2].val == -1 &&
-			result[len(result)-1].kind == ']' {
+		// After a `]` the current cell is 0, so a following loop is dead.
+		// Loop to handle chains: the `]` is still at the end of result.
+		for len(result) > 0 && result[len(result)-1].kind == ']' {
 			// Check if next non-comment token is '['.
 			j := i + 1
 			for j < len(tokens) && tokens[j].kind == 'c' {

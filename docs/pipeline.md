@@ -139,6 +139,7 @@ Peephole optimization on the raw Brainfuck string:
 
 - Merges consecutive identical operations, cancels adjacent `+-`
   and `><` pairs
-- Removes dead loops (`[-]` after another `[-]`, `[]` at start)
+- Removes dead loops: a loop immediately after `]` never runs, since
+  a `]` leaves its cell 0 (e.g. `][-]` -> `]`, `[-][+]` -> `[-]`)
 - Eliminates highway round-trips after guard scans
   (`[<<<]<<<<<<<<[<<<<<<<<]>>>>>>>>[>>>>>>>>]` -> `[<<<]`)
