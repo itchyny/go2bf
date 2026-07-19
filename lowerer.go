@@ -2760,6 +2760,28 @@ func arrayTypeSize(expr ast.Expr) int {
 	return max(arrayTypeSizePart(expr, nil), 0)
 }
 
+// byteArrayCells returns the total cell count of a (possibly nested) fixed
+// byte array type, or 0 if the innermost element is not a single byte. Used
+// to size `*[N][M]byte`-style pointer parameters, which are laid out flat and
+// whose binding cannot carry a wider inner-element width.
+func byteArrayCells(expr ast.Expr, consts map[string]byte) int {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		if intIdentSize(t.Name) == 1 {
+			return 1
+		}
+	case *ast.ArrayType:
+		if t.Len != nil {
+			if inner := byteArrayCells(t.Elt, consts); inner > 0 {
+				if n := arrayTypeSizePart(t, consts); n > 0 {
+					return n * inner
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func (l *Lowerer) arraySize(expr ast.Expr) int {
 	elemCount, elemSize, _, _, _, _, _ := l.arrayElementInfo(expr)
 	return elemCount * elemSize
@@ -10090,6 +10112,18 @@ func (l *Lowerer) indexInto(base exprResult, indexExpr ast.Expr) (exprResult, er
 			l.freeCell(idx)
 			return exprResult{cell: dst, temp: true, exprShape: exprShape{size: n, intSize: n}}, nil
 		}
+		// Nested array element ([N][M]T reached through a pointer): indexing
+		// yields an [M]T sub-array, so carry the inner element width forward.
+		if base.innerElemSize > 0 {
+			inner := base.innerElemSize
+			return exprResult{
+				cell: idx, temp: true,
+				exprShape: exprShape{
+					size: base.elemSize, elemSize: inner, elemCount: base.elemSize / inner,
+					elemType: base.elemType, elemIntSize: base.innerElemIntSize, isPointer: true,
+				},
+			}, nil
+		}
 		// Multi-byte struct element: return pointer to sub-array.
 		return exprResult{
 			cell: idx, temp: true,
@@ -10397,21 +10431,13 @@ func (l *Lowerer) storeCompositeAtIndex(flatArr arrayInfo, outer Cell, indexExpr
 // shaped according to the field's type. `idx` is consumed/freed.
 func (l *Lowerer) loadFieldViaPtr(idx Cell, fi FieldInfo) exprResult {
 	// Array field: return the pointer for indexing, with element shape so
-	// `pp.arr[i]` strides at the right width for uintN / struct elements.
+	// `pp.arr[i]` strides at the right width for uintN / struct elements and
+	// nested arrays (`pp.grid[i][j]` for a [N][M]T field). shapeOfField
+	// captures the inner element info the flat manual computation dropped.
 	if fi.ElemCount > 0 {
-		elemSize := 1
-		if fi.ElemIntSize > 1 {
-			elemSize = fi.ElemIntSize
-		} else if fi.ElemType != "" {
-			if sd, ok := l.result.Structs[fi.ElemType]; ok {
-				elemSize = sd.Size
-			}
-		}
-		return exprResult{
-			cell: idx, temp: true,
-			exprShape: exprShape{elemSize: elemSize, elemCount: fi.ElemCount,
-				elemType: fi.ElemType, elemIntSize: fi.ElemIntSize, isPointer: true},
-		}
+		sh := l.shapeOfField(fi)
+		sh.isPointer = true
+		return exprResult{cell: idx, temp: true, exprShape: sh}
 	}
 	// Pointer-typed struct field (`p *T`): load the slot index so further
 	// selectors traverse the pointee.

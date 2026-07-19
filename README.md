@@ -471,14 +471,15 @@ The generated Brainfuck uses a CPU-like execution model:
 - `ptr[i]` read/write, `ptr[i][j]` read/write for array pointers
 - `ptr[i].x` read/write for array-of-structs pointers
 - `ptr.data[i]` read/write for struct-with-array pointers,
-  including multi-byte (`pp.x[i] = uint16(...)`) and struct
-  (`pp.items[i].field`) element types
+  including multi-byte (`pp.x[i] = uint16(...)`), struct
+  (`pp.items[i].field`), and nested-array (`pp.grid[i][j]`
+  for a `[N][M]T` field) element types
 - Pointer-typed struct fields (`type Outer struct { p *Inner }`):
   `out.p.v` read/write follows the field's pointer to the target
 - `len(ptr)`, `len(*ptr)`, `cap(ptr)` for array pointers
 - `ptr == nil`, `ptr != nil` comparison
 - Typed pointer parameters: `func f(p *[N]byte)`,
-  `func f(p *Point)`, `func f(p *uintN)`
+  `func f(p *[N][M]byte)`, `func f(p *Point)`, `func f(p *uintN)`
 - Pass pointers to functions for by-reference semantics
 
 ### Built-in functions

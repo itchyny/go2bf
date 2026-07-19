@@ -11890,6 +11890,44 @@ func main() {
 			"", "1 6\n",
 		},
 		{
+			"pointer to 2d byte array parameter",
+			`package main
+func fill(m *[2][3]byte, base byte) {
+	for i := 0; i < 2; i++ {
+		for j := 0; j < 3; j++ {
+			m[i][j] = base + byte(i*3+j)
+		}
+	}
+}
+func main() {
+	var m [2][3]byte
+	fill(&m, 10)
+	println(m[0][0], m[1][2])
+}`,
+			"", "10 15\n",
+		},
+		{
+			"nested array fields via pointer receiver",
+			`package main
+type P struct{ x, y byte }
+type M struct{ b [2][3]byte; h [2][2]uint16; p [2][2]P }
+func (m *M) set() {
+	m.b[1][2] = 5
+	m.h[0][1] = 1000
+	m.p[1][0] = P{7, 8}
+}
+func (m *M) read() (byte, uint16, byte) {
+	return m.b[1][2], m.h[0][1], m.p[1][0].x
+}
+func main() {
+	var m M
+	m.set()
+	b, h, x := m.read()
+	println(b, h, x)
+}`,
+			"", "5 1000 7\n",
+		},
+		{
 			"pointer array of structs field read",
 			`package main
 type P struct { x byte; y byte }

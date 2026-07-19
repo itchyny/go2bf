@@ -661,6 +661,10 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 										elemSize = n
 										elemIntSize = n
 									}
+								} else if cells := byteArrayCells(at.Elt, result.ByteConsts); cells > 0 {
+									// Pointer to a nested byte array (*[N][M]byte):
+									// each outer element is an [M]byte sub-array.
+									elemSize = cells
 								}
 								pi.ElemCount = count
 								pi.ElemSize = elemSize
