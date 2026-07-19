@@ -8150,6 +8150,10 @@ func (l *Lowerer) lowerUnary(e *ast.UnaryExpr, lowerExpr func(ast.Expr) (exprRes
 	if err != nil {
 		return exprResult{}, err
 	}
+	// Unary plus is a no-op: +x == x, for any integer width.
+	if e.Op == token.ADD {
+		return operand, nil
+	}
 	// Multi-byte integer unary operations.
 	if operand.intSize > 1 {
 		return l.lowerUnaryInt(e.Op, operand)

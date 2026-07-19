@@ -1383,6 +1383,16 @@ func main() {
 }`,
 			"", "56",
 		},
+		{
+			"unary plus",
+			`package main
+func main() {
+	a := byte(3)
+	var b uint16 = 50000
+	println(+a, +a+byte(4), +b, +(b+1000))
+}`,
+			"", "3 7 50000 51000\n",
+		},
 		// --- Comparison operators ---
 		{
 			"comparison eq",
