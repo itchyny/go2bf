@@ -6498,6 +6498,19 @@ func main() {
 			"", "1 2 3 4 4\n",
 		},
 		{
+			"slice literal with index keys",
+			`package main
+func main() {
+	a := []byte{2: 5, 4: 9}
+	b := []byte{1, 5: 9, 3}
+	c := []uint16{0: 1000, 3: 2000}
+	println(len(a), a[0], a[2], a[4])
+	println(len(b), b[0], b[5], b[6])
+	println(len(c), c[0], c[3], c[1])
+}`,
+			"", "5 0 5 9\n7 1 9 3\n4 1000 2000 0\n",
+		},
+		{
 			"slice from array",
 			`package main
 func main() {

@@ -1319,7 +1319,27 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 	si.elemSlice = esl
 	si.elemPtrType = ept
 	si.elemIntSize = eis
-	n := len(comp.Elts)
+	// Length is the highest index reached + 1. For a plain literal (no keyed
+	// `index: value` elements) that is just len(Elts); a keyed element sets
+	// the running index, and any gaps stay 0 (IRFramePush zeroes the backing).
+	n := 0
+	elemIdx := 0
+	for _, elt := range comp.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			k, ok := l.constValue(kv.Key)
+			if !ok {
+				return sliceInfo{}, errors.New("slice literal index must be a constant")
+			}
+			elemIdx = k
+		}
+		if elemIdx+1 > n {
+			n = elemIdx + 1
+		}
+		elemIdx++
+	}
+	if n*si.elemSize > 255 {
+		return sliceInfo{}, fmt.Errorf("slice literal of %d cells exceeds the 255-slot ceiling", n*si.elemSize)
+	}
 	l.emit(&IRConst{Dst: si.len, Value: byte(n)}) // #nosec G115
 	l.emit(&IRConst{Dst: si.cap, Value: byte(n)}) // #nosec G115
 	l.emit(&IRCopy{Dst: si.ptr, Src: l.heapPtr})
@@ -1336,14 +1356,23 @@ func (l *Lowerer) evalSliceLiteral(comp *ast.CompositeLit) (sliceInfo, error) {
 	if at, ok := comp.Type.(*ast.ArrayType); ok {
 		elemTypeExpr = at.Elt
 	}
-	for i, elt := range comp.Elts {
+	elemIdx = 0
+	for _, elt := range comp.Elts {
+		// Keyed element `index: value`: place value at the constant index.
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			k, _ := l.constValue(kv.Key) // validated in the length pass above
+			elemIdx = k
+			elt = kv.Value
+		}
+		pos := elemIdx
+		elemIdx++
 		// Infer type for typeless inner composite literals.
 		if cl, ok := elt.(*ast.CompositeLit); ok && cl.Type == nil && elemTypeExpr != nil {
 			elt = &ast.CompositeLit{Type: elemTypeExpr, Elts: cl.Elts}
 		}
 		idx := l.allocCell()
 		l.emit(&IRCopy{Dst: idx, Src: si.ptr})
-		l.emit(&IRAddI{Dst: idx, Value: byte(i * es)}) // #nosec G115
+		l.emit(&IRAddI{Dst: idx, Value: byte(pos * es)}) // #nosec G115
 		if si.elemIntSize > 1 {
 			r, err := l.lowerExpr(elt)
 			if err != nil {

@@ -419,7 +419,7 @@ The generated Brainfuck uses a CPU-like execution model:
 
 - `[]byte`, `[]uintN`, `[]Point`, `[][N]byte`, `[][]byte`,
   `[]*byte`, `[]*Point`
-- Composite literals: `[]byte{1, 2, 3}`,
+- Composite literals: `[]byte{1, 2, 3}`, `[]byte{2: 5, 4: 9}`,
   `[]Point{Point{1, 2}, Point{3, 4}}`
 - `make([]byte, n)`, `make([]Point, n, cap)`
 - Indexing: `s[i]`, `s[i].x` for struct slices
