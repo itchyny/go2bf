@@ -47,8 +47,8 @@ last allocated one).
 
 The lowerer assigns each variable an abstract **cell** ID starting at
 `sentinelFwd + 1`. `slotOf(cell) = cell - (sentinelFwd + 1)` maps a
-cell back to its stack slot, and `stackValuePos(slot) = sentinelFwd
-+ 4 + 3 * slot` gives the slot's value-cell tape position.
+cell back to its stack slot, and `stackValuePos(slot) = sentinelFwd +
+4 + 3 * slot` gives the slot's value-cell tape position.
 
 Cells are allocated sequentially and freed when temporaries go out of
 scope. The allocator reuses freed cells (free list). For contiguous
