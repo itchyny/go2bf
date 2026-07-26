@@ -11,6 +11,8 @@ Compile Go to Brainfuck!
 <details>
 <summary>FizzBuzz</summary>
 
+Uses for loops, if-else chains, and modulo.
+
 ```go
 package main
 
@@ -58,6 +60,8 @@ Fizz
 <details>
 <summary>Recursive Fibonacci</summary>
 
+Uses recursion returning a byte.
+
 ```go
 package main
 
@@ -96,6 +100,8 @@ fib(10) = 55
 
 <details>
 <summary>Factorial numbers</summary>
+
+Uses recursion with 32-bit integers and type conversion.
 
 ```go
 package main
@@ -138,6 +144,8 @@ func main() {
 <details>
 <summary>Structs with methods</summary>
 
+Uses structs, value-receiver methods, and composite literals.
+
 ```go
 package main
 
@@ -171,6 +179,8 @@ func main() {
 
 <details>
 <summary>Roman numerals</summary>
+
+Uses a global array and string concatenation.
 
 ```go
 package main
@@ -223,6 +233,48 @@ func main() {
 444 = CDXLIV
 1999 = MCMXCIX
 3888 = MMMDCCCLXXXVIII
+```
+
+</details>
+
+<details>
+<summary>Prime numbers</summary>
+
+Uses a slice that grows with `append` and `range` over it.
+
+```go
+package main
+
+func main() {
+    var primes []byte
+    for n := byte(2); n < 100; n++ {
+        prime := byte(1)
+        for _, p := range primes {
+            if p*p > n {
+                break
+            }
+            if n%p == 0 {
+                prime = 0
+                break
+            }
+        }
+        if prime == 1 {
+            primes = append(primes, n)
+        }
+    }
+    for i, p := range primes {
+        if i > 0 {
+            print(" ")
+        }
+        print(p)
+    }
+    println()
+}
+```
+
+```text
+ $ go2bf run primes.go
+2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97
 ```
 
 </details>
