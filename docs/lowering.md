@@ -312,22 +312,50 @@ implements both directions:
   and `shift` has a `*Point` receiver): the receiver expression is
   wrapped in a synthetic `&ast.UnaryExpr{Op: AND, X: receiver}`
   before being prepended. `lowerAddressOf` then materializes the
-  address as a const slot index.
-- *Pointer caller, value method* (`pp.sum()` where `pp` is `*Point`
-  and `sum` has a value receiver): the implicit deref happens later,
-  in `inlineCall`'s arg-evaluation loop. When the lowered argument
-  is `isPointer && structType != "" && !elemSlice` and the parameter
-  is a value-typed struct, the loop reads each cell of the pointed
-  struct via `ptrLoad` into a fresh contiguous block and replaces
-  the arg with that materialized value. The traversal copies the
-  pointer cell into a temp before bumping it, so the source
-  variable's value is preserved across the call. Skipped entirely
-  when the parameter itself is a pointer, since the byte cell
-  holding the slot index is what the callee expects.
+  address as a slot index.
+- *Pointer caller, value method* (`pp.sum()` where `pp` is a pointer
+  variable or a pointer-typed field and `sum` has a value receiver):
+  the receiver is wrapped in a synthetic `&ast.StarExpr{X: receiver}`,
+  so `lowerDeref` reads the pointed-to struct into a fresh contiguous
+  value block before the call binds it to the value parameter. This
+  covers every receiver `isPointerReceiver` recognizes statically.
 
-`isPointerReceiver` checks `lookupPtrType` for the receiver ident
-to decide whether wrapping is needed; an already-pointer receiver
-passes through unchanged.
+There is also a runtime-shape fallback in `inlineCall`'s arg loop: when
+a lowered argument is `isPointer && elemCount >= 1 && structType != ""
+&& !elemSlice` and the parameter is a value-typed struct, it
+materializes the pointee's cells into a value with `materializePtrComposite`.
+This catches receivers that only turn out to be a pointer into a pointee
+at lowering time -- notably a value field reached *through* a pointer
+field (a promoted embedded method, `nd.mid.Base` where `mid` is a
+pointer field) -- which the static `&ast.StarExpr` wrap does not see.
+
+`isPointerReceiver` decides which direction applies: it reports true
+for a pointer variable (`lookupPtrType`), a pointer-typed struct field,
+or an element of a slice of pointers (`ps[i]` for `[]*T`), so
+`prependReceiver` adds `&` only for a genuine value and `*` only for a
+genuine pointer. The `*`-deref reads the full pointee: a pointer-typed
+field carries the pointee's cell count (`loadFieldViaPtr` and
+`shapeOfField` set `elemCount` to the struct's size), so `lowerDeref`
+copies every cell rather than a single byte -- necessary for structs
+with multi-byte fields.
+
+`&(x)` and `&*p` are folded in `lowerAddressOf` (`&*p` is just `p`), so
+an explicit deref receiver like `(*pp).set(...)` resolves without
+trying to take the address of a `ParenExpr`.
+
+**Address of a field through a pointer.** `&b.f1...fn` must yield the
+field's real slot -- not the slot of a temp that `lowerSelectorExpr`
+would load the field into -- whenever the chain passes through a
+pointer: either the base is a pointer-to-struct variable, or an
+intermediate field is a pointer. `lowerAddressOf` handles this via
+`lowerAddressOfFieldThroughPtr`, which keeps a running slot index,
+adds each field's offset, and dereferences (loads the pointee slot via
+`ptrLoad`) at a pointer field. A chain that stays entirely within value
+fields returns `ok=false` and falls through to the static path, keeping
+that code identical. This makes a pointer-receiver method reachable
+through such a chain (`p.mid.in.set(...)`, `nd.mid.add(...)` where
+`mid` is a pointer field) and lets `&nd.mid.y` be passed to a mutating
+function.
 
 ## Arrays
 

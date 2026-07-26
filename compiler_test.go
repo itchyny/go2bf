@@ -9085,6 +9085,23 @@ func main() {
 			"", "14\n13 13\n",
 		},
 		{
+			"struct embedding method promoted through pointer field",
+			`package main
+type Base struct { n uint16 }
+func (b *Base) add(v uint16) { b.n += v }
+func (b Base) get() uint16 { return b.n }
+type Mid struct { Base }
+type Node struct { mid *Mid; id byte }
+func main() {
+	m := Mid{}
+	nd := Node{mid: &m, id: 7}
+	nd.mid.add(1000)     // promoted pointer-receiver method through a pointer field
+	nd.mid.add(50000)
+	println(nd.mid.get(), nd.id)
+}`,
+			"", "51000 7\n",
+		},
+		{
 			"struct embedding method shadowed by outer",
 			`package main
 type Base struct { id byte }
@@ -11939,6 +11956,143 @@ func main() {
 	println(x.v)
 }`,
 			"", "12\n",
+		},
+		{
+			"value receiver method on pointer field auto-derefs",
+			`package main
+type N struct { v byte }
+func (n N) get() byte { return n.v }
+func (n *N) bump() { n.v++ }
+type W struct { p *N }
+func main() {
+	x := N{v: 7}
+	w := W{p: &x}
+	println(w.p.get())   // value receiver on a pointer field: deref
+	w.p.bump()
+	println(w.p.get(), x.v)
+}`,
+			"", "7\n8 8\n",
+		},
+		{
+			"value receiver method on pointer variable auto-derefs",
+			`package main
+type T struct { x byte }
+func (t T) get() byte { return t.x }
+func main() {
+	t := T{x: 5}
+	p := &t
+	println(p.get())
+}`,
+			"", "5\n",
+		},
+		{
+			"pointer receiver method on field through pointer variable",
+			`package main
+type In struct { v byte }
+func (i *In) set(n byte) { i.v = n }
+func (i In) get() byte { return i.v }
+type Mid struct { in In }
+type Out struct { mid Mid }
+func main() {
+	var o Out
+	p := &o
+	p.mid.in.set(42)     // ptr-receiver method on a value-field chain through a pointer
+	println(p.mid.in.get(), o.mid.in.v)
+}`,
+			"", "42 42\n",
+		},
+		{
+			"address of field through pointer variable",
+			`package main
+type In struct { v byte }
+type Out struct { a In; b In }
+func addto(p *byte, n byte) { *p += n }
+func main() {
+	var o Out
+	p := &o
+	addto(&p.a.v, 5)     // &field through a pointer, deep chain
+	addto(&p.b.v, 9)
+	println(o.a.v, o.b.v)
+}`,
+			"", "5 9\n",
+		},
+		{
+			"value receiver on multibyte pointer field derefs all cells",
+			`package main
+type Acc struct { total uint16 }
+func (a *Acc) add(v uint16) { a.total += v }
+func (a Acc) sum() uint16 { return a.total }
+type Wrap struct { acc *Acc }
+func main() {
+	a := Acc{}
+	w := Wrap{acc: &a}
+	w.acc.add(1000)
+	w.acc.add(50000)
+	q := *w.acc            // explicit deref of a multibyte pointer field
+	println(w.acc.sum(), q.total, a.total)
+}`,
+			"", "51000 51000 51000\n",
+		},
+		{
+			"deref receiver via parenthesized star",
+			`package main
+type T struct { x uint16 }
+func (t T) get() uint16 { return t.x }
+func (t *T) set(n uint16) { t.x = n }
+func main() {
+	t := T{x: 1}
+	pp := &t
+	(*pp).set(40000)       // &*pp collapses to pp for the pointer receiver
+	println((*pp).get(), t.x)
+}`,
+			"", "40000 40000\n",
+		},
+		{
+			"pointer receiver method on slice-of-pointers element",
+			`package main
+type Cnt struct { v byte }
+func (c *Cnt) inc() { c.v++ }
+func (c Cnt) get() byte { return c.v }
+func main() {
+	a := Cnt{v: 1}
+	b := Cnt{v: 2}
+	ps := []*Cnt{&a, &b}
+	ps[0].inc()
+	ps[1].inc()
+	ps[1].inc()
+	println(ps[0].get(), ps[1].get(), a.v, b.v)
+}`,
+			"", "2 4 2 4\n",
+		},
+		{
+			"address of value field reached through a pointer field",
+			`package main
+type Mid struct { x, y byte }
+type Node struct { mid *Mid }
+func addto(p *byte, n byte) { *p += n }
+func main() {
+	m := Mid{x: 1, y: 2}
+	nd := Node{mid: &m}
+	addto(&nd.mid.y, 40)   // deref a pointer field, then take a value field's address
+	println(m.x, m.y)
+}`,
+			"", "1 42\n",
+		},
+		{
+			"address of field through a pointer field of a slice element",
+			`package main
+type Leaf struct { v byte }
+type Item struct { leaf *Leaf; tag byte }
+func addto(p *byte, n byte) { *p += n }
+func main() {
+	l0 := Leaf{v: 1}
+	l1 := Leaf{v: 2}
+	items := []Item{{leaf: &l0}, {leaf: &l1}}
+	addto(&items[0].leaf.v, 40)   // slice index, then through a pointer field
+	addto(&items[1].leaf.v, 90)
+	println(l0.v, l1.v)
+}`,
+			"", "41 92\n",
 		},
 		{
 			"nested struct field via pointer",

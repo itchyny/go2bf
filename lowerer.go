@@ -2153,6 +2153,20 @@ func (l *Lowerer) shapeOf(expr ast.Expr, sc scope) exprShape {
 				return exprShape{intSize: n}
 			}
 		}
+		// *w.p -- deref a pointer-typed struct field.
+		if sel, ok := expr.X.(*ast.SelectorExpr); ok {
+			parentType := l.resolveExprTypeName(sel.X)
+			if def, ok := l.result.Structs[parentType]; ok {
+				if fi, ok := def.Field[sel.Sel.Name]; ok && fi.IsPointer {
+					if fi.StructType != "" {
+						return exprShape{structType: fi.StructType}
+					}
+					if fi.IntSize > 1 {
+						return exprShape{intSize: fi.IntSize}
+					}
+				}
+			}
+		}
 	case *ast.UnaryExpr:
 		// &x -- pointer to the operand's shape.
 		if expr.Op == token.AND {
@@ -2409,9 +2423,13 @@ func (l *Lowerer) shapeOfField(fi FieldInfo) exprShape {
 		}
 		sh.size = sh.elemCount * sh.elemSize
 	case fi.IsPointer && fi.StructType != "":
+		// A pointer field occupies one cell but carries the pointee's cell
+		// count as elemCount so a deref (`*w.p`) reads all its cells.
 		sh.size = 1
 		sh.isPointer = true
 		sh.structType = fi.StructType
+		sh.elemSize = 1
+		sh.elemCount = l.result.Structs[fi.StructType].Size
 	case fi.StructType != "":
 		sd := l.result.Structs[fi.StructType]
 		sh.size = sd.Size
@@ -3213,17 +3231,21 @@ func (l *Lowerer) lowerCallStmt(call *ast.CallExpr) error {
 	return nil
 }
 
-// prependReceiver returns args with the method receiver prepended. If the
-// method has a pointer receiver and the supplied expression is a value-typed
-// struct, the receiver is implicitly wrapped with `&` so the inlined body
-// sees a pointer (matching Go's auto-address-of semantics on method calls).
+// prependReceiver returns args with the method receiver prepended, matching
+// Go's automatic receiver adjustment: a pointer-receiver method called on a
+// value gets `&receiver`, and a value-receiver method called on a pointer
+// (a pointer variable or a pointer-typed field) gets `*receiver` so the
+// inlined body sees a value copy.
 func (l *Lowerer) prependReceiver(receiver ast.Expr, info *FuncInfo, args []ast.Expr) []ast.Expr {
 	if receiver == nil {
 		return args
 	}
-	if len(info.ParamTypes) > 0 && info.ParamTypes[0].IsPointer && info.ParamTypes[0].StructType != "" {
-		if !l.isPointerReceiver(receiver) {
+	if len(info.ParamTypes) > 0 && info.ParamTypes[0].StructType != "" {
+		switch pt := info.ParamTypes[0]; {
+		case pt.IsPointer && !l.isPointerReceiver(receiver):
 			receiver = &ast.UnaryExpr{Op: token.AND, X: receiver}
+		case !pt.IsPointer && l.isPointerReceiver(receiver):
+			receiver = &ast.StarExpr{X: receiver}
 		}
 	}
 	return append([]ast.Expr{receiver}, args...)
@@ -3256,6 +3278,14 @@ func (l *Lowerer) isPointerReceiver(receiver ast.Expr) bool {
 		parentType := l.resolveExprTypeName(x.X)
 		if def, ok := l.result.Structs[parentType]; ok {
 			if fi, ok := def.Field[x.Sel.Name]; ok && fi.IsPointer {
+				return true
+			}
+		}
+	case *ast.IndexExpr:
+		// `ps[i].method()` where ps is a slice of pointers (`[]*T`): the
+		// element is already a pointer, no &-wrapping needed.
+		if id, ok := x.X.(*ast.Ident); ok {
+			if si, ok := l.lookupSlice(id.Name); ok && si.elemPtrType != "" {
 				return true
 			}
 		}
@@ -5227,17 +5257,8 @@ func (l *Lowerer) assignStringHeader(lhs ast.Expr, src sliceInfo) error {
 // the rhs directly through the array via `lowerArrayAssign`. Returns the
 // outermost IndexExpr on a match, nil otherwise.
 func (l *Lowerer) peelSize1FieldChain(sel *ast.SelectorExpr) (*ast.IndexExpr, bool) {
-	fields := []string{sel.Sel.Name}
-	cur := sel.X
-	for {
-		inner, ok := cur.(*ast.SelectorExpr)
-		if !ok {
-			break
-		}
-		fields = append([]string{inner.Sel.Name}, fields...)
-		cur = inner.X
-	}
-	idx, ok := cur.(*ast.IndexExpr)
+	fields, base := collectFieldChain(sel)
+	idx, ok := base.(*ast.IndexExpr)
 	if !ok {
 		return nil, false
 	}
@@ -7963,6 +7984,12 @@ func (l *Lowerer) ptrDynIndex(ptr Cell, indexExpr ast.Expr, elemSize int) (Cell,
 // lowerAddressOf handles &x, &a[i], &p.x -- returns the stack slot index as a byte.
 func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 	switch e := expr.(type) {
+	case *ast.ParenExpr:
+		// &(x) is &x.
+		return l.lowerAddressOf(e.X)
+	case *ast.StarExpr:
+		// &*p is p (the pointer itself).
+		return l.lowerExpr(e.X)
 	case *ast.Ident:
 		var cell Cell
 		var ptrIntSize int
@@ -8077,6 +8104,15 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		} else if pe != e {
 			return l.lowerAddressOf(pe)
 		}
+		// &b.f1...fn where the chain passes through a pointer (a pointer base
+		// or a pointer field): compute the field's real slot at runtime, since
+		// lowerSelectorExpr would load it into a temp and slotOf would point at
+		// the temp instead.
+		if r, ok, err := l.lowerAddressOfFieldThroughPtr(e); err != nil {
+			return exprResult{}, err
+		} else if ok {
+			return r, nil
+		}
 		// &base[i].field on slice/struct-array bases: lowerSelectorExpr would
 		// load the field's value into a temp, so slotOf would point at the
 		// temp instead of the field's slot. Compute the slot at runtime.
@@ -8127,22 +8163,82 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 	}
 }
 
+// lowerAddressOfFieldThroughPtr returns the slot for &b.f1...fn when the chain
+// passes through a pointer at some point: either the base `b` is a
+// pointer-to-struct variable, or an intermediate field is a pointer. It keeps
+// a running slot index, adding each field's offset and dereferencing (loading
+// the pointee's slot) at a pointer field. Returns ok=false when the chain stays
+// entirely within value fields, so the caller falls through to the static path
+// (which keeps the generated code identical).
+func (l *Lowerer) lowerAddressOfFieldThroughPtr(e *ast.SelectorExpr) (exprResult, bool, error) {
+	fields, base := collectFieldChain(e)
+	id, ok := base.(*ast.Ident)
+	if !ok {
+		return exprResult{}, false, nil
+	}
+	// Seed the running address and current struct type from the base.
+	var addr Cell
+	var curType string
+	if def, ok := l.lookupPtrType(id.Name); ok {
+		ptrCell, err := l.lookupVar(id.Name)
+		if err != nil {
+			return exprResult{}, false, err
+		}
+		addr = l.allocCell()
+		l.emit(&IRCopy{Dst: addr, Src: ptrCell}) // pointee slot index
+		curType = def.Name
+	} else if si, ok := l.lookupStruct(id.Name); ok {
+		// Value struct base: only take over when a pointer field is crossed;
+		// otherwise the static &-path handles it with identical code.
+		if !l.chainCrossesPointer(si.def.Name, fields) {
+			return exprResult{}, false, nil
+		}
+		addr = l.allocCell()
+		l.emit(&IRConst{Dst: addr, Value: byte(slotOf(si.base))}) // #nosec G115
+		curType = si.def.Name
+	} else {
+		return exprResult{}, false, nil
+	}
+	addr, fi, err := l.walkFieldAddr(addr, curType, fields)
+	if err != nil {
+		return exprResult{}, false, err
+	}
+	r := exprResult{cell: addr, temp: true}
+	r.isPointer = true
+	r.structType = fi.StructType
+	if fi.IntSize > 1 {
+		r.intSize = fi.IntSize
+	}
+	return r, true, nil
+}
+
+// chainCrossesPointer reports whether walking the field chain from struct
+// typeName dereferences a pointer field before the final field.
+func (l *Lowerer) chainCrossesPointer(typeName string, fields []string) bool {
+	curType := typeName
+	for _, name := range fields[:len(fields)-1] {
+		def, ok := l.result.Structs[curType]
+		if !ok {
+			return false
+		}
+		fi, ok := def.Field[name]
+		if !ok {
+			return false
+		}
+		if fi.IsPointer && fi.StructType != "" {
+			return true
+		}
+		curType = fi.StructType
+	}
+	return false
+}
+
 // lowerAddressOfIndexedField returns the slot for &base[i].field when base
 // is a slice or array of structs. Returns ok=false when the pattern does
 // not apply; the caller should fall through to the static path.
 func (l *Lowerer) lowerAddressOfIndexedField(e *ast.SelectorExpr) (exprResult, bool, error) {
-	// Walk chained selectors to collect field names (`arr[i].a.b.c`).
-	fields := []string{e.Sel.Name}
-	cur := e.X
-	for {
-		inner, ok := cur.(*ast.SelectorExpr)
-		if !ok {
-			break
-		}
-		fields = append([]string{inner.Sel.Name}, fields...)
-		cur = inner.X
-	}
-	idx, ok := cur.(*ast.IndexExpr)
+	fields, base := collectFieldChain(e)
+	idx, ok := base.(*ast.IndexExpr)
 	if !ok {
 		return exprResult{}, false, nil
 	}
@@ -8150,23 +8246,16 @@ func (l *Lowerer) lowerAddressOfIndexedField(e *ast.SelectorExpr) (exprResult, b
 	if !ok {
 		return exprResult{}, false, nil
 	}
+	// Index the base to a slot index; then walk the field chain from there.
 	var addr Cell
-	var def *StructDef
+	var curType string
 	if si, ok := l.lookupSlice(id.Name); ok && si.elemType != "" {
-		d, ok := l.result.Structs[si.elemType]
-		if !ok {
-			return exprResult{}, false, nil
-		}
 		a, err := l.ptrDynIndex(si.ptr, idx.Index, si.elemSize)
 		if err != nil {
 			return exprResult{}, false, err
 		}
-		addr, def = a, d
+		addr, curType = a, si.elemType
 	} else if ai, ok := l.lookupArray(id.Name); ok && ai.elemType != "" {
-		d, ok := l.result.Structs[ai.elemType]
-		if !ok {
-			return exprResult{}, false, nil
-		}
 		baseCell := l.allocCell()
 		l.emit(&IRConst{Dst: baseCell, Value: byte(slotOf(ai.base))}) // #nosec G115
 		a, err := l.ptrDynIndex(baseCell, idx.Index, ai.elemSize)
@@ -8174,28 +8263,13 @@ func (l *Lowerer) lowerAddressOfIndexedField(e *ast.SelectorExpr) (exprResult, b
 		if err != nil {
 			return exprResult{}, false, err
 		}
-		addr, def = a, d
+		addr, curType = a, ai.elemType
 	} else {
 		return exprResult{}, false, nil
 	}
-	var fi FieldInfo
-	for i, name := range fields {
-		var ok bool
-		fi, ok = def.Field[name]
-		if !ok {
-			l.freeCell(addr)
-			return exprResult{}, false, fmt.Errorf("unknown field %s in struct %s", name, def.Name)
-		}
-		if fi.Offset > 0 {
-			l.emit(&IRAddI{Dst: addr, Value: byte(fi.Offset)}) // #nosec G115
-		}
-		if i < len(fields)-1 {
-			if fi.IsPointer || fi.StructType == "" {
-				l.freeCell(addr)
-				return exprResult{}, false, fmt.Errorf("cannot take address through non-struct field %s", name)
-			}
-			def = l.result.Structs[fi.StructType]
-		}
+	addr, fi, err := l.walkFieldAddr(addr, curType, fields)
+	if err != nil {
+		return exprResult{}, false, err
 	}
 	r := exprResult{cell: addr, temp: true}
 	if fi.IntSize > 0 {
@@ -8203,6 +8277,59 @@ func (l *Lowerer) lowerAddressOfIndexedField(e *ast.SelectorExpr) (exprResult, b
 		r.intSize = fi.IntSize
 	}
 	return r, true, nil
+}
+
+// collectFieldChain splits a chained selector into its field names, ordered
+// base to leaf, and the base expression the chain selects from. For `x.a.b.c`
+// it returns (["a", "b", "c"], x).
+func collectFieldChain(e *ast.SelectorExpr) (fields []string, base ast.Expr) {
+	fields = []string{e.Sel.Name}
+	base = e.X
+	for {
+		inner, ok := base.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		fields = append([]string{inner.Sel.Name}, fields...)
+		base = inner.X
+	}
+	return fields, base
+}
+
+// walkFieldAddr walks the field chain from a struct of type curType whose base
+// slot index is held in addr, adding each field's offset to addr and following
+// (loading through) any pointer field crossed along the way. It returns the
+// resulting address cell and the final field's info. addr is freed on error.
+func (l *Lowerer) walkFieldAddr(addr Cell, curType string, fields []string) (Cell, FieldInfo, error) {
+	var fi FieldInfo
+	for i, name := range fields {
+		def, ok := l.result.Structs[curType]
+		if !ok {
+			l.freeCell(addr)
+			return 0, FieldInfo{}, fmt.Errorf("undefined struct: %s", curType)
+		}
+		fi, ok = def.Field[name]
+		if !ok {
+			l.freeCell(addr)
+			return 0, FieldInfo{}, fmt.Errorf("unknown field %s in struct %s", name, def.Name)
+		}
+		if fi.Offset > 0 {
+			l.emit(&IRAddI{Dst: addr, Value: byte(fi.Offset)}) // #nosec G115
+		}
+		if i < len(fields)-1 {
+			if fi.StructType == "" {
+				l.freeCell(addr)
+				return 0, FieldInfo{}, fmt.Errorf("cannot take address through non-struct field %s", name)
+			}
+			if fi.IsPointer {
+				loaded := l.ptrLoad(addr) // follow the pointer to its pointee slot
+				l.freeCell(addr)
+				addr = loaded
+			}
+			curType = fi.StructType
+		}
+	}
+	return addr, fi, nil
 }
 
 // lowerDeref handles *p -- reads from the stack slot whose index is in p.
@@ -10528,13 +10655,17 @@ func (l *Lowerer) loadFieldViaPtr(idx Cell, fi FieldInfo) exprResult {
 		return exprResult{cell: idx, temp: true, exprShape: sh}
 	}
 	// Pointer-typed struct field (`p *T`): load the slot index so further
-	// selectors traverse the pointee.
+	// selectors (or a deref) traverse the pointee. elemCount carries the
+	// pointee's cell count so a deref reads all its cells.
 	if fi.IsPointer && fi.StructType != "" {
 		result := l.ptrLoad(idx)
 		l.freeCell(idx)
 		return exprResult{
 			cell: result, temp: true,
-			exprShape: exprShape{isPointer: true, structType: fi.StructType},
+			exprShape: exprShape{
+				isPointer: true, structType: fi.StructType,
+				elemSize: 1, elemCount: l.result.Structs[fi.StructType].Size,
+			},
 		}
 	}
 	// Nested struct field: hand back a pointer-to-struct view so the caller
