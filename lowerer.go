@@ -3027,6 +3027,13 @@ func (l *Lowerer) tryLowerDivModAssign(a, b ast.Stmt) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// Widen operands to a common width so multi-byte divmod reads full
+	// cells: a bare constant divisor (e.g. `c / 7`) lowers to a single
+	// byte, but emitDivModIntFused reads n cells from each operand.
+	if n := max(src1.intSize, src2.intSize); n > 1 {
+		src1 = l.widenIntegerLiteral(src1, n)
+		src2 = l.widenIntegerLiteral(src2, n)
+	}
 	src2 = l.ensureTemp(src2)
 	divID, ok := divLHS.(*ast.Ident)
 	if !ok {

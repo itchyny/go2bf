@@ -9222,14 +9222,17 @@ func main() {
 func main() {
 	a := uint16(1000)
 	b := uint16(7)
-	q := a / b
-	r := a % b
-	println(q, r)
+	q0 := a / b
+	r0 := a % b
+	println(q0, r0)
+	q1 := a / 7
+	r1 := a % 7
+	println(q1, r1)
 	q2 := uint16(50000) / 1000
 	r2 := uint16(50000) % 1000
 	println(q2, r2)
 }`,
-			"", "142 6\n50 0\n",
+			"", "142 6\n142 6\n50 0\n",
 		},
 		{
 			"uint16 fibonacci",
@@ -12685,7 +12688,7 @@ func f(n byte) byte {
 		c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 +
 		d0 + d1 + d2 + d3 + d4 + d5 + d6 + d7 + d8 + d9 +
 		e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7 + e8 + e9 +
-		g0 + g1 + g2 + g3 + g4 + g5 + g6 + g7 + g8 + g9 
+		g0 + g1 + g2 + g3 + g4 + g5 + g6 + g7 + g8 + g9
 }
 func main() { putchar(f(1)) }`,
 			"too many local variables in recursive function",
