@@ -95,6 +95,22 @@ type FieldInfo struct {
 	ElemSlice    bool   // true for [][]T or []string slice fields
 	InnerSize    int    // for nested array fields ([N][M]T), inner array cell count
 	InnerIntSize int    // for [N][M]uintN, innermost int width
+	Embedded     bool   // true for an embedded struct field (promotes its fields)
+}
+
+// embeddedFieldName returns the implicit field name of an embedded struct
+// field (`Base` or `*Base` with no explicit name), or "" if the type cannot
+// be embedded.
+func embeddedFieldName(typ ast.Expr) string {
+	switch t := typ.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		if id, ok := t.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return ""
 }
 
 // IsString reports whether the field is a 3-cell byte-slice header
@@ -482,6 +498,20 @@ func Analyze(files []*ast.File, fset *token.FileSet) (*AnalysisResult, error) {
 						fi, fieldSize, err := analyzeFieldType(field.Type, result.Structs)
 						if err != nil {
 							return nil, err
+						}
+						if len(field.Names) == 0 {
+							// Embedded field: implicit name is the type name.
+							name := embeddedFieldName(field.Type)
+							if name == "" || fi.StructType == "" {
+								return nil, fmt.Errorf("unsupported embedded field: %s", exprString(field.Type))
+							}
+							info := fi
+							info.Offset = offset
+							info.Embedded = true
+							def.Fields = append(def.Fields, name)
+							def.Field[name] = info
+							offset += fieldSize
+							continue
 						}
 						for _, name := range field.Names {
 							def.Fields = append(def.Fields, name.Name)

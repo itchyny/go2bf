@@ -3265,6 +3265,23 @@ func (l *Lowerer) resolveCall(call *ast.CallExpr) (string, ast.Expr) {
 	}
 	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 		if structType := l.resolveExprTypeName(sel.X); structType != "" {
+			if _, ok := l.result.Funcs[structType+"."+sel.Sel.Name]; ok {
+				return structType + "." + sel.Sel.Name, sel.X
+			}
+			// Promote a method from an embedded struct: u.m() -> u.Base.m().
+			// An ambiguous match is left unpromoted so it errors downstream as
+			// an unresolved call rather than silently picking one method.
+			if path, ambiguous := l.embeddedPath(structType, func(owner string) bool {
+				_, ok := l.result.Funcs[owner+"."+sel.Sel.Name]
+				return ok
+			}); len(path) > 0 && !ambiguous {
+				recv, owner := ast.Expr(sel.X), structType
+				for _, name := range path {
+					recv = &ast.SelectorExpr{X: recv, Sel: &ast.Ident{Name: name}}
+					owner = l.result.Structs[owner].Field[name].StructType
+				}
+				return owner + "." + sel.Sel.Name, recv
+			}
 			return structType + "." + sel.Sel.Name, sel.X
 		}
 	}
@@ -3946,6 +3963,19 @@ func (l *Lowerer) lowerLocalTypes(gd *ast.GenDecl) error {
 			fi, fieldSize, err := analyzeFieldType(field.Type, l.result.Structs)
 			if err != nil {
 				return err
+			}
+			if len(field.Names) == 0 {
+				name := embeddedFieldName(field.Type)
+				if name == "" || fi.StructType == "" {
+					return fmt.Errorf("unsupported embedded field: %s", exprString(field.Type))
+				}
+				info := fi
+				info.Offset = offset
+				info.Embedded = true
+				def.Fields = append(def.Fields, name)
+				def.Field[name] = info
+				offset += fieldSize
+				continue
 			}
 			for _, name := range field.Names {
 				def.Fields = append(def.Fields, name.Name)
@@ -4929,6 +4959,12 @@ func (l *Lowerer) lowerFieldAssign(sel *ast.SelectorExpr, rhs ast.Expr) error {
 	if star, ok := sel.X.(*ast.StarExpr); ok {
 		return l.lowerFieldAssign(&ast.SelectorExpr{X: star.X, Sel: sel.Sel}, rhs)
 	}
+	// Rewrite promoted embedded-field access (u.id = v -> u.Base.id = v).
+	if pe, err := l.promoteEmbedded(sel); err != nil {
+		return err
+	} else if pe != sel {
+		return l.lowerFieldAssign(pe, rhs)
+	}
 	// arr[i].f1...fn = v where the chain bottoms out in a size-1 struct
 	// array: the chain occupies a single byte at arr[i], so write rhs
 	// directly through the array (writeInto stores 1 byte regardless of
@@ -5561,6 +5597,12 @@ func (l *Lowerer) ptrIncDecInt(idx Cell, n int, tok token.Token) {
 // `lowerExpr(sel.X)` and dispatched into one of three groups: pointer,
 // flat-offset (variable-indexed array), or direct cell.
 func (l *Lowerer) lowerFieldIncDec(sel *ast.SelectorExpr, tok token.Token) error {
+	// Rewrite promoted embedded-field access (u.id++ -> u.Base.id++).
+	if pe, err := l.promoteEmbedded(sel); err != nil {
+		return err
+	} else if pe != sel {
+		return l.lowerFieldIncDec(pe, tok)
+	}
 	base, err := l.lowerExpr(sel.X)
 	if err != nil || base.structType == "" {
 		// Fall back: chained selectors (`r.min.x`) and other shapes
@@ -8022,6 +8064,12 @@ func (l *Lowerer) lowerAddressOf(expr ast.Expr) (exprResult, error) {
 		}
 		return r, nil
 	case *ast.SelectorExpr:
+		// Rewrite promoted embedded-field access (&u.id -> &u.Base.id).
+		if pe, err := l.promoteEmbedded(e); err != nil {
+			return exprResult{}, err
+		} else if pe != e {
+			return l.lowerAddressOf(pe)
+		}
 		// &base[i].field on slice/struct-array bases: lowerSelectorExpr would
 		// load the field's value into a temp, so slotOf would point at the
 		// temp instead of the field's slot. Compute the slot at runtime.
@@ -10517,10 +10565,79 @@ func (l *Lowerer) loadFieldViaPtr(idx Cell, fi FieldInfo) exprResult {
 	return exprResult{cell: result, temp: true, exprShape: exprShape{intSize: 1}}
 }
 
+// embeddedPath returns the chain of embedded field names to traverse from
+// struct typeName to reach the shallowest member for which has(ownerType) is
+// true, following Go's selector rules: the shallowest match wins (a struct's
+// own member is depth 0, shadowing any promoted one). It serves both field
+// promotion (has tests for a field) and method promotion (has tests for a
+// method). The returned path is empty when the member is direct or unreachable
+// -- both mean the selector needs no rewrite. ambiguous is true when two or
+// more members tie at the shallowest matching depth, which Go rejects. A
+// non-nil empty path marks a direct hit; nil marks not found.
+func (l *Lowerer) embeddedPath(typeName string, has func(ownerType string) bool) (path []string, ambiguous bool) {
+	def, found := l.result.Structs[typeName]
+	if !found {
+		return nil, false
+	}
+	if has(typeName) {
+		return []string{}, false // direct member: no deeper search
+	}
+	for _, name := range def.Fields {
+		fi := def.Field[name]
+		if !fi.Embedded {
+			continue
+		}
+		sub, subAmbiguous := l.embeddedPath(fi.StructType, has)
+		if sub == nil {
+			continue // not reachable through this embedded field
+		}
+		cand := append([]string{name}, sub...)
+		switch {
+		case path == nil || len(cand) < len(path):
+			path, ambiguous = cand, subAmbiguous // strictly shallower wins
+		case len(cand) == len(path):
+			ambiguous = true // another member ties at this depth
+		}
+	}
+	return path, ambiguous
+}
+
+// promoteEmbedded rewrites a selector `x.F` that reaches a promoted field of an
+// embedded struct into its explicit path `x.E...F`. Selectors that resolve
+// directly (or not at all) are returned unchanged. It errors on an ambiguous
+// promotion, matching Go's compile-time rejection.
+func (l *Lowerer) promoteEmbedded(e *ast.SelectorExpr) (*ast.SelectorExpr, error) {
+	typeName := l.resolveExprTypeName(e.X)
+	if typeName == "" {
+		return e, nil
+	}
+	path, ambiguous := l.embeddedPath(typeName, func(owner string) bool {
+		_, ok := l.result.Structs[owner].Field[e.Sel.Name]
+		return ok
+	})
+	if ambiguous {
+		return e, fmt.Errorf("ambiguous selector %s.%s", exprString(e.X), e.Sel.Name)
+	}
+	if len(path) == 0 {
+		return e, nil
+	}
+	x := e.X
+	for _, name := range path {
+		x = &ast.SelectorExpr{X: x, Sel: &ast.Ident{Name: name}}
+	}
+	return &ast.SelectorExpr{X: x, Sel: e.Sel}, nil
+}
+
 func (l *Lowerer) lowerSelectorExpr(e *ast.SelectorExpr) (exprResult, error) {
 	// Unwrap (expr).field so the selector resolution sees the inner form.
 	if p, ok := e.X.(*ast.ParenExpr); ok {
 		return l.lowerSelectorExpr(&ast.SelectorExpr{X: p.X, Sel: e.Sel})
+	}
+	// Rewrite promoted embedded-field access (u.id -> u.Base.id).
+	if pe, err := l.promoteEmbedded(e); err != nil {
+		return exprResult{}, err
+	} else if pe != e {
+		return l.lowerSelectorExpr(pe)
 	}
 	// (*pp).field is equivalent to pp.field (Go auto-derefs pointer
 	// receivers in selector access). Rewrite so the Ident-with-ptrType

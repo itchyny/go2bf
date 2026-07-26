@@ -200,6 +200,43 @@ type Rect struct { min Point; max Point }
 `Rect` occupies 4 cells: `min.x`, `min.y`, `max.x`, `max.y`.
 Chained access `r.min.x` is resolved recursively at compile time.
 
+### Embedding
+
+An embedded field (a struct or `*Struct` type written with no field
+name) is recorded under its type name with `Embedded = true`:
+
+```go
+type Base struct { id byte }
+type User struct { Base; name byte } // Base occupies cell[base+0]
+```
+
+Both fields and methods are promoted -- `u.id` resolves to the
+embedded `Base`'s `id`, and `u.m()` dispatches to `Base`'s method `m`.
+Promotion is a pure AST rewrite done before lowering, driven by
+`embeddedPath(typeName, has)`: it walks the embedded fields looking for
+the shallowest owner type satisfying the `has` predicate and returns
+the field chain to reach it.
+
+For field promotion, `promoteEmbedded` calls `embeddedPath` with a
+predicate testing `def.Field[name]` and rewrites `u.id` into the
+explicit path `u.Base.id` (transitively for multi-level embedding). The
+rewrite is applied at the top of `lowerSelectorExpr`, `lowerFieldAssign`,
+`lowerFieldIncDec`, and the `lowerAddressOf` selector case, so reads,
+writes, `++`/`+=`, and address-of all share one mechanism.
+
+For method promotion, `resolveCall` calls `embeddedPath` with a
+predicate testing `Funcs[owner+"."+method]`; when `u.m()` has no direct
+`User.m`, it rewrites the receiver to `u.Base` and resolves the call to
+`Base.m`. `prependReceiver` then handles value/pointer receiver
+adjustment as for any method. No codegen changes are needed for either.
+
+`embeddedPath` follows Go's selector rules: the shallowest depth wins
+(a struct's own member at depth 0 shadows any promoted one), and two
+members tying at the shallowest matching depth are ambiguous, which Go
+rejects. An ambiguous field is an `ambiguous selector` error; an
+ambiguous method is left unpromoted so it surfaces as an unresolved
+call rather than silently picking one.
+
 ### Struct Fields with Arrays
 
 Fields can be arrays:

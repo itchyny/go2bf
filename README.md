@@ -414,6 +414,8 @@ The generated Brainfuck uses a CPU-like execution model:
   `return s[i]` for struct slices)
 - Pass to and return from functions
 - Value and pointer receivers (`func (v T) m()`, `func (p *T) m()`)
+- Struct embedding with field and method promotion, including
+  multi-level embedding and promotion through pointers and indexing.
 
 ### Slices
 

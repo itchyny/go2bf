@@ -8988,6 +8988,115 @@ func main() {
 }`,
 			"", "0 42 0\n",
 		},
+		{
+			"struct embedding field promotion",
+			`package main
+type Base struct { id, tag byte }
+type User struct { Base; name byte }
+func inc(p *byte) { *p += 10 }
+func main() {
+	var u User
+	u.id = 5       // promoted read/write
+	u.tag = 7
+	u.name = 9
+	u.id++         // promoted inc/dec
+	inc(&u.tag)    // promoted address-of
+	println(u.id, u.tag, u.name, u.Base.id)
+}`,
+			"", "6 17 9 6\n",
+		},
+		{
+			"struct embedding multi-level and value init",
+			`package main
+type Base struct { n uint16 }
+type Mid struct { Base; extra byte }
+type User struct { Mid; name byte }
+func show(u User) { println(u.n, u.extra, u.name) }
+func main() {
+	u := User{Mid: Mid{Base: Base{n: 300}, extra: 3}, name: 9}
+	show(u)
+	u.n += 50      // promoted two levels, multi-byte
+	p := &u
+	p.extra = 8    // promoted through pointer
+	var arr [2]User
+	arr[0].name = 1
+	arr[1].extra = 2
+	println(u.n, u.extra, arr[0].name, arr[1].extra)
+}`,
+			"", "300 3 9\n350 8 1 2\n",
+		},
+		{
+			"struct embedding pointer",
+			`package main
+type Base struct { id byte }
+type User struct { *Base; name byte }
+func main() {
+	b := Base{id: 5}
+	u := User{Base: &b, name: 9}
+	println(u.id, u.name)
+	u.id = 20        // writes through the embedded pointer
+	println(b.id)
+}`,
+			"", "5 9\n20\n",
+		},
+		{
+			"struct embedding shallower field wins",
+			`package main
+type A struct { x byte }
+type Deep struct { x byte }
+type Mid struct { Deep }
+type Outer struct { Mid; A }
+func main() {
+	var o Outer
+	o.x = 7          // A.x at depth 1 wins over Mid.Deep.x at depth 2
+	o.A.x = 1
+	o.Mid.Deep.x = 2
+	println(o.x, o.A.x, o.Mid.Deep.x)
+}`,
+			"", "1 1 2\n",
+		},
+		{
+			"struct embedding outer field shadows promoted",
+			`package main
+type Base struct { id byte }
+type User struct { Base; id byte }
+func main() {
+	var u User
+	u.id = 7         // User.id (depth 0), not Base.id
+	u.Base.id = 3
+	println(u.id, u.Base.id)
+}`,
+			"", "7 3\n",
+		},
+		{
+			"struct embedding method promotion",
+			`package main
+type Base struct { id byte }
+func (b Base) plus(n byte) byte { return b.id + n }
+func (b *Base) bump() { b.id += 10 }
+type Mid struct { Base; extra byte }
+type User struct { Mid; name byte }
+func main() {
+	u := User{Mid: Mid{Base: Base{id: 3}}, name: 9}
+	println(u.plus(4) * 2)   // promoted value-receiver, two levels, in expression
+	u.bump()                 // promoted pointer-receiver, two levels
+	println(u.plus(0), u.id)
+}`,
+			"", "14\n13 13\n",
+		},
+		{
+			"struct embedding method shadowed by outer",
+			`package main
+type Base struct { id byte }
+func (b Base) kind() byte { return 1 }
+type User struct { Base; name byte }
+func (u User) kind() byte { return 2 }
+func main() {
+	var u User
+	println(u.kind(), u.Base.kind())
+}`,
+			"", "2 1\n",
+		},
 		// --- uint16 ---
 		{
 			"uint16 basics",
@@ -12364,6 +12473,43 @@ func TestCompileError(t *testing.T) {
 			`package main
 func f() {}`,
 			"no main function found",
+		},
+		{
+			"non-struct embedded field",
+			`package main
+type User struct { int; name byte }
+func main() { var u User; _ = u.name }`,
+			"unsupported embedded field: int",
+		},
+		{
+			"ambiguous promoted selector",
+			`package main
+type A struct { x byte }
+type B struct { x byte }
+type C struct { A; B; y byte }
+func main() { var c C; c.x = 5; _ = c }`,
+			"ambiguous selector c.x",
+		},
+		{
+			"ambiguous promoted selector deep tie",
+			`package main
+type A struct { v byte }
+type B struct { A }
+type D struct { A }
+type E struct { B; D }
+func main() { var e E; println(e.v) }`,
+			"ambiguous selector e.v",
+		},
+		{
+			"ambiguous promoted method",
+			`package main
+type A struct { v byte }
+func (a A) m() byte { return 1 }
+type B struct { w byte }
+func (b B) m() byte { return 2 }
+type C struct { A; B }
+func main() { var c C; println(c.m()) }`,
+			"unsupported function in expression: C.m",
 		},
 		{
 			"zero-length array local var",
