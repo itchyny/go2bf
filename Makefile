@@ -1,5 +1,5 @@
 BIN := go2bf
-VERSION := $$(make -s show-version)
+VERSION := $$($(MAKE) -s show-version)
 VERSION_PATH := .
 CURRENT_REVISION = $(shell git rev-parse --short HEAD)
 BUILD_LDFLAGS = "-s -w -X main.revision=$(CURRENT_REVISION)"
